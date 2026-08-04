@@ -41,6 +41,17 @@ def _trust_blocks(question: str) -> bool:
     entry = _load_trust().get(arch)
     return bool(entry is not None and entry.get("trust") is False)
 
+
+def _holdout_validated(arch: str) -> bool:
+    """True when the archetype was *proven on the sealed hold-out slice* (config/archetype_trust.json,
+    ``holdout_validated``). Gates whether a deterministic hard module (diffpair / compute / pivot /
+    enumeration) may DIRECTLY commit its answer. Until an archetype earns this, its module is advisory:
+    its extraction is injected as a hint and the LLM + consistency + verify gates decide (abstain-
+    leaning), so a module that overfit the visible projects cannot commit a confident wrong answer on
+    unseen test data (the #4 −0.1 regression). A missing map / entry ⇒ False ⇒ advisory."""
+    entry = _load_trust().get(arch)
+    return bool(entry is not None and entry.get("holdout_validated") is True)
+
 SYSTEM = """あなたは社内共有ドライブの資料に基づいて質問へ回答するRAGアシスタントです。
 以下を厳守してください。
 - 回答は必ず日本語。提供された『根拠資料』のみを使用し、外部知識や推測で補わない。
@@ -194,54 +205,86 @@ def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: b
     if apply_trust_gate and _trust_blocks(question):
         return _result(question, settings.ABSTAIN, "untrusted-archetype", "", [], [], verified=False)
 
+    # Hard-module advisory gate (SOT-2424). The deterministic modules below (compute / enumeration /
+    # diffpair / pivotcond) DIRECTLY commit a confident answer only for archetypes proven to generalize
+    # on the sealed hold-out slice (`_holdout_validated`). For an unproven archetype the module runs in
+    # *advisory* mode: its extraction is stashed in ``advisory`` and injected as a hint into the LLM
+    # prompt, where consistency + verify decide (abstain-leaning) — so a module that overfit the
+    # visible projects cannot commit a confident wrong answer on unseen test (#4 −0.1 regression).
+    # ``measuring`` (selfimprove passes apply_trust_gate=False) keeps the ORIGINAL direct-commit
+    # behaviour so the loop can measure each module's true deterministic precision per slice.
+    measuring = not apply_trust_gate
+    advisory: list[str] = []
+
     if compute.is_compute_question(question):
         computed = compute.answer_question(question)
         if computed is not None:
-            return _result(question, _clip_tokens(computed), "high", computed, [], [], verified=True)
-        return _result(question, settings.ABSTAIN, "compute-unresolved", "", [], [], verified=False)
+            if measuring or _holdout_validated("cross_aggregate"):
+                return _result(question, _clip_tokens(computed), "high", computed, [], [], verified=True)
+            advisory.append(computed)
+        elif measuring or _holdout_validated("cross_aggregate"):
+            return _result(question, settings.ABSTAIN, "compute-unresolved", "", [], [], verified=False)
 
     if enumeration.is_enumeration_question(question):
         enum_answer = enumeration.answer_question(question)
         if enum_answer is not None:
-            return _result(question, _clip_tokens(enum_answer), "high", enum_answer, [], [], verified=True)
+            enum_arch = archetype.classify(question)  # enum_set / highlight_set
+            if measuring or _holdout_validated(enum_arch):
+                return _result(question, _clip_tokens(enum_answer), "high", enum_answer, [], [], verified=True)
+            advisory.append(enum_answer)
 
     # Version-diff questions ("old版と最新版の変更点") are answered by a deterministic structural
     # diff of the two versions, not by retrieval+LLM (the two files are near-identical and the single
-    # changed value is buried). When the pair/diff resolves uniquely we return it; when it's clearly a
-    # diff question but we cannot resolve it we abstain (Missing 0 beats Incorrect -1). This runs
-    # before the trust gate because the diff is self-contained and does not depend on trust.
+    # changed value is buried). When the pair/diff resolves uniquely and version_diff is hold-out
+    # validated we commit it; otherwise the diff becomes an advisory hint. When it's clearly a diff
+    # question but unresolved, we abstain only in the direct-commit path (Missing 0 beats Incorrect -1).
     if diffpair.is_diff_question(question):
         try:
             diff_ans = diffpair.answer_question(question)
         except Exception:
             diff_ans = None
         if diff_ans:
-            return _result(question, _clip_tokens(diff_ans), "high", diff_ans, [], [], verified=True)
-        return _result(question, settings.ABSTAIN, "diff-unresolved", "", [], [], verified=False)
+            if measuring or _holdout_validated("version_diff"):
+                return _result(question, _clip_tokens(diff_ans), "high", diff_ans, [], [], verified=True)
+            advisory.append(diff_ans)
+        elif measuring or _holdout_validated("version_diff"):
+            return _result(question, settings.ABSTAIN, "diff-unresolved", "", [], [], verified=False)
 
     # PivotTable / AutoFilter extraction-condition questions ("PivotTableの抽出条件", "フィルターで
     # 抽出されている条件") are answered by reading the workbook's pivot definition / autofilter XML and
     # recomputing the condition deterministically (valid idx6/idx11/idx21), not by retrieval+LLM (the
-    # condition is not in the flattened cell text). When it resolves uniquely we return it; when it is
-    # clearly a condition question we cannot resolve we abstain (Missing 0 beats Incorrect −1). Runs
-    # before the trust gate because the answer is self-contained and does not depend on trust.
+    # condition is not in the flattened cell text). Direct-commit only when pivot_condition is hold-out
+    # validated; otherwise advisory. Unresolved abstains only in the direct-commit path.
     if pivotcond.is_pivot_condition_question(question):
         try:
             pv_ans = pivotcond.answer_question(question)
         except Exception:
             pv_ans = None
         if pv_ans:
-            return _result(question, _clip_tokens(pv_ans), "high", pv_ans, [], [], verified=True)
-        return _result(question, settings.ABSTAIN, "pivot-unresolved", "", [], [], verified=False)
+            if measuring or _holdout_validated("pivot_condition"):
+                return _result(question, _clip_tokens(pv_ans), "high", pv_ans, [], [], verified=True)
+            advisory.append(pv_ans)
+        elif measuring or _holdout_validated("pivot_condition"):
+            return _result(question, settings.ABSTAIN, "pivot-unresolved", "", [], [], verified=False)
 
-    # Trust gate (additive): abstain up-front on archetypes measured as unreliable, before any LLM
-    # call. scoring.selfimprove passes apply_trust_gate=False because that loop *measures* trust.
+    # Retrieval + LLM path (reached when no hard module direct-committed above). The additive trust
+    # gate already abstained measured-unreliable archetypes up front; scoring.selfimprove passes
+    # apply_trust_gate=False so this loop can *measure* trust.
     r = retrieve.get()
     evidence = r.retrieve(question, k=k)
     images = _gather_images(question, evidence)
+    # Advisory hints from unvalidated hard modules: offered as *unverified* candidates only. The verify
+    # pass (疑わしきは false) requires the answer to be independently supported by the evidence, so a
+    # hint that isn't corroborated leads to abstention rather than a confident commit.
+    advisory_block = ""
+    if advisory:
+        advisory_block = (
+            "\n\n【未検証の自動抽出候補（hold-out未実証。参考情報に過ぎない。"
+            "根拠資料から独立に確認できる場合のみ採用し、確認できなければ採用せず confidence=\"low\"）】\n"
+            + "\n".join(f"- {a}" for a in advisory))
     prompt = (
         f"質問:\n{question}\n\n"
-        f"根拠資料:\n{_format_evidence(evidence)}\n\n"
+        f"根拠資料:\n{_format_evidence(evidence)}{advisory_block}\n\n"
         "上記の根拠のみに基づき、質問へ回答してください。JSONで reasoning, answer, confidence を返す。"
     )
     model = settings.GEN_MODEL_HARD if (hard or images) else settings.GEN_MODEL

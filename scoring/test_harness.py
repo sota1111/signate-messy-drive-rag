@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import collections
+import json
 
 from scoring import deterministic as D
 from scoring import synth
@@ -65,7 +66,7 @@ _CORE_ARCHETYPES = {
 
 def test_synth_builds_and_self_scores_perfect():
     items = synth.build()
-    assert len(items) >= 100, f"expected at least 100 benchmark items, got {len(items)}"
+    assert len(items) >= 250, f"expected at least 250 benchmark items, got {len(items)}"
     counts = collections.Counter(it.archetype for it in items)
     core = {a: n for a, n in counts.items() if a in _CORE_ARCHETYPES}
     assert set(core) == _CORE_ARCHETYPES, f"expected the 8 core archetypes, got {counts}"
@@ -108,3 +109,131 @@ def test_trust_gate_noop_when_map_missing(monkeypatch):
     monkeypatch.setattr(generate, "_load_trust", lambda: {})
     # unknown / unmapped archetype is never blocked
     assert generate._trust_blocks("この契約書の太字箇所を抜き出してください。") is False
+
+
+# ------------------------------- hold-out split & trust decision (SOT-2424) --------------------
+def test_split_rows_by_sealed_company(monkeypatch):
+    from scoring import selfimprove
+
+    monkeypatch.setenv("SEAL_COMPANIES", "株式会社青葉バイオメディカル機器")
+    rows = [
+        {"company": "株式会社青葉バイオメディカル機器", "points": 1.0},
+        {"company": "京橋信用ソリューションズ株式会社", "points": 1.0},
+        {"company": "横断", "points": 0.0},
+    ]
+    dev, hold = selfimprove.split_rows(rows)
+    assert [r["company"] for r in hold] == ["株式会社青葉バイオメディカル機器"]
+    assert {r["company"] for r in dev} == {"京橋信用ソリューションズ株式会社", "横断"}
+
+
+def test_decide_trust_judges_on_holdout_not_dev():
+    from scoring import selfimprove
+
+    # dev looks great but the sealed hold-out is unreliable → NOT validated, and trust=False (evidence)
+    dev = {"pivot_condition": {"precision": 1.0, "committed": 8, "coverage": 1.0,
+                               "mean_score": 1.0, "n": 8,
+                               "verdicts": {"Perfect": 8}}}
+    hold = {"pivot_condition": {"precision": 0.4, "committed": 5, "coverage": 1.0,
+                                "mean_score": 0.4, "n": 5, "verdicts": {"Perfect": 2}}}
+    decided = selfimprove.decide_trust(dev, hold, threshold=0.8, min_committed=5, holdout_min=3)
+    e = decided["pivot_condition"]
+    assert e["holdout_validated"] is False
+    assert e["trust"] is False and e["trust_basis"] == "holdout"
+
+
+def test_decide_trust_validates_when_holdout_clears_threshold():
+    from scoring import selfimprove
+
+    dev = {"version_diff": {"precision": 1.0, "committed": 6, "coverage": 1.0,
+                            "mean_score": 1.0, "n": 6, "verdicts": {"Perfect": 6}}}
+    hold = {"version_diff": {"precision": 1.0, "committed": 4, "coverage": 1.0,
+                             "mean_score": 1.0, "n": 4, "verdicts": {"Perfect": 4}}}
+    decided = selfimprove.decide_trust(dev, hold, threshold=0.8, min_committed=5, holdout_min=3)
+    e = decided["version_diff"]
+    assert e["holdout_validated"] is True and e["trust"] is True
+
+
+def test_decide_trust_insufficient_holdout_is_additive_safe():
+    from scoring import selfimprove
+
+    # only dev data (e.g. glossary/横断, never in the hold-out): not commit-validated, but trust stays
+    # True when dev clears the bar so the additive abstain gate never blocks it.
+    dev = {"glossary_formal": {"precision": 1.0, "committed": 9, "coverage": 0.6,
+                               "mean_score": 0.6, "n": 15, "verdicts": {"Perfect": 9}}}
+    decided = selfimprove.decide_trust(dev, {}, threshold=0.8, min_committed=5, holdout_min=3)
+    e = decided["glossary_formal"]
+    assert e["holdout_validated"] is False
+    assert e["trust"] is True and e["trust_basis"] == "dev"
+
+
+# ------------------------------- overfit detector (SOT-2424) -----------------------------------
+def test_overfit_detects_state_4_valid_up_holdout_down():
+    from scoring import overfit_check
+
+    # the #4 regression: valid30 proxy +0.5833 while the real hold-out slice went −0.1
+    v = overfit_check.assess(dev_gain=0.5833, holdout_gain=-0.1)
+    assert v.overfit is True and v.label == "OVERFIT_SUSPECTED"
+
+
+def test_overfit_ok_when_both_slices_rise_together():
+    from scoring import overfit_check
+
+    v = overfit_check.assess(dev_gain=0.10, holdout_gain=0.09)
+    assert v.overfit is False
+
+
+def test_overfit_ignores_noise_level_dev_change():
+    from scoring import overfit_check
+
+    v = overfit_check.assess(dev_gain=0.005, holdout_gain=-0.20)
+    assert v.overfit is False  # no material dev gain → nothing to adopt/judge
+
+
+# ------------------------------- hard-module advisory gate (SOT-2424) --------------------------
+def test_hard_module_commits_only_when_holdout_validated(monkeypatch):
+    from src.rag import generate
+
+    q = "全案件で支払った税込金額をもとに、消費税額の総額を計算してください。"
+    assert generate.compute.is_compute_question(q)
+
+    # any LLM/retrieval reach is a bug in this path
+    def _boom(*a, **k):
+        raise AssertionError("must not call the LLM/retrieval on a validated hard commit")
+    monkeypatch.setattr(generate.llm, "generate", _boom)
+    monkeypatch.setattr(generate.retrieve, "get", _boom)
+
+    monkeypatch.setattr(generate, "_load_trust",
+                        lambda: {"cross_aggregate": {"holdout_validated": True}})
+    res = generate.answer_question(q)
+    assert res["verified"] is True and res["confidence"] == "high"
+    assert res["answer"] and res["answer"] != generate.settings.ABSTAIN
+
+
+def test_hard_module_advisory_when_not_validated(monkeypatch):
+    from src.rag import generate
+
+    q = "全案件で支払った税込金額をもとに、消費税額の総額を計算してください。"
+
+    # unvalidated → the compute answer must NOT be committed directly; it flows through retrieval+LLM
+    # as an advisory hint, and the (stubbed) verify pass abstains on unsupported hints.
+    captured = {}
+
+    class _Retriever:
+        def retrieve(self, question, k=16):
+            return [{"rel": "x", "text": "根拠", "kind": "text"}]
+    monkeypatch.setattr(generate.retrieve, "get", lambda: _Retriever())
+    monkeypatch.setattr(generate, "_gather_images", lambda *a, **k: [])
+
+    def _fake_llm(prompt, **kw):
+        captured["prompt"] = captured.get("prompt", "") + prompt
+        # first pass draft: low confidence → abstain path
+        return json.dumps({"answer": "", "confidence": "low"})
+    monkeypatch.setattr(generate.llm, "generate", _fake_llm)
+    monkeypatch.setattr(generate, "_load_trust",
+                        lambda: {"cross_aggregate": {"holdout_validated": False}})
+
+    res = generate.answer_question(q)
+    # the deterministic compute candidate was injected as an advisory hint (not committed)
+    assert "未検証の自動抽出候補" in captured["prompt"]
+    assert res["answer"] == generate.settings.ABSTAIN
+    assert res["verified"] is False

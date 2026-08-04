@@ -24,6 +24,7 @@ ARCHETYPE_KIND: dict[str, str] = {
     "enum_set": "set",
     "highlight_set": "set",
     "cross_aggregate": "numeric",
+    "contract_amount": "numeric",
     "pivot_condition": "string",
     "config_model_type": "string",
     "config_hyperparam": "numeric",

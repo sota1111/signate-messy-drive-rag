@@ -19,17 +19,41 @@ from __future__ import annotations
 
 import argparse
 import collections
+import datetime as _dt
 import itertools
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from config import settings
 from scoring import deterministic, synth
+from src.rag.corpus import nfc
 
 TRUST_PATH = Path(settings.REPO_ROOT) / "config" / "archetype_trust.json"
+HISTORY_PATH = settings.ARTIFACTS_DIR / "holdout_history.jsonl"
 DEFAULT_THRESHOLD = 0.80
 DEFAULT_MIN_COMMITTED = 5
+# Per-company synthetic samples are scarce, so the hold-out slice needs a smaller commit floor than
+# the dev slice for an archetype to be judged at all.
+DEFAULT_HOLDOUT_MIN_COMMITTED = 3
+
+# Companies sealed out of development and used ONLY as the generalization hold-out. Trust for a
+# question archetype is decided on this unseen slice — never on the dev/valid slice — so an archetype
+# that merely overfits the visible projects cannot earn trust. Override with SEAL_COMPANIES
+# (comma-separated company folder names). Glossary (社内管理) and cross-document (横断) items are not
+# owned by a single project and therefore never fall into the hold-out slice.
+_DEFAULT_SEALED = (
+    "株式会社青葉バイオメディカル機器",
+    "医療法人社団 蒼泉会 ひがし丘総合病院",
+    "青葉与信マネジメント株式会社",
+)
+
+
+def sealed_companies() -> set[str]:
+    raw = os.getenv("SEAL_COMPANIES")
+    names = raw.split(",") if raw else list(_DEFAULT_SEALED)
+    return {nfc(s).strip() for s in names if s and s.strip()}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -96,9 +120,22 @@ def score_results(items: list[synth.SynthItem], preds: dict[str, dict]) -> list[
         pred = (preds.get(it.id) or {}).get("answer", settings.ABSTAIN)
         verdict = deterministic.score(str(pred), it.truth, it.kind)
         rows.append({"id": it.id, "archetype": it.archetype, "kind": it.kind,
-                     "pred": pred, "truth": it.truth, "verdict": verdict,
+                     "company": it.company, "pred": pred, "truth": it.truth, "verdict": verdict,
                      "points": deterministic.POINTS[verdict]})
     return rows
+
+
+def split_rows(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Partition scored rows into (dev, hold-out) by sealed company."""
+    sealed = sealed_companies()
+    dev, hold = [], []
+    for r in rows:
+        (hold if nfc(str(r.get("company", ""))) in sealed else dev).append(r)
+    return dev, hold
+
+
+def _overall_mean(rows: list[dict]) -> float:
+    return sum(r["points"] for r in rows) / len(rows) if rows else 0.0
 
 
 def aggregate(rows: list[dict], threshold: float, min_committed: int) -> dict[str, dict]:
@@ -124,30 +161,94 @@ def aggregate(rows: list[dict], threshold: float, min_committed: int) -> dict[st
     return trust
 
 
-def write_trust(trust: dict[str, dict], threshold: float, min_committed: int) -> None:
+def decide_trust(dev_agg: dict[str, dict], hold_agg: dict[str, dict],
+                 threshold: float, min_committed: int, holdout_min: int) -> dict[str, dict]:
+    """Merge dev + hold-out per-archetype stats into the trust map, judging trust on the hold-out.
+
+    - ``holdout_validated`` (gates hard-module *direct commit* in generate.py) is True ONLY when the
+      hold-out slice has enough committed samples AND clears the precision threshold on the *unseen*
+      projects. An archetype proven only on dev/valid never earns this.
+    - ``trust`` (drives the additive abstain gate) is set False only with positive evidence of
+      unreliability on the judging split (hold-out when sufficient, else dev). Insufficient data
+      leaves ``trust`` True so the gate never abstains an unmeasured archetype (additive-safe)."""
+    out: dict[str, dict] = {}
+    for arch in sorted(set(dev_agg) | set(hold_agg)):
+        d = dev_agg.get(arch)
+        h = hold_agg.get(arch)
+        holdout_validated = bool(h and h["committed"] >= holdout_min and h["precision"] >= threshold)
+        if h and h["committed"] >= holdout_min:
+            trust, basis = h["precision"] >= threshold, "holdout"
+        elif d and d["committed"] >= min_committed:
+            trust, basis = d["precision"] >= threshold, "dev"
+        else:
+            trust, basis = True, "insufficient"
+        out[arch] = {
+            "trust": trust,
+            "holdout_validated": holdout_validated,
+            "trust_basis": basis,
+            "holdout": h,
+            "dev": d,
+        }
+    return out
+
+
+def write_trust(trust: dict[str, dict], threshold: float, min_committed: int,
+                holdout_min: int) -> None:
     TRUST_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "_meta": {
             "generator": "scoring.selfimprove",
             "threshold": threshold, "min_committed": min_committed,
+            "holdout_min_committed": holdout_min,
+            "sealed_companies": sorted(sealed_companies()),
+            "trust_judged_on": "holdout",
         },
         "archetypes": trust,
     }
     TRUST_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def report(trust: dict[str, dict], rows: list[dict]) -> None:
-    overall = sum(r["points"] for r in rows) / len(rows) if rows else 0.0
-    print("\n==================== self-improvement: archetype精度 ====================")
-    print(f"{'archetype':22} {'n':>3} {'commit':>6} {'prec':>6} {'cov':>6} {'mean':>7}  trust")
-    print("-" * 70)
-    for arch in sorted(trust):
-        t = trust[arch]
-        print(f"{arch:22} {t['n']:>3} {t['committed']:>6} {t['precision']:>6.2f} "
-              f"{t['coverage']:>6.2f} {t['mean_score']:>7.3f}  {'✓' if t['trust'] else '·'}")
-    print("-" * 70)
-    trusted = [a for a, t in trust.items() if t["trust"]]
-    print(f"overall mean score: {overall:+.4f}   trusted archetypes: {trusted}")
+def append_history(label: str, dev_rows: list[dict], hold_rows: list[dict],
+                   decided: dict[str, dict], when: str | None = None) -> dict:
+    """Append this run's dev/hold-out means (overall + per archetype) to the history ledger, so
+    overfit_check can compare consecutive runs (valid gain vs hold-out gain)."""
+    rec = {
+        "recordedAt": when or _dt.datetime.now().isoformat(timespec="seconds"),
+        "label": label,
+        "dev_mean": round(_overall_mean(dev_rows), 4),
+        "holdout_mean": round(_overall_mean(hold_rows), 4),
+        "archetypes": {
+            a: {"dev_mean": (decided[a]["dev"] or {}).get("mean_score"),
+                "holdout_mean": (decided[a]["holdout"] or {}).get("mean_score")}
+            for a in decided
+        },
+    }
+    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(HISTORY_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return rec
+
+
+def report(decided: dict[str, dict], dev_rows: list[dict], hold_rows: list[dict]) -> None:
+    dev_mean, hold_mean = _overall_mean(dev_rows), _overall_mean(hold_rows)
+    print("\n============== self-improvement: dev vs hold-out archetype精度 ==============")
+    print(f"sealed (hold-out) companies: {sorted(sealed_companies())}")
+    print(f"{'archetype':20} | {'devN':>4} {'dCom':>5} {'dPrc':>5} {'dMean':>6} "
+          f"| {'hoN':>4} {'hCom':>5} {'hPrc':>5} {'hMean':>6} | basis      commit")
+    print("-" * 96)
+    for arch in sorted(decided):
+        e = decided[arch]
+        d, h = e["dev"], e["holdout"]
+        dcell = (f"{d['n']:>4} {d['committed']:>5} {d['precision']:>5.2f} {d['mean_score']:>6.3f}"
+                 if d else f"{'-':>4} {'-':>5} {'-':>5} {'-':>6}")
+        hcell = (f"{h['n']:>4} {h['committed']:>5} {h['precision']:>5.2f} {h['mean_score']:>6.3f}"
+                 if h else f"{'-':>4} {'-':>5} {'-':>5} {'-':>6}")
+        print(f"{arch:20} | {dcell} | {hcell} | {e['trust_basis']:10} "
+              f"{'commit✓' if e['holdout_validated'] else 'advisory'}")
+    print("-" * 96)
+    committable = [a for a, e in decided.items() if e["holdout_validated"]]
+    print(f"overall mean — dev: {dev_mean:+.4f}   hold-out: {hold_mean:+.4f}")
+    print(f"hold-out-validated (direct-commit) archetypes: {committable}")
 
 
 def main() -> int:
@@ -158,6 +259,8 @@ def main() -> int:
     ap.add_argument("--hard", action="store_true")
     ap.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
     ap.add_argument("--min-committed", type=int, default=DEFAULT_MIN_COMMITTED)
+    ap.add_argument("--holdout-min-committed", type=int, default=DEFAULT_HOLDOUT_MIN_COMMITTED)
+    ap.add_argument("--label", default="run", help="label recorded in the hold-out history ledger")
     ap.add_argument("--preds", type=Path, default=None,
                     help="score a cached RAG run (jsonl of {id, answer}) instead of calling the LLM")
     args = ap.parse_args()
@@ -190,13 +293,21 @@ def main() -> int:
         print(f"cached RAG answers → {cache}")
 
     rows = score_results(items, preds)
-    trust = aggregate(rows, args.threshold, args.min_committed)
-    write_trust(trust, args.threshold, args.min_committed)
-    report(trust, rows)
+    dev_rows, hold_rows = split_rows(rows)
+    dev_agg = aggregate(dev_rows, args.threshold, args.min_committed)
+    hold_agg = aggregate(hold_rows, args.threshold, args.holdout_min_committed)
+    decided = decide_trust(dev_agg, hold_agg, args.threshold, args.min_committed,
+                           args.holdout_min_committed)
+    write_trust(decided, args.threshold, args.min_committed, args.holdout_min_committed)
+    report(decided, dev_rows, hold_rows)
+    rec = append_history(args.label, dev_rows, hold_rows, decided)
+    print(f"appended hold-out history → {HISTORY_PATH} "
+          f"(dev {rec['dev_mean']:+.4f} / hold-out {rec['holdout_mean']:+.4f})")
     scored = settings.ARTIFACTS_DIR / "synth_scored.csv"
     import csv as _csv
     with open(scored, "w", encoding="utf-8", newline="") as f:
-        w = _csv.DictWriter(f, fieldnames=["id", "archetype", "kind", "verdict", "points", "pred", "truth"])
+        w = _csv.DictWriter(f, fieldnames=["id", "archetype", "kind", "company", "verdict",
+                                           "points", "pred", "truth"])
         w.writeheader()
         w.writerows(rows)
     print(f"wrote {TRUST_PATH}\nwrote {scored}")

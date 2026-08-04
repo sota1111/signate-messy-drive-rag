@@ -51,6 +51,32 @@ proxy ≈0 but real −0.23. Under Incorrect=−1, **precision beats recall**: a
 only high-confidence directly-readable facts. Optimize for **Incorrect→0**, not proxy mean.
 The official score is on the SIGNATE page (CLI cannot read it back) — it is the only trustworthy signal.
 
+## Generalization hold-out gate (SOT-2424)
+
+Improvement adoption is now judged on an **unseen hold-out**, not on valid30/dev:
+
+- **Sealed projects → hold-out slice.** `scoring.selfimprove` seals whole companies
+  (`_DEFAULT_SEALED`, override `SEAL_COMPANIES=`) out of development; trust for each archetype is
+  decided on that unseen slice (`decide_trust`), never on the dev/valid slice. Output is the
+  `dev vs hold-out` per-archetype table plus `config/archetype_trust.json`
+  (`holdout_validated` / `trust` / `trust_basis` per archetype) and an appended
+  `artifacts/holdout_history.jsonl`.
+- **Hard modules default to advisory.** diffpair / compute / pivot / enumeration DIRECTLY commit a
+  confident answer only for an archetype that is `holdout_validated` (proven to transfer on the
+  sealed slice). Until proven, the module's extraction is injected into the LLM prompt as an
+  *unverified advisory hint* and the consistency + verify gates decide (abstain-leaning) — so a
+  module that overfit the visible projects cannot commit a confident wrong answer on unseen test
+  (the #4 −0.1 failure mode).
+- **Overfit detector.** `python -m scoring.overfit_check` compares the last two hold-out history
+  runs and BLOCKS adoption when the dev slice improved but the hold-out did not keep up
+  (e.g. the #4 state: valid +0.58 / hold-out −0.1). Exit 3 = overfit suspected.
+
+```bash
+python -m scoring.selfimprove            # RAG over synth → dev vs hold-out trust map + history
+python -m scoring.selfimprove --self-test   # offline scorer/GT validation (no LLM)
+python -m scoring.overfit_check          # block adoption if the last change overfit the dev slice
+```
+
 ## Live backend
 
 - URL: `https://signate-messy-drive-rag-backend-4kvjtj6qvq-uc.a.run.app`
