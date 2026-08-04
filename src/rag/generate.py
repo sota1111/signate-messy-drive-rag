@@ -33,14 +33,18 @@ SYSTEM = """あなたは社内共有ドライブの資料に基づいて質問�
   単位の重複・「〜です」等の冗長表現を付けない。ground_truthに無い追加情報を足すと誤りになる。"""
 
 # Second pass: distill to the minimal exact-format answer AND strictly re-verify support.
-_VERIFY_SYSTEM = """あなたは回答の整形と最終検証を行うレビュアです。
-質問・根拠資料（画像を含む場合あり）・下書き回答を読み、JSONで返す。
-- final: 質問が求める値・要素だけに最小化した最終回答（説明・前置き・冗長語・根拠の再掲を全て除去、
-  列挙は「、」区切り、指定の単位/桁/表記・並び順に従う）。該当が無いと確認できる場合は「該当なし」。
-- supported: 原則 true。下書きが根拠（テキストまたは画像）に整合していれば true とする。
-  false にするのは、**複数資料をまたぐ計算・集計・差分**で数値を根拠から確認できない、
-  または答えが根拠に全く存在しない/明らかな当て推量の場合のみ。図表・ハイライト・単一資料の
-  読み取りは、画像や根拠と整合していれば supported=true とすること。"""
+_VERIFY_SYSTEM = """あなたは回答の最終検証・整形を行う**厳格な**レビュアです。誤答は0点より悪い(-1点)ため、
+確実に正しいと言い切れない場合は不採用(supported=false)にしてください。JSONで返す。
+- final: 質問が求める値・要素だけに最小化した最終回答（説明・前置き・冗長語・根拠の再掲・余分な語を
+  全て除去、列挙は「、」区切り、指定の単位/桁/表記・並び順に従う）。
+- supported の判定（**疑わしきは false**）:
+  * 答えの値・要素が根拠（テキストまたは画像）に**明示的に現れており**そのまま読み取れる → true。
+  * 次はすべて false にする:
+    - 複数資料をまたぐ**計算・集計・合計・差分・平均**で、その数値が根拠に直接書かれていない。
+    - **列挙問題**で、条件に一致する要素を**すべて**列挙できたと根拠から確認しきれない（一部のみは false）。
+    - 「該当なし」だが、対象が本当に存在しないと根拠で確認できない（見つからなかっただけは false）。
+    - 下書きに余分な語・言い換えがあり、正解表記と一致する確証がない。
+    - 根拠が弱い/断片的で、答えが推測を含む。"""
 
 _VERIFY_SCHEMA = {
     "type": "object",
@@ -126,7 +130,7 @@ def _clip_tokens(text: str, max_tokens: int = settings.MAX_ANSWER_TOKENS - 20) -
     return _ENC.decode(toks[:max_tokens])
 
 
-def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: bool = False) -> dict:
+def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: bool = True) -> dict:
     r = retrieve.get()
     evidence = r.retrieve(question, k=k)
     images = _gather_images(question, evidence)
@@ -154,8 +158,9 @@ def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: b
     ans = (obj.get("answer") or "").strip()
     conf = obj.get("confidence", "low")
 
-    # confidence-gated abstention (Incorrect=-1 → don't guess)
-    if not ans or conf == "low":
+    # PRECISION-FIRST: under Incorrect=-1, a blank submission scores 0, so only commit on
+    # HIGH confidence — medium/low abstain outright.
+    if not ans or conf != "high":
         return _result(question, settings.ABSTAIN, conf, ans, evidence, images, verified=False)
 
     # second pass: distill to exact format + strict support check
