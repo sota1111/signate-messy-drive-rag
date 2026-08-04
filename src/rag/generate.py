@@ -24,7 +24,8 @@ SYSTEM = """あなたは社内共有ドライブの資料に基づいて質問�
 - 質問文が指定する形式・単位・小数桁・丸め方・並び順・主略称/通常表現・抽出対象の表記に従う。
 - 資料内で定義されたタスクID/アクションID/列名/パラメータ名などの識別子は資料の表記どおりに書く。
 - 要素を列挙する問題は、指定された順序（ID昇順・座席表順・文書出現順など）で過不足なく「、」区切りで列挙する。
-- 条件に該当する対象が資料内に存在しない場合は「該当なし」「ありません」等と明確に答える（これは有効な回答）。
+- 条件に該当する対象が資料内に**明確に存在しないと確認できる**場合のみ「該当なし」と答える。
+  対象が存在するか自体が不明なとき「該当なし」と断定してはいけない（それは誤答=-1になる）→ confidence="low"。
 - 根拠資料から答えを特定できない、または確信が持てない場合は confidence を "low" にする。
   誤答は0点より悪い(-1点)ため、確信が持てないときは推測せず低確信とすること。
 - 特に、複数資料をまたぐ集計・計算・差分は、根拠から数値を一つ一つ確認できないなら confidence="low"。
@@ -125,7 +126,7 @@ def _clip_tokens(text: str, max_tokens: int = settings.MAX_ANSWER_TOKENS - 20) -
     return _ENC.decode(toks[:max_tokens])
 
 
-def answer_question(question: str, *, k: int = 12, hard: bool = False, verify: bool = True) -> dict:
+def answer_question(question: str, *, k: int = 12, hard: bool = False, verify: bool = False) -> dict:
     r = retrieve.get()
     evidence = r.retrieve(question, k=k)
     images = _gather_images(question, evidence)
