@@ -13,7 +13,7 @@ import re
 import tiktoken
 
 from config import settings
-from src.rag import archetype, diffpair, llm, retrieve
+from src.rag import archetype, diffpair, llm, pivotcond, retrieve
 from src.rag.corpus import nfc
 
 _ENC = tiktoken.get_encoding("cl100k_base")
@@ -184,6 +184,21 @@ def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: b
         if diff_ans:
             return _result(question, _clip_tokens(diff_ans), "high", diff_ans, [], [], verified=True)
         return _result(question, settings.ABSTAIN, "diff-unresolved", "", [], [], verified=False)
+
+    # PivotTable / AutoFilter extraction-condition questions ("PivotTableの抽出条件", "フィルターで
+    # 抽出されている条件") are answered by reading the workbook's pivot definition / autofilter XML and
+    # recomputing the condition deterministically (valid idx6/idx11/idx21), not by retrieval+LLM (the
+    # condition is not in the flattened cell text). When it resolves uniquely we return it; when it is
+    # clearly a condition question we cannot resolve we abstain (Missing 0 beats Incorrect −1). Runs
+    # before the trust gate because the answer is self-contained and does not depend on trust.
+    if pivotcond.is_pivot_condition_question(question):
+        try:
+            pv_ans = pivotcond.answer_question(question)
+        except Exception:
+            pv_ans = None
+        if pv_ans:
+            return _result(question, _clip_tokens(pv_ans), "high", pv_ans, [], [], verified=True)
+        return _result(question, settings.ABSTAIN, "pivot-unresolved", "", [], [], verified=False)
 
     # Trust gate (additive): abstain up-front on archetypes measured as unreliable, before any LLM
     # call. scoring.selfimprove passes apply_trust_gate=False because that loop *measures* trust.

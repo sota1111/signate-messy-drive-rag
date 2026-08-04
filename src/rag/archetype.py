@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import re
 
+from src.rag import pivotcond
 from src.rag.corpus import nfc
 
 # archetype -> deterministic comparator kind (numeric / set / string), see scoring.deterministic
 ARCHETYPE_KIND: dict[str, str] = {
+    "pivot_condition": "string",
     "config_model_type": "string",
     "config_hyperparam": "numeric",
     "metric_score": "numeric",
@@ -56,6 +58,11 @@ _RULES: list[tuple[str, re.Pattern[str]]] = [
 def classify(question: str) -> str:
     """Return the archetype name for a question, or ``"unknown"`` when none applies."""
     q = nfc(question)
+    # PivotTable / AutoFilter condition questions route to the deterministic pivotcond module; keep
+    # detection identical to it (like diffpair/version_diff) so classification and routing agree. A
+    # version-diff question is never a pivot-condition question, so this precedes the rule table.
+    if pivotcond.is_pivot_condition_question(q):
+        return "pivot_condition"
     for name, pat in _RULES:
         if pat.search(q):
             return name
