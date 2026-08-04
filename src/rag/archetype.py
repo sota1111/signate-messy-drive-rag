@@ -35,6 +35,9 @@ ARCHETYPE_KIND: dict[str, str] = {
     "glossary_formal": "string",
     "glossary_abbrev": "string",
     "version_diff": "string",
+    "document_extract": "string",
+    "derived_calculation": "numeric",
+    "fact_lookup": "string",
 }
 
 # Ordered, most-specific-first. First matching pattern wins.
@@ -73,7 +76,16 @@ def classify(question: str) -> str:
     for name, pat in _RULES:
         if pat.search(q):
             return name
-    return "unknown"
+    # Production questions are intentionally much broader than the synthetic generators. Preserve
+    # that distribution with coarse, answer-mode archetypes instead of collapsing most test items
+    # into an unusable ``unknown`` bucket.
+    if re.search(r"(old|旧|v\d|r\d).{0,30}(から|と).{0,30}(最新|新版|v\d|r\d|変更|修正|比較)", q, re.I):
+        return "version_diff"
+    if re.search(r"(差額|合計|総額|割合|何%|何倍|平均|最大|最小|相関|上昇率|減少|計算|算出|いくら|何時間|何人|いくつ)", q):
+        return "derived_calculation"
+    if re.search(r"(抽出|抜き出|挙げ|箇所|項目|タスクID|アクションID)", q):
+        return "document_extract"
+    return "fact_lookup"
 
 
 def kind_of(archetype: str) -> str:
