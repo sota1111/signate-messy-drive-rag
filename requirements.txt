@@ -1,0 +1,37 @@
+# --- LLM / GCP ---
+google-genai>=1.0.0
+google-cloud-aiplatform>=1.60.0
+google-cloud-storage>=2.10.0
+google-cloud-firestore>=2.11.0
+google-auth>=2.30.0
+
+# --- Document extraction (multimodal messy drive) ---
+python-docx==1.1.2          # .docx  (bold runs, highlight)
+openpyxl==3.1.5             # .xlsx  (cell fill colors, PivotTable)
+python-pptx==1.0.2          # .pptx  (highlight, shapes, text)
+pypdf==5.1.0                # .pdf   text layer
+pdfplumber==0.11.4          # .pdf   tables / words with bbox
+pdf2image==1.17.0           # .pdf   -> image (for OCR / vision)
+Pillow==11.0.0              # images
+pandas==2.2.2
+numpy==1.26.4
+tabulate==0.9.0
+nbformat==5.10.4            # .ipynb parsing
+
+# --- Retrieval ---
+rank-bm25==0.2.2            # sparse lexical retrieval
+scikit-learn==1.5.2         # cosine / utilities
+tiktoken==0.7.0             # token counting (answer 1000-token cap)
+
+# --- Official evaluator parity (local self-scoring) ---
+openai==1.57.1             # only if an OpenAI key is later supplied; judge default is Gemini
+
+# --- API backend (Cloud Run) ---
+fastapi==0.115.5
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+python-dotenv==1.2.2
+
+# --- Dev ---
+pytest==8.3.3
+tqdm==4.67.1

@@ -1,0 +1,41 @@
+# ---- Competition data (SIGNATE distribution — MUST NOT be redistributed) ----
+/data/
+*.zip
+
+# ---- Secrets / credentials ----
+.env
+.env.*
+!.env.example
+*-sa-key.json
+service-account*.json
+application_default_credentials.json
+
+# ---- Build / run artifacts ----
+/artifacts/
+/index_store/
+/.cache/
+*.log
+result/
+scoring.csv
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# ---- Terraform ----
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# ---- OS ----
+.DS_Store
