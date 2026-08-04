@@ -23,15 +23,9 @@ resource "google_project_service" "services" {
   disable_on_destroy = false
 }
 
-# ---------------- Artifact Registry (container images) ----------------
-resource "google_artifact_registry_repository" "docker" {
-  project       = var.project_id
-  location      = var.region
-  repository_id = var.artifact_registry_repository
-  format        = "DOCKER"
-  description   = "Container images for signate-messy-drive-rag backend."
-  depends_on    = [google_project_service.services]
-}
+# ---------------- Artifact Registry ----------------
+# The Docker repo is created by scripts/deploy.sh BEFORE the image build (the build must push
+# into an existing repo), so it is intentionally NOT managed here to avoid a create race.
 
 # ---------------- GCS bucket (retrieval index artifacts) ----------------
 resource "google_storage_bucket" "index" {

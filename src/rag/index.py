@@ -16,7 +16,8 @@ import numpy as np
 
 from config import settings
 from src.rag import corpus, llm
-from src.rag.extract import extract
+# NOTE: extract/* (office→openpyxl/pptx, passwords→msoffcrypto) is imported lazily inside build()
+# so the SERVE path (generate→retrieve→index) needs none of the heavy extraction deps.
 
 CHUNK_CHARS = 1200
 CHUNK_OVERLAP = 180
@@ -74,6 +75,8 @@ def tokenize(text: str) -> list[str]:
 
 
 def build(caption_images: bool = True, verbose: bool = True) -> None:
+    from src.rag.extract import extract  # heavy deps, only needed for building
+
     refs = corpus.walk()
     chunks: list[Chunk] = []
     cid = 0

@@ -9,7 +9,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from src.rag.corpus import FileRef
-from src.rag.extract import office, plain, passwords
+
+# office/plain/passwords pull heavy, build-only deps (openpyxl, python-pptx, msoffcrypto,
+# pdfplumber). They are imported lazily inside extract() so that merely importing a light
+# submodule of this package (e.g. `extract.glossary` at serve time) does NOT require them.
 
 
 @dataclass
@@ -28,6 +31,8 @@ _TEXT = {"md", "txt"}
 
 
 def extract(ref: FileRef, *, caption_images: bool = False) -> ExtractedDoc:
+    from src.rag.extract import office, plain, passwords  # heavy, build-only deps
+
     ext = ref.ext
     try:
         if ext in _OFFICE:
