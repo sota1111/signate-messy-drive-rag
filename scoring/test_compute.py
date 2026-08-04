@@ -44,3 +44,39 @@ def test_synth_contains_cross_aggregate_items():
     synth.gen_cross_aggregate(items)
     assert len(items) == 3
     assert all(compute.answer_question(i.question) == i.truth for i in items)
+
+
+def test_unconditional_csv_column_stats_are_computed_exactly():
+    items = []
+    synth.gen_csv(items)
+    assert items
+    for item in items:
+        assert deterministic.score(
+            compute.column_stat_answer(item.question), item.truth, "numeric"
+        ) == "Perfect"
+
+
+def test_csv_column_stat_rejects_conditional_questions():
+    items = []
+    synth.gen_csv(items)
+    question = items[0].question.replace("の平均値", "が10以上のときの平均値")
+    assert compute.column_stat_answer(question) is None
+
+
+def test_generate_routes_validated_csv_stat_without_llm(monkeypatch):
+    items = []
+    synth.gen_csv(items)
+    item = next(i for i in items if i.archetype == "csv_column_mean")
+    monkeypatch.setattr(
+        generate,
+        "_load_trust",
+        lambda: {"csv_column_mean": {"trust": True, "holdout_validated": True}},
+    )
+    monkeypatch.setattr(
+        generate.llm,
+        "generate",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
+    )
+    result = generate.answer_question(item.question)
+    assert deterministic.score(result["answer"], item.truth, "numeric") == "Perfect"
+    assert result["verified"] is True
