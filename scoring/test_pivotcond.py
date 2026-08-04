@@ -82,6 +82,9 @@ def test_idx6_routes_through_generate_without_llm(monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("LLM/retrieval must not be reached for a resolved pivot-condition question")
 
+    # SOT-2424: the pivot hard module direct-commits only for a hold-out-validated archetype.
+    monkeypatch.setattr(generate, "_load_trust",
+                        lambda: {"pivot_condition": {"holdout_validated": True}})
     monkeypatch.setattr(generate.llm, "generate", _boom)
     monkeypatch.setattr(generate.retrieve, "get", _boom)
     res = generate.answer_question(_Q_IDX6)

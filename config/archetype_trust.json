@@ -2,119 +2,411 @@
   "_meta": {
     "generator": "scoring.selfimprove",
     "threshold": 0.8,
-    "min_committed": 5
+    "min_committed": 5,
+    "holdout_min_committed": 3,
+    "sealed_companies": [
+      "医療法人社団 蒼泉会 ひがし丘総合病院",
+      "株式会社青葉バイオメディカル機器",
+      "青葉与信マネジメント株式会社"
+    ],
+    "trust_judged_on": "holdout"
   },
   "archetypes": {
     "config_hyperparam": {
       "trust": true,
-      "precision": 1.0,
-      "coverage": 1.0,
-      "mean_score": 1.0,
-      "n": 20,
-      "committed": 20,
-      "verdicts": {
-        "Perfect": 20,
-        "Acceptable": 0,
-        "Missing": 0,
-        "Incorrect": 0
+      "holdout_validated": true,
+      "trust_basis": "holdout",
+      "holdout": {
+        "trust": true,
+        "precision": 1.0,
+        "coverage": 1.0,
+        "mean_score": 1.0,
+        "n": 6,
+        "committed": 6,
+        "verdicts": {
+          "Perfect": 6,
+          "Acceptable": 0,
+          "Missing": 0,
+          "Incorrect": 0
+        }
+      },
+      "dev": {
+        "trust": true,
+        "precision": 1.0,
+        "coverage": 1.0,
+        "mean_score": 1.0,
+        "n": 14,
+        "committed": 14,
+        "verdicts": {
+          "Perfect": 14,
+          "Acceptable": 0,
+          "Missing": 0,
+          "Incorrect": 0
+        }
       }
     },
     "config_model_type": {
       "trust": true,
-      "precision": 1.0,
-      "coverage": 1.0,
-      "mean_score": 1.0,
-      "n": 10,
-      "committed": 10,
-      "verdicts": {
-        "Perfect": 10,
-        "Acceptable": 0,
-        "Missing": 0,
-        "Incorrect": 0
+      "holdout_validated": true,
+      "trust_basis": "holdout",
+      "holdout": {
+        "trust": true,
+        "precision": 1.0,
+        "coverage": 1.0,
+        "mean_score": 1.0,
+        "n": 3,
+        "committed": 3,
+        "verdicts": {
+          "Perfect": 3,
+          "Acceptable": 0,
+          "Missing": 0,
+          "Incorrect": 0
+        }
+      },
+      "dev": {
+        "trust": true,
+        "precision": 1.0,
+        "coverage": 1.0,
+        "mean_score": 1.0,
+        "n": 7,
+        "committed": 7,
+        "verdicts": {
+          "Perfect": 7,
+          "Acceptable": 0,
+          "Missing": 0,
+          "Incorrect": 0
+        }
+      }
+    },
+    "contract_amount": {
+      "trust": true,
+      "holdout_validated": false,
+      "trust_basis": "insufficient",
+      "holdout": null,
+      "dev": {
+        "trust": false,
+        "precision": 0.0,
+        "coverage": 0.0,
+        "mean_score": 0.0,
+        "n": 1,
+        "committed": 0,
+        "verdicts": {
+          "Perfect": 0,
+          "Acceptable": 0,
+          "Missing": 1,
+          "Incorrect": 0
+        }
+      }
+    },
+    "cross_aggregate": {
+      "trust": true,
+      "holdout_validated": false,
+      "trust_basis": "insufficient",
+      "holdout": null,
+      "dev": {
+        "trust": false,
+        "precision": 0.0,
+        "coverage": 0.0,
+        "mean_score": 0.0,
+        "n": 3,
+        "committed": 0,
+        "verdicts": {
+          "Perfect": 0,
+          "Acceptable": 0,
+          "Missing": 3,
+          "Incorrect": 0
+        }
       }
     },
     "csv_column_max": {
       "trust": true,
-      "precision": 1.0,
-      "coverage": 0.8824,
-      "mean_score": 0.7353,
-      "n": 17,
-      "committed": 15,
-      "verdicts": {
-        "Perfect": 10,
-        "Acceptable": 5,
-        "Missing": 2,
-        "Incorrect": 0
+      "holdout_validated": true,
+      "trust_basis": "holdout",
+      "holdout": {
+        "trust": true,
+        "precision": 1.0,
+        "coverage": 0.4545,
+        "mean_score": 0.3182,
+        "n": 11,
+        "committed": 5,
+        "verdicts": {
+          "Perfect": 2,
+          "Acceptable": 3,
+          "Missing": 6,
+          "Incorrect": 0
+        }
+      },
+      "dev": {
+        "trust": true,
+        "precision": 1.0,
+        "coverage": 0.3846,
+        "mean_score": 0.3462,
+        "n": 26,
+        "committed": 10,
+        "verdicts": {
+          "Perfect": 8,
+          "Acceptable": 2,
+          "Missing": 16,
+          "Incorrect": 0
+        }
       }
     },
     "csv_column_mean": {
       "trust": true,
-      "precision": 0.9375,
-      "coverage": 0.9412,
-      "mean_score": 0.8235,
-      "n": 17,
-      "committed": 16,
-      "verdicts": {
-        "Perfect": 15,
-        "Acceptable": 0,
-        "Missing": 1,
-        "Incorrect": 1
+      "holdout_validated": true,
+      "trust_basis": "holdout",
+      "holdout": {
+        "trust": true,
+        "precision": 0.8,
+        "coverage": 0.4545,
+        "mean_score": 0.2727,
+        "n": 11,
+        "committed": 5,
+        "verdicts": {
+          "Perfect": 4,
+          "Acceptable": 0,
+          "Missing": 6,
+          "Incorrect": 1
+        }
+      },
+      "dev": {
+        "trust": true,
+        "precision": 1.0,
+        "coverage": 0.4231,
+        "mean_score": 0.4231,
+        "n": 26,
+        "committed": 11,
+        "verdicts": {
+          "Perfect": 11,
+          "Acceptable": 0,
+          "Missing": 15,
+          "Incorrect": 0
+        }
       }
     },
     "data_shape": {
       "trust": true,
-      "precision": 1.0,
-      "coverage": 1.0,
-      "mean_score": 1.0,
-      "n": 40,
-      "committed": 40,
-      "verdicts": {
-        "Perfect": 40,
-        "Acceptable": 0,
-        "Missing": 0,
-        "Incorrect": 0
+      "holdout_validated": true,
+      "trust_basis": "holdout",
+      "holdout": {
+        "trust": true,
+        "precision": 1.0,
+        "coverage": 1.0,
+        "mean_score": 1.0,
+        "n": 12,
+        "committed": 12,
+        "verdicts": {
+          "Perfect": 12,
+          "Acceptable": 0,
+          "Missing": 0,
+          "Incorrect": 0
+        }
+      },
+      "dev": {
+        "trust": true,
+        "precision": 1.0,
+        "coverage": 1.0,
+        "mean_score": 1.0,
+        "n": 28,
+        "committed": 28,
+        "verdicts": {
+          "Perfect": 28,
+          "Acceptable": 0,
+          "Missing": 0,
+          "Incorrect": 0
+        }
+      }
+    },
+    "enum_set": {
+      "trust": true,
+      "holdout_validated": false,
+      "trust_basis": "insufficient",
+      "holdout": {
+        "trust": false,
+        "precision": 0.0,
+        "coverage": 0.0,
+        "mean_score": 0.0,
+        "n": 2,
+        "committed": 0,
+        "verdicts": {
+          "Perfect": 0,
+          "Acceptable": 0,
+          "Missing": 2,
+          "Incorrect": 0
+        }
+      },
+      "dev": {
+        "trust": false,
+        "precision": 0.0,
+        "coverage": 0.0,
+        "mean_score": 0.0,
+        "n": 1,
+        "committed": 0,
+        "verdicts": {
+          "Perfect": 0,
+          "Acceptable": 0,
+          "Missing": 1,
+          "Incorrect": 0
+        }
       }
     },
     "glossary_abbrev": {
       "trust": true,
-      "precision": 1.0,
-      "coverage": 0.8,
-      "mean_score": 0.8,
-      "n": 15,
-      "committed": 12,
-      "verdicts": {
-        "Perfect": 12,
-        "Acceptable": 0,
-        "Missing": 3,
-        "Incorrect": 0
+      "holdout_validated": false,
+      "trust_basis": "dev",
+      "holdout": null,
+      "dev": {
+        "trust": true,
+        "precision": 1.0,
+        "coverage": 0.48,
+        "mean_score": 0.48,
+        "n": 25,
+        "committed": 12,
+        "verdicts": {
+          "Perfect": 12,
+          "Acceptable": 0,
+          "Missing": 13,
+          "Incorrect": 0
+        }
       }
     },
     "glossary_formal": {
       "trust": true,
-      "precision": 1.0,
-      "coverage": 0.6,
-      "mean_score": 0.6,
-      "n": 15,
-      "committed": 9,
-      "verdicts": {
-        "Perfect": 9,
-        "Acceptable": 0,
-        "Missing": 6,
-        "Incorrect": 0
+      "holdout_validated": false,
+      "trust_basis": "dev",
+      "holdout": null,
+      "dev": {
+        "trust": true,
+        "precision": 1.0,
+        "coverage": 0.36,
+        "mean_score": 0.36,
+        "n": 25,
+        "committed": 9,
+        "verdicts": {
+          "Perfect": 9,
+          "Acceptable": 0,
+          "Missing": 16,
+          "Incorrect": 0
+        }
+      }
+    },
+    "highlight_set": {
+      "trust": true,
+      "holdout_validated": false,
+      "trust_basis": "insufficient",
+      "holdout": null,
+      "dev": {
+        "trust": false,
+        "precision": 0.0,
+        "coverage": 0.0,
+        "mean_score": 0.0,
+        "n": 3,
+        "committed": 0,
+        "verdicts": {
+          "Perfect": 0,
+          "Acceptable": 0,
+          "Missing": 3,
+          "Incorrect": 0
+        }
       }
     },
     "metric_score": {
       "trust": true,
-      "precision": 1.0,
-      "coverage": 0.8636,
-      "mean_score": 0.8636,
-      "n": 22,
-      "committed": 19,
-      "verdicts": {
-        "Perfect": 19,
-        "Acceptable": 0,
-        "Missing": 3,
-        "Incorrect": 0
+      "holdout_validated": true,
+      "trust_basis": "holdout",
+      "holdout": {
+        "trust": true,
+        "precision": 1.0,
+        "coverage": 0.625,
+        "mean_score": 0.625,
+        "n": 8,
+        "committed": 5,
+        "verdicts": {
+          "Perfect": 5,
+          "Acceptable": 0,
+          "Missing": 3,
+          "Incorrect": 0
+        }
+      },
+      "dev": {
+        "trust": true,
+        "precision": 1.0,
+        "coverage": 1.0,
+        "mean_score": 1.0,
+        "n": 14,
+        "committed": 14,
+        "verdicts": {
+          "Perfect": 14,
+          "Acceptable": 0,
+          "Missing": 0,
+          "Incorrect": 0
+        }
+      }
+    },
+    "pivot_condition": {
+      "trust": true,
+      "holdout_validated": false,
+      "trust_basis": "insufficient",
+      "holdout": {
+        "trust": false,
+        "precision": 0.0,
+        "coverage": 0.0,
+        "mean_score": 0.0,
+        "n": 8,
+        "committed": 0,
+        "verdicts": {
+          "Perfect": 0,
+          "Acceptable": 0,
+          "Missing": 8,
+          "Incorrect": 0
+        }
+      },
+      "dev": {
+        "trust": false,
+        "precision": 0.0,
+        "coverage": 0.0,
+        "mean_score": 0.0,
+        "n": 17,
+        "committed": 0,
+        "verdicts": {
+          "Perfect": 0,
+          "Acceptable": 0,
+          "Missing": 17,
+          "Incorrect": 0
+        }
+      }
+    },
+    "version_diff": {
+      "trust": true,
+      "holdout_validated": false,
+      "trust_basis": "insufficient",
+      "holdout": {
+        "trust": false,
+        "precision": 0.0,
+        "coverage": 0.0,
+        "mean_score": 0.0,
+        "n": 1,
+        "committed": 0,
+        "verdicts": {
+          "Perfect": 0,
+          "Acceptable": 0,
+          "Missing": 1,
+          "Incorrect": 0
+        }
+      },
+      "dev": {
+        "trust": false,
+        "precision": 0.0,
+        "coverage": 0.0,
+        "mean_score": 0.0,
+        "n": 2,
+        "committed": 0,
+        "verdicts": {
+          "Perfect": 0,
+          "Acceptable": 0,
+          "Missing": 2,
+          "Incorrect": 0
+        }
       }
     }
   }

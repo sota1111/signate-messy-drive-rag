@@ -21,6 +21,9 @@ def test_valid_cross_aggregates_are_computed_exactly():
 
 
 def test_generate_routes_computation_without_llm(monkeypatch):
+    # SOT-2424: the compute hard module direct-commits only for a hold-out-validated archetype.
+    monkeypatch.setattr(generate, "_load_trust",
+                        lambda: {"cross_aggregate": {"holdout_validated": True}})
     question, truth = _valid(13)
     monkeypatch.setattr(generate.llm, "generate", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
     result = generate.answer_question(question)
@@ -28,7 +31,9 @@ def test_generate_routes_computation_without_llm(monkeypatch):
     assert result["verified"] is True
 
 
-def test_unresolved_compute_question_abstains():
+def test_unresolved_compute_question_abstains(monkeypatch):
+    monkeypatch.setattr(generate, "_load_trust",
+                        lambda: {"cross_aggregate": {"holdout_validated": True}})
     result = generate.answer_question("存在しない案件のfoo列の平均値を算出してください。")
     assert result["answer"] == settings.ABSTAIN
     assert result["confidence"] == "compute-unresolved"

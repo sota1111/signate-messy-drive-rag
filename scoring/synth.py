@@ -132,7 +132,7 @@ def gen_metrics(items: list[SynthItem]) -> None:
                     _fmt_num(v, 0), company, rel))
 
 
-def gen_csv(items: list[SynthItem], per_project_cols: int = 2) -> None:
+def gen_csv(items: list[SynthItem], per_project_cols: int = 5) -> None:
     for p in _canonical_by_company("train.csv"):
         try:
             df = pd.read_csv(p)
@@ -159,7 +159,7 @@ def gen_csv(items: list[SynthItem], per_project_cols: int = 2) -> None:
                     _fmt_num(max_v, dp), company, rel))
 
 
-def gen_glossary(items: list[SynthItem], limit: int = 15) -> None:
+def gen_glossary(items: list[SynthItem], limit: int = 25) -> None:
     from src.rag.extract import glossary as G
 
     try:
@@ -248,6 +248,43 @@ def gen_cross_aggregate(items: list[SynthItem]) -> None:
                                "横断", "valid deterministic ground truth"))
 
 
+# valid index -> (archetype, kind, company). Ground truth is the official valid_txt.csv answer (known
+# correct), so these enrich enum/highlight/contract coverage without risking a fabricated GT. The
+# company is the real owning project so sealing that project moves the item into the hold-out slice.
+_VALID_ANCHORED: dict[int, tuple[str, str, str]] = {
+    0:  ("highlight_set", "set",     "株式会社青潮モビリティサービス"),
+    23: ("highlight_set", "set",     "株式会社青潮モビリティサービス"),
+    25: ("highlight_set", "set",     "株式会社東都人材プラットフォーム"),
+    20: ("enum_set",      "set",     "青葉与信マネジメント株式会社"),
+    26: ("enum_set",      "set",     "株式会社青葉バイオメディカル機器"),
+    15: ("enum_set",      "set",     "横断"),
+    12: ("contract_amount", "numeric", "京橋信用ソリューションズ株式会社"),
+}
+
+
+def gen_valid_anchored(items: list[SynthItem]) -> None:
+    """Enum / highlight / contract-amount items with official (known-correct) valid ground truth.
+
+    These archetypes have no clean machine-GT generator across every project, so we anchor a handful
+    to the official valid answers. They score Perfect against themselves (self-test invariant) and,
+    labelled with their real owning company, participate in the hold-out split like any other item."""
+    try:
+        questions = pd.read_csv(settings.QUESTIONS_VALID).set_index("index")
+        truths = pd.read_csv(settings.VALID_GROUND_TRUTH, header=None, index_col=0)
+    except Exception:
+        return
+    for idx, (arch, kind, company) in _VALID_ANCHORED.items():
+        try:
+            q = str(questions.at[idx, "question"])
+            truth = nfc(str(truths.at[idx, 1]))
+        except Exception:
+            continue
+        if not q or not truth:
+            continue
+        items.append(SynthItem(f"{arch}::valid{idx}", arch, kind, q, truth, company,
+                               "valid official ground truth"))
+
+
 def build() -> list[SynthItem]:
     items: list[SynthItem] = []
     gen_config(items)
@@ -257,6 +294,7 @@ def build() -> list[SynthItem]:
     gen_version_diff(items)
     gen_pivot_condition(items)
     gen_cross_aggregate(items)
+    gen_valid_anchored(items)
     return items
 
 

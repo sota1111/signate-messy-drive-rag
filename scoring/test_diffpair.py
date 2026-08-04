@@ -51,6 +51,9 @@ def test_idx9_routes_through_generate_without_llm(monkeypatch):
     def _boom(*a, **k):  # any LLM/retrieval use would mean the diff route didn't fire
         raise AssertionError("LLM/retrieval must not be reached for a resolved version-diff question")
 
+    # SOT-2424: the diff hard module direct-commits only for a hold-out-validated archetype.
+    monkeypatch.setattr(generate, "_load_trust",
+                        lambda: {"version_diff": {"holdout_validated": True}})
     monkeypatch.setattr(generate.llm, "generate", _boom)
     monkeypatch.setattr(generate.retrieve, "get", _boom)
     res = generate.answer_question(_Q_IDX9)
