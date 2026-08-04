@@ -125,6 +125,45 @@ def _csv_aggregate(question: str) -> str | None:
     return f"{float(value):.{int(dp.group(1))}f}" if dp else str(value)
 
 
+def _nearest_ids_to_filtered_mean(question: str) -> str | None:
+    """Return every id tied for nearest to a filtered column mean, in source order."""
+    q = nfc(question)
+    if not ("平均値に最も近い" in q and "idをすべて" in q):
+        return None
+    refs = [r for r in walk() if r.ext == "csv" and r.name == "train.csv"
+            and _company_match(q, r.project) and "analysis_project/data" in r.rel]
+    if len(refs) != 1:
+        return None
+    df = pd.read_csv(refs[0].path)
+    selected = df
+    filter_columns: set[str] = set()
+    for col in map(str, df.columns):
+        eq = re.search(rf"{re.escape(col)}(?:が|=)([^、,]+?)(?=かつ|、|,|$)", q)
+        gt = re.search(rf"{re.escape(col)}(?:が)?([0-9,.]+)より大きい", q)
+        if gt:
+            selected = selected[pd.to_numeric(selected[col], errors="coerce")
+                                > float(gt.group(1).replace(",", ""))]
+            filter_columns.add(col)
+        elif eq:
+            raw = eq.group(1).strip()
+            selected = selected[selected[col].astype(str).map(nfc) == nfc(raw)]
+            filter_columns.add(col)
+    if not filter_columns or selected.empty or "id" not in df.columns:
+        return None
+    candidates = [str(c) for c in df.columns if c not in filter_columns | {"id"}
+                  and re.search(rf"(?<![A-Za-z0-9_]){re.escape(str(c))}(?![A-Za-z0-9_])", q)]
+    if len(candidates) != 1:
+        return None
+    target = candidates[0]
+    values = pd.to_numeric(selected[target], errors="coerce").dropna()
+    if values.empty:
+        return None
+    mean = values.mean()
+    distances = (pd.to_numeric(selected[target], errors="coerce") - mean).abs()
+    nearest = selected.loc[distances == distances.min(), "id"].astype(str).tolist()
+    return "、".join(nearest) if nearest else None
+
+
 def _all_paid_tax(question: str) -> str | None:
     if not ("全案件" in question and "消費税" in question and "税込" in question):
         return None
@@ -156,7 +195,7 @@ def _all_paid_tax(question: str) -> str | None:
 
 def answer_question(question: str) -> str | None:
     q = nfc(question)
-    for fn in (_all_paid_tax, _fraction_difference, _csv_aggregate):
+    for fn in (_nearest_ids_to_filtered_mean, _all_paid_tax, _fraction_difference, _csv_aggregate):
         try:
             answer = fn(q)
         except Exception:
