@@ -186,12 +186,43 @@ def gen_glossary(items: list[SynthItem], limit: int = 15) -> None:
                 nfc(ab), "社内管理", "社内管理/社内用語集"))
 
 
+def gen_version_diff(items: list[SynthItem]) -> None:
+    """One item per resolvable version pair (old→latest structural diff).
+
+    Ground truth is the deterministic structural diff itself (``src.rag.diffpair``), so scoring a RAG
+    run against it measures whether the generator correctly *routes* a diff question to the structural
+    differ and reproduces the "変更前 → 変更後" answer — the same path that answers valid idx9."""
+    from src.rag import diffpair
+
+    try:
+        pairs = diffpair.find_pairs()
+    except Exception:
+        return
+    for p in pairs:
+        company = nfc(p.new.project) or nfc(p.old.project)
+        base = nfc(p.base)
+        if not company or not base:
+            continue
+        q = (f"{company}の{base}について、旧版と最新版を比較し、"
+             "変更された箇所を変更前と変更後で答えてください。")
+        try:
+            truth = diffpair.answer_question(q)
+        except Exception:
+            truth = None
+        if not truth:  # unresolvable / ambiguous / no substantive change → skip (not a benchmark item)
+            continue
+        items.append(SynthItem(
+            f"vdiff::{company}::{base}", "version_diff", "string",
+            q, truth, company, _rel(p.new.path)))
+
+
 def build() -> list[SynthItem]:
     items: list[SynthItem] = []
     gen_config(items)
     gen_metrics(items)
     gen_csv(items)
     gen_glossary(items)
+    gen_version_diff(items)
     return items
 
 

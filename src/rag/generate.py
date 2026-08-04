@@ -13,7 +13,7 @@ import re
 import tiktoken
 
 from config import settings
-from src.rag import archetype, llm, retrieve
+from src.rag import archetype, diffpair, llm, retrieve
 from src.rag.corpus import nfc
 
 _ENC = tiktoken.get_encoding("cl100k_base")
@@ -171,6 +171,20 @@ def _draft(prompt: str, system: str, model: str, images, temperature: float, thi
 
 def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: bool = True,
                     consistency: bool = True, apply_trust_gate: bool = True) -> dict:
+    # Version-diff questions ("old版と最新版の変更点") are answered by a deterministic structural
+    # diff of the two versions, not by retrieval+LLM (the two files are near-identical and the single
+    # changed value is buried). When the pair/diff resolves uniquely we return it; when it's clearly a
+    # diff question but we cannot resolve it we abstain (Missing 0 beats Incorrect -1). This runs
+    # before the trust gate because the diff is self-contained and does not depend on trust.
+    if diffpair.is_diff_question(question):
+        try:
+            diff_ans = diffpair.answer_question(question)
+        except Exception:
+            diff_ans = None
+        if diff_ans:
+            return _result(question, _clip_tokens(diff_ans), "high", diff_ans, [], [], verified=True)
+        return _result(question, settings.ABSTAIN, "diff-unresolved", "", [], [], verified=False)
+
     # Trust gate (additive): abstain up-front on archetypes measured as unreliable, before any LLM
     # call. scoring.selfimprove passes apply_trust_gate=False because that loop *measures* trust.
     if apply_trust_gate and _trust_blocks(question):
