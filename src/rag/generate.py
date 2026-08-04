@@ -130,7 +130,24 @@ def _clip_tokens(text: str, max_tokens: int = settings.MAX_ANSWER_TOKENS - 20) -
     return _ENC.decode(toks[:max_tokens])
 
 
-def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: bool = True) -> dict:
+def _norm_answer(a: str) -> str:
+    """Normalize for consistency comparison: keep alphanumerics + JP, drop separators/units-ish."""
+    a = nfc(a).lower()
+    return re.sub(r"[\s、,。.\-_/:：;；()（）「」『』【】\"'`円%％]", "", a)
+
+
+def _draft(prompt: str, system: str, model: str, images, temperature: float, thinking: int) -> dict:
+    raw = llm.generate(prompt, system=system, model=model, images=images,
+                       temperature=temperature, thinking_budget=thinking,
+                       max_output_tokens=2048, response_schema=_RESPONSE_SCHEMA)
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"answer": raw.strip(), "confidence": "low"}
+
+
+def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: bool = True,
+                    consistency: bool = True) -> dict:
     r = retrieve.get()
     evidence = r.retrieve(question, k=k)
     images = _gather_images(question, evidence)
@@ -140,28 +157,22 @@ def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: b
         "上記の根拠のみに基づき、質問へ回答してください。JSONで reasoning, answer, confidence を返す。"
     )
     model = settings.GEN_MODEL_HARD if (hard or images) else settings.GEN_MODEL
-    raw = llm.generate(
-        prompt,
-        system=SYSTEM,
-        model=model,
-        images=images,
-        temperature=0.0,
-        thinking_budget=2048 if (hard or images) else 512,
-        max_output_tokens=2048,
-        response_schema=_RESPONSE_SCHEMA,
-    )
-    try:
-        obj = json.loads(raw)
-    except Exception:
-        obj = {"answer": raw.strip(), "confidence": "low"}
+    think = 2048 if (hard or images) else 512
 
+    # Self-consistency: draft twice with diversity. Unstable answers (computed/ambiguous guesses)
+    # disagree across samples → abstain. Stable facts agree → candidate to commit.
+    obj = _draft(prompt, SYSTEM, model, images, 0.0, think)
     ans = (obj.get("answer") or "").strip()
     conf = obj.get("confidence", "low")
-
-    # PRECISION-FIRST: under Incorrect=-1, a blank submission scores 0, so only commit on
-    # HIGH confidence — medium/low abstain outright.
     if not ans or conf != "high":
         return _result(question, settings.ABSTAIN, conf, ans, evidence, images, verified=False)
+
+    if consistency:
+        obj2 = _draft(prompt, SYSTEM, model, images, 0.6, think)
+        ans2 = (obj2.get("answer") or "").strip()
+        if not ans2 or _norm_answer(ans) != _norm_answer(ans2):
+            return _result(question, settings.ABSTAIN, "inconsistent", ans, evidence, images,
+                           verified=False)
 
     # second pass: distill to exact format + strict support check
     if verify:
