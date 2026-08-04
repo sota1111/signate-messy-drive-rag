@@ -1,0 +1,97 @@
+"""Extraction for non-Office files: pdf, csv/tsv, md/txt/toml/lock, py, ipynb, json."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from src.rag.corpus import FileRef
+
+
+def read_text_any(path: Path) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def extract_pdf(ref: FileRef) -> str:
+    """Text layer via pdfplumber (keeps tables as pipe rows). OCR fallback handled by vision layer."""
+    out: list[str] = []
+    try:
+        import pdfplumber
+
+        with pdfplumber.open(str(ref.path)) as pdf:
+            for pi, page in enumerate(pdf.pages, 1):
+                out.append(f"[ページ{pi}]")
+                txt = page.extract_text() or ""
+                if txt.strip():
+                    out.append(txt)
+                for tbl in page.extract_tables() or []:
+                    out.append("[表]")
+                    for row in tbl:
+                        out.append(" | ".join("" if c is None else str(c) for c in row))
+    except Exception:
+        try:
+            import pypdf
+
+            for pi, page in enumerate(pypdf.PdfReader(str(ref.path)).pages, 1):
+                out.append(f"[ページ{pi}]\n{page.extract_text() or ''}")
+        except Exception:
+            return ""
+    return "\n".join(out)
+
+
+def extract_csv(ref: FileRef) -> str:
+    """CSV/TSV → header + row sample + light schema; big tables are summarised, not dumped."""
+    import pandas as pd
+
+    sep = "\t" if ref.ext == "tsv" else ","
+    try:
+        df = pd.read_csv(ref.path, sep=sep, encoding="utf-8", on_bad_lines="skip")
+    except Exception:
+        return read_text_any(ref.path)[:20000]
+    lines = [f"列: {list(df.columns)}", f"行数: {len(df)}"]
+    # numeric summary helps aggregation questions
+    try:
+        desc = df.describe(include="all").transpose()
+        lines.append("[統計サマリ]")
+        lines.append(desc.to_string())
+    except Exception:
+        pass
+    lines.append("[先頭20行]")
+    lines.append(df.head(20).to_string())
+    return "\n".join(lines)
+
+
+def extract_ipynb(ref: FileRef) -> str:
+    try:
+        nb = json.loads(read_text_any(ref.path))
+    except Exception:
+        return read_text_any(ref.path)[:20000]
+    out: list[str] = []
+    for cell in nb.get("cells", []):
+        src = "".join(cell.get("source", []))
+        if not src.strip():
+            continue
+        out.append(f"[{cell.get('cell_type', 'code')}セル]\n{src}")
+        for o in cell.get("outputs", []):
+            txt = o.get("text") or (o.get("data", {}) or {}).get("text/plain")
+            if txt:
+                out.append("[出力] " + ("".join(txt) if isinstance(txt, list) else str(txt))[:1500])
+    return "\n".join(out)
+
+
+def extract_code(ref: FileRef) -> str:
+    return f"[コード {ref.name}]\n" + read_text_any(ref.path)
+
+
+def extract_json(ref: FileRef) -> str:
+    txt = read_text_any(ref.path)
+    try:
+        return f"[JSON {ref.name}]\n" + json.dumps(json.loads(txt), ensure_ascii=False, indent=1)
+    except Exception:
+        return f"[JSON {ref.name}]\n" + txt
+
+
+def extract_generic_text(ref: FileRef) -> str:
+    return read_text_any(ref.path)
