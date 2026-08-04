@@ -1,5 +1,6 @@
 # ---- Competition data (SIGNATE distribution — MUST NOT be redistributed) ----
 /data/
+/backend/_corpus/
 *.zip
 
 # ---- Secrets / credentials ----

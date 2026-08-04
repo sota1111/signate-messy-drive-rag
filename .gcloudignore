@@ -1,0 +1,16 @@
+# Cloud Build upload filter. NOTE: presence of this file overrides .gitignore for builds,
+# so index_store/ and backend/_corpus (needed in the image) are INCLUDED by default here.
+.git/
+.venv/
+venv/
+__pycache__/
+*.pyc
+data/            # full 228MB corpus — NOT needed in the image (glossary is staged separately)
+artifacts/
+docs/
+tests/
+infra/
+*.log
+.env
+.env.*
+!.env.example
