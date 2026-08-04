@@ -78,9 +78,16 @@ def _judge_openai(pred: str, truth: str) -> str:
     return json.loads(resp)["judged"]
 
 
-def judge(pred: str, truth: str) -> str:
+def judge(pred: str, truth: str, votes: int = 1) -> str:
+    """Judge a (pred, truth) pair. votes>1 = majority-of-N self-consistency (reduces proxy noise)."""
     backend = settings.JUDGE_BACKEND.lower()
-    return _judge_openai(pred, truth) if backend == "openai" else _judge_gemini(pred, truth)
+    one = _judge_openai if backend == "openai" else _judge_gemini
+    if votes <= 1:
+        return one(pred, truth)
+    import collections
+
+    tally = collections.Counter(one(pred, truth) for _ in range(votes))
+    return tally.most_common(1)[0][0]
 
 
 def score_pairs(pairs: list[tuple[str, str]]) -> tuple[float, list[dict]]:
@@ -90,7 +97,7 @@ def score_pairs(pairs: list[tuple[str, str]]) -> tuple[float, list[dict]]:
     def one(p):
         pred, truth = p
         try:
-            verdict = judge(pred, truth)
+            verdict = judge(pred, truth, votes=3)
         except Exception as e:  # noqa: BLE001
             verdict = f"ERROR:{e}"
         return {"pred": pred, "truth": truth, "judged": verdict,

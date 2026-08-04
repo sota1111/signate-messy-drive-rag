@@ -23,11 +23,32 @@ SYSTEM = """あなたは社内共有ドライブの資料に基づいて質問�
 - 回答は必ず日本語。提供された『根拠資料』のみを使用し、外部知識や推測で補わない。
 - 質問文が指定する形式・単位・小数桁・丸め方・並び順・主略称/通常表現・抽出対象の表記に従う。
 - 資料内で定義されたタスクID/アクションID/列名/パラメータ名などの識別子は資料の表記どおりに書く。
-- 要素を列挙する問題は、指定された順序（ID昇順・座席表順・文書出現順など）で過不足なく列挙する。
+- 要素を列挙する問題は、指定された順序（ID昇順・座席表順・文書出現順など）で過不足なく「、」区切りで列挙する。
 - 条件に該当する対象が資料内に存在しない場合は「該当なし」「ありません」等と明確に答える（これは有効な回答）。
 - 根拠資料から答えを特定できない、または確信が持てない場合は confidence を "low" にする。
   誤答は0点より悪い(-1点)ため、確信が持てないときは推測せず低確信とすること。
-- answer は簡潔に。冗長な説明や前置きを付けず、問われた値・要素そのものを答える。"""
+- 特に、複数資料をまたぐ集計・計算・差分は、根拠から数値を一つ一つ確認できないなら confidence="low"。
+- answer は **問われた値・要素そのものだけ** を書く。説明文・前置き・言い換え・根拠の再掲・
+  単位の重複・「〜です」等の冗長表現を付けない。ground_truthに無い追加情報を足すと誤りになる。"""
+
+# Second pass: distill to the minimal exact-format answer AND strictly re-verify support.
+_VERIFY_SYSTEM = """あなたは回答の整形と最終検証を行うレビュアです。
+質問・根拠資料（画像を含む場合あり）・下書き回答を読み、JSONで返す。
+- final: 質問が求める値・要素だけに最小化した最終回答（説明・前置き・冗長語・根拠の再掲を全て除去、
+  列挙は「、」区切り、指定の単位/桁/表記・並び順に従う）。該当が無いと確認できる場合は「該当なし」。
+- supported: 原則 true。下書きが根拠（テキストまたは画像）に整合していれば true とする。
+  false にするのは、**複数資料をまたぐ計算・集計・差分**で数値を根拠から確認できない、
+  または答えが根拠に全く存在しない/明らかな当て推量の場合のみ。図表・ハイライト・単一資料の
+  読み取りは、画像や根拠と整合していれば supported=true とすること。"""
+
+_VERIFY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "supported": {"type": "boolean"},
+        "final": {"type": "string"},
+    },
+    "required": ["supported", "final"],
+}
 
 _RESPONSE_SCHEMA = {
     "type": "object",
@@ -104,7 +125,7 @@ def _clip_tokens(text: str, max_tokens: int = settings.MAX_ANSWER_TOKENS - 20) -
     return _ENC.decode(toks[:max_tokens])
 
 
-def answer_question(question: str, *, k: int = 12, hard: bool = False) -> dict:
+def answer_question(question: str, *, k: int = 12, hard: bool = False, verify: bool = True) -> dict:
     r = retrieve.get()
     evidence = r.retrieve(question, k=k)
     images = _gather_images(question, evidence)
@@ -131,16 +152,38 @@ def answer_question(question: str, *, k: int = 12, hard: bool = False) -> dict:
 
     ans = (obj.get("answer") or "").strip()
     conf = obj.get("confidence", "low")
+
     # confidence-gated abstention (Incorrect=-1 → don't guess)
     if not ans or conf == "low":
-        final = settings.ABSTAIN
-    else:
-        final = _clip_tokens(ans)
+        return _result(question, settings.ABSTAIN, conf, ans, evidence, images, verified=False)
+
+    # second pass: distill to exact format + strict support check
+    if verify:
+        try:
+            vraw = llm.generate(
+                f"質問:\n{question}\n\n根拠資料:\n{_format_evidence(evidence, max_chars=12000)}\n\n"
+                f"下書き回答: {ans}\n\n上記を検証・整形してJSONで supported, final を返す。",
+                system=_VERIFY_SYSTEM, model=model, images=images, temperature=0.0,
+                thinking_budget=512, max_output_tokens=1024, response_schema=_VERIFY_SCHEMA,
+            )
+            vobj = json.loads(vraw)
+            if not vobj.get("supported", False):
+                return _result(question, settings.ABSTAIN, "low", ans, evidence, images, verified=True)
+            final_ans = (vobj.get("final") or ans).strip() or ans
+            return _result(question, _clip_tokens(final_ans), conf, ans, evidence, images, verified=True)
+        except Exception:
+            pass  # fall through to the un-verified answer
+
+    return _result(question, _clip_tokens(ans), conf, ans, evidence, images, verified=False)
+
+
+def _result(question, answer, conf, raw, evidence, images, verified) -> dict:
     return {
         "question": question,
-        "answer": final,
+        "answer": answer,
         "confidence": conf,
-        "raw_answer": ans,
+        "raw_answer": raw,
+        "verified": verified,
         "evidence_files": [c["rel"] for c in evidence[:6]],
         "used_images": len(images),
     }
