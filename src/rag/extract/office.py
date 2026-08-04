@@ -11,6 +11,7 @@ import io
 
 import docx
 import openpyxl
+from openpyxl.styles.colors import COLOR_INDEX
 from openpyxl.utils import get_column_letter
 from pptx import Presentation
 
@@ -71,6 +72,24 @@ def _color_name(argb: str | None) -> str | None:
     if s < 0.12 or v < 0.20 or (v > 0.96 and s < 0.06):
         return None
     return _hue_name(h * 360)
+
+
+def _excel_color_name(color) -> str | None:
+    """Resolve direct and indexed Excel fills through the same deterministic HSV classifier."""
+    if color is None:
+        return None
+    kind = getattr(color, "type", None)
+    if kind == "rgb":
+        return _color_name(getattr(color, "rgb", None))
+    if kind == "indexed":
+        try:
+            index = int(color.indexed)
+            return _color_name(COLOR_INDEX[index]) if 0 <= index < len(COLOR_INDEX) else None
+        except (TypeError, ValueError):
+            return None
+    # Theme colours depend on the workbook theme. Treating their integer index as RGB caused
+    # unstable false highlights, so unresolved theme/auto colours deliberately fail closed.
+    return None
 
 
 # ---------------- DOCX ----------------
@@ -148,7 +167,7 @@ def extract_xlsx(ref: FileRef, data: bytes | None) -> str:
                     color = None
                     fg = getattr(fill, "fgColor", None)
                     if fg is not None:
-                        color = _color_name(getattr(fg, "rgb", None))
+                        color = _excel_color_name(fg)
                     if color:
                         highlights.append(f"{c.coordinate}({color}): {v}")
             if cells:

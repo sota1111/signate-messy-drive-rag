@@ -13,7 +13,7 @@ import re
 import tiktoken
 
 from config import settings
-from src.rag import archetype, compute, diffpair, llm, pivotcond, retrieve
+from src.rag import archetype, compute, diffpair, enumeration, llm, pivotcond, retrieve
 from src.rag.corpus import nfc
 
 _ENC = tiktoken.get_encoding("cl100k_base")
@@ -95,7 +95,7 @@ _FIGURE_HINT = re.compile(
 _PNG_NAME = re.compile(r"([A-Za-z0-9_\-]+\.png)")
 
 
-def _gather_images(question: str, evidence: list[dict], limit: int = 3) -> list["llm.Image"]:
+def _gather_images(question: str, evidence: list[dict], limit: int = 16) -> list["llm.Image"]:
     """Attach PNGs referenced by the question or present as image chunks in the evidence."""
     from src.rag import corpus
     from src.rag.extract import vision
@@ -114,6 +114,24 @@ def _gather_images(question: str, evidence: list[dict], limit: int = 3) -> list[
         if r.ext == "png" and nfc(r.name).lower() in wanted:
             if not target_company or nfc(r.project) == nfc(target_company):
                 picks.append(r)
+    # Image-only reports contain one embedded raster per page. Attach the complete report so a
+    # page-title question cannot silently read an unrelated retrieved PNG.
+    pdf_picks = []
+    for c in evidence:
+        if c.get("kind") == "pdf":
+            r = refs.get(c["rel"])
+            if r is not None and (not target_company or nfc(r.project) == nfc(target_company)):
+                pdf_picks.append(r)
+    if pdf_picks:
+        imgs = []
+        for r in pdf_picks:
+            try:
+                imgs.extend(llm.Image(data=data, mime_type=mime)
+                            for data, mime in vision.pdf_page_images(r.path))
+            except Exception:
+                continue
+            if imgs:
+                return imgs[:limit]
     # else image chunks that surfaced in retrieval
     if not picks:
         for c in evidence:
@@ -181,6 +199,11 @@ def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: b
         if computed is not None:
             return _result(question, _clip_tokens(computed), "high", computed, [], [], verified=True)
         return _result(question, settings.ABSTAIN, "compute-unresolved", "", [], [], verified=False)
+
+    if enumeration.is_enumeration_question(question):
+        enum_answer = enumeration.answer_question(question)
+        if enum_answer is not None:
+            return _result(question, _clip_tokens(enum_answer), "high", enum_answer, [], [], verified=True)
 
     # Version-diff questions ("old版と最新版の変更点") are answered by a deterministic structural
     # diff of the two versions, not by retrieval+LLM (the two files are near-identical and the single

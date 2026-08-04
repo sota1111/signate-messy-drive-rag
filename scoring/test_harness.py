@@ -42,7 +42,7 @@ def test_classify_known_archetypes():
     assert archetype.classify("青葉のproject_config.jsonの model_type は何ですか。") == "config_model_type"
     assert archetype.classify("metrics.json における accuracy の値を答えてください。") == "metric_score"
     assert archetype.classify("社内用語集で「PP」の正式名称は何ですか。") == "glossary_formal"
-    assert archetype.classify("この契約書の太字箇所をすべて抜き出してください。") == "unknown"
+    assert archetype.classify("この契約書の太字箇所をすべて抜き出してください。") == "enum_set"
     assert archetype.classify(
         "青嶺の提案書について、oldフォルダ内の旧版と最新版を比較し、変更された箇所を変更前と変更後で答えてください。"
     ) == "version_diff"
