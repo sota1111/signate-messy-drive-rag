@@ -216,6 +216,20 @@ def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: b
     measuring = not apply_trust_gate
     advisory: list[str] = []
 
+    # Deterministic UNCONDITIONAL CSV column statistic ("train.csv の {列} の 最大値/平均値/最小値").
+    # Pure pandas over the project's own train.csv, so it generalizes to the sealed hold-out companies
+    # with no overfit — unlike the conditional _csv_aggregate below it needs no row filter. Direct-commit
+    # only when the classified archetype (csv_column_max / csv_column_mean) is hold-out validated;
+    # otherwise the value is an advisory hint for the LLM+verify gates. It defers (returns None) on any
+    # conditional question, so it never answers a filtered question with a whole-column value.
+    _csv_arch = archetype.classify(question)
+    if _csv_arch in ("csv_column_max", "csv_column_mean"):
+        stat = compute.column_stat_answer(question)
+        if stat is not None:
+            if measuring or _holdout_validated(_csv_arch):
+                return _result(question, _clip_tokens(stat), "high", stat, [], [], verified=True)
+            advisory.append(stat)
+
     if compute.is_compute_question(question):
         computed = compute.answer_question(question)
         if computed is not None:

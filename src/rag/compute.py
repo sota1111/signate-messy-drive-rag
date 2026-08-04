@@ -125,6 +125,64 @@ def _csv_aggregate(question: str) -> str | None:
     return f"{float(value):.{int(dp.group(1))}f}" if dp else str(value)
 
 
+def _csv_column_stat(question: str) -> str | None:
+    """Unconditional single-column statistic over a project's canonical ``train.csv``.
+
+    Answers "…train.csv の {列} の {最大値|最小値|平均値} …" deterministically (pure pandas, no LLM).
+    This is the *unconditional* counterpart to ``_csv_aggregate`` (which requires a row filter): reading
+    a column's whole-table max/min/mean generalizes to every project — including the sealed hold-out
+    companies — because it only touches that project's own file, so it cannot overfit the visible set.
+
+    Returns None (deferring to the LLM / the filtered route) when a row condition is present, when the
+    column or the train.csv is ambiguous, when the column is non-numeric, or when the requested statistic
+    is not a plain column max/min/mean — so it never answers a *conditional* question with a whole-column
+    value."""
+    q = nfc(question)
+    if not re.search(r"(列|カラム|column)", q):
+        return None
+    # A row condition is _csv_aggregate's job — never answer it with an unconditional whole-column stat.
+    if re.search(r"(条件|かつ|のとき|の時|場合|以上|以下|未満|より大き|より小さ|超える|=)", q):
+        return None
+    refs = [r for r in walk() if r.ext == "csv" and r.name == "train.csv"
+            and _company_match(q, r.project) and "analysis_project/data" in r.rel]
+    if len(refs) != 1:
+        return None
+    df = pd.read_csv(refs[0].path)
+    targets = [str(c) for c in df.columns
+               if re.search(rf"(?<![A-Za-z0-9_]){re.escape(str(c))}(?![A-Za-z0-9_])", q)
+               and str(c).lower() not in ("id", "index")]
+    if len(targets) != 1:
+        return None
+    series = df[targets[0]]
+    if not pd.api.types.is_numeric_dtype(series):
+        return None
+    if "平均" in q or "mean" in q.lower():
+        value = series.mean()
+    elif "最大" in q or "max" in q.lower():
+        value = series.max()
+    elif "最小" in q or "min" in q.lower():
+        value = series.min()
+    else:
+        return None
+    if pd.isna(value):
+        return None
+    if "整数" in q or "四捨五入" in q:
+        return str(round(float(value)))
+    dp = re.search(r"小数第([0-9]+)位", q)
+    if dp:
+        return f"{float(value):.{int(dp.group(1))}f}"
+    fv = float(value)
+    return str(int(fv)) if fv.is_integer() else f"{fv:.2f}"
+
+
+def column_stat_answer(question: str) -> str | None:
+    """Public entry for the unconditional column-statistic route (see ``_csv_column_stat``)."""
+    try:
+        return _csv_column_stat(question)
+    except Exception:
+        return None
+
+
 def _nearest_ids_to_filtered_mean(question: str) -> str | None:
     """Return every id tied for nearest to a filtered column mean, in source order."""
     q = nfc(question)
