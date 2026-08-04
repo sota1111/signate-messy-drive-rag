@@ -126,7 +126,7 @@ def _clip_tokens(text: str, max_tokens: int = settings.MAX_ANSWER_TOKENS - 20) -
     return _ENC.decode(toks[:max_tokens])
 
 
-def answer_question(question: str, *, k: int = 12, hard: bool = False, verify: bool = False) -> dict:
+def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: bool = False) -> dict:
     r = retrieve.get()
     evidence = r.retrieve(question, k=k)
     images = _gather_images(question, evidence)
