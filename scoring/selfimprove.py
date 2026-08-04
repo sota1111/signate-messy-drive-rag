@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from config import settings
+from scoring.calibrate import load_ledger, spearman
 from scoring import deterministic, synth
 from src.rag.corpus import nfc
 
@@ -249,6 +250,13 @@ def report(decided: dict[str, dict], dev_rows: list[dict], hold_rows: list[dict]
     committable = [a for a, e in decided.items() if e["holdout_validated"]]
     print(f"overall mean — dev: {dev_mean:+.4f}   hold-out: {hold_mean:+.4f}")
     print(f"hold-out-validated (direct-commit) archetypes: {committable}")
+    try:
+        ledger = load_ledger()
+        rho = spearman([r["local_score"] for r in ledger],
+                       [r["real_public_score"] for r in ledger])
+        print(f"proxy↔real Spearman KPI ({len(ledger)} submissions): {rho:+.4f}")
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"proxy↔real Spearman KPI: unavailable ({exc})")
 
 
 def main() -> int:
