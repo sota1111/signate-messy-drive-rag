@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 ABSTAIN_TOKENS = ("わかりません", "分かりません", "不明")
 POINTS = {"Perfect": 1.0, "Acceptable": 0.5, "Missing": 0.0, "Incorrect": -1.0}
@@ -28,18 +29,33 @@ def _numbers(s: str) -> list[float]:
     return [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", s)]
 
 
+def _decimal_token(s: str) -> tuple[Decimal, int] | None:
+    matches = re.findall(r"-?\d+(?:\.\d+)?", _nfkc(s).replace(",", ""))
+    if len(matches) != 1:
+        return None
+    token = matches[0]
+    try:
+        return Decimal(token), len(token.partition(".")[2])
+    except InvalidOperation:
+        return None
+
+
+def _round_half_up(value: Decimal, dp: int) -> Decimal:
+    return value.quantize(Decimal(1).scaleb(-dp), rounding=ROUND_HALF_UP)
+
+
 def score_numeric(pred: str, truth: str, round_dp: int | None = None) -> str:
     if is_abstain(pred):
         return "Missing"
-    tp, tt = _numbers(pred), _numbers(truth)
-    if not tp or not tt:
+    parsed_p, parsed_t = _decimal_token(pred), _decimal_token(truth)
+    if parsed_p is None or parsed_t is None:
         return "Incorrect"
-    p, t = tp[0], tt[0]
-    if abs(p - t) < 1e-9:
+    (p, pred_dp), (t, truth_dp) = parsed_p, parsed_t
+    if p == t:
         return "Perfect"
-    # Acceptable: matches when either side rounded to the ground truth's precision
-    dp = round_dp if round_dp is not None else (len(truth.split(".")[1]) if "." in truth else 0)
-    if round(p, dp) == round(t, dp):
+    # 四捨五入 the more precise value to the explicitly written lower precision.
+    dp = round_dp if round_dp is not None else min(pred_dp, truth_dp)
+    if pred_dp != truth_dp and _round_half_up(p, dp) == _round_half_up(t, dp):
         return "Acceptable"
     return "Incorrect"
 

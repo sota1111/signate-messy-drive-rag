@@ -10,7 +10,9 @@ Score: Perfect +1, Acceptable +0.5, Missing 0, Incorrect -1; final = mean over q
 from __future__ import annotations
 
 import json
+import re
 import textwrap
+import unicodedata
 
 from config import settings
 from src.rag import llm
@@ -49,6 +51,44 @@ _SCHEMA = {
 _POINTS = {"Perfect": 1.0, "Acceptable": 0.5, "Missing": 0.0, "Incorrect": -1.0}
 
 
+def _norm(value: str) -> str:
+    return unicodedata.normalize("NFKC", str(value)).strip().lower()
+
+
+def _numeric_shape(value: str) -> tuple[str, str] | None:
+    normalized = _norm(value).replace(",", "")
+    matches = list(re.finditer(r"-?\d+(?:\.\d+)?", normalized))
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    context = normalized[:match.start()] + normalized[match.end():]
+    return match.group(), re.sub(r"[\s:：=()（）]", "", context)
+
+
+def deterministic_judge(pred: str, truth: str) -> str | None:
+    """Resolve unambiguous cases; return None for semantic LLM review."""
+    from scoring import deterministic
+
+    if deterministic.is_abstain(pred):
+        return "Missing"
+    p, t = _norm(pred), _norm(truth)
+    if p == t:
+        return "Perfect"
+    pn, tn = _numeric_shape(pred), _numeric_shape(truth)
+    if pn and tn:
+        pc, tc = pn[1], tn[1]
+        if (("税込" in pc and "税抜" in tc) or ("税抜" in pc and "税込" in tc)):
+            return "Incorrect"
+        if not pc or not tc or pc == tc:
+            return deterministic.score_numeric(pred, truth)
+        return None
+    if re.search(r"[、,/／・\n]", p) or re.search(r"[、,/／・\n]", t):
+        return deterministic.score_set(pred, truth)
+    if max(len(p), len(t)) <= 32 and not re.search(r"[。.!?！？\s]", p + t):
+        return "Incorrect"
+    return None
+
+
 def _judge_gemini(pred: str, truth: str) -> str:
     raw = llm.generate(
         f"ground_truth: {truth} answer: {pred}\n",
@@ -78,10 +118,17 @@ def _judge_openai(pred: str, truth: str) -> str:
     return json.loads(resp)["judged"]
 
 
-def judge(pred: str, truth: str, votes: int = 1) -> str:
-    """Judge a (pred, truth) pair. votes>1 = majority-of-N self-consistency (reduces proxy noise)."""
+def judge(pred: str, truth: str, votes: int = 3) -> str:
+    """Hybrid judge: deterministic first, majority-of-3 LLM when ambiguous."""
+    resolved = deterministic_judge(pred, truth)
+    if resolved is not None:
+        return resolved
     backend = settings.JUDGE_BACKEND.lower()
     one = _judge_openai if backend == "openai" else _judge_gemini
+    return _majority(one, pred, truth, votes)
+
+
+def _majority(one, pred: str, truth: str, votes: int) -> str:
     if votes <= 1:
         return one(pred, truth)
     import collections
