@@ -27,7 +27,21 @@ Metric: Perfect +1 / Acceptable +0.5 / Missing 0 / Incorrect −1, mean.
 |---|---|---|---|---|
 | 1 | 2026-08-04 | baseline hybrid RAG + abstention | **−0.2333** (−7/30) | below blank; committed answers net-negative |
 | 2 | 2026-08-04 | precision-first (high-conf + strict verify) | **−0.0667** (−2/30) | +0.167; 該当なし 19→2; still slightly net-neg |
-| 3 | 2026-08-04 | + answer self-consistency gate | _pending_ | 24 committed / 74 abstain; valid Incorrect 5→2 |
+| 3 | 2026-08-04 | + answer self-consistency gate | **−0.0333** (−1/30) | **best real submission**; 24 committed |
+| 4 | 2026-08-04 | SOT-2407..2411 modules (diff/pivot/aggregate/enum) | **−0.1000** (−3/30) | **regressed** despite valid30 proxy +0.5833 |
+
+### ⚠️ Key lesson — valid30 is NOT predictive (overfitting)
+Submission #4's hard modules scored **+0.5833 on valid30 but −0.10 on the real public 30**. They were
+developed against valid30's specific questions and commit confident-wrong answers on unseen questions
+(each −1). **The local proxy AND valid30 both mislead.** Public LB shows each team's *best* submission,
+so #3 (−0.0333) still stands as our recorded floor.
+
+### Strategy pivot (2026-08-04, human decision): aim for the frontier, not ±0.x
+1st place = 1.0 (30/30, answers everything correctly). The gap is **coverage × accuracy**, not abstention
+tuning. Shift from precision-first (caps near 0) to answering the full spectrum correctly, gated by a
+**generalization hold-out** (sealed project + independent synth) so improvements must *transfer*, not
+overfit valid30. Driven by the opus autonomous loop: **SOT-2424** (hold-out + overfit detection, Urgent)
+→ **SOT-2425** (per-archetype coverage×accuracy iteration).
 
 **Public LB is 30 questions**; score = mean of Perfect+1/Acceptable+0.5/Missing0/Incorrect−1
 (so a blank all-abstain submission = 0.0). Top ~11 teams = 30/30 = 1.0 → the task is fully saturable.
