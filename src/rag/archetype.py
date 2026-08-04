@@ -21,6 +21,7 @@ from src.rag.corpus import nfc
 
 # archetype -> deterministic comparator kind (numeric / set / string), see scoring.deterministic
 ARCHETYPE_KIND: dict[str, str] = {
+    "cross_aggregate": "numeric",
     "pivot_condition": "string",
     "config_model_type": "string",
     "config_hyperparam": "numeric",
@@ -35,6 +36,7 @@ ARCHETYPE_KIND: dict[str, str] = {
 
 # Ordered, most-specific-first. First matching pattern wins.
 _RULES: list[tuple[str, re.Pattern[str]]] = [
+    ("cross_aggregate", re.compile(r"(総額を計算|いくら少なく|平均を算出|条件.{0,30}(平均|最大|件数))")),
     # A version-diff question: an explicit OLDER-version marker + a comparison/change verb. Kept in
     # sync with diffpair.is_diff_question so classification and routing agree.
     ("version_diff", re.compile(

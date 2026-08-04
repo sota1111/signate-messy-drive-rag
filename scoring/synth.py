@@ -236,6 +236,18 @@ def gen_pivot_condition(items: list[SynthItem]) -> None:
             "pivot_condition", "string", b.question, nfc(b.truth), b.company, b.source))
 
 
+def gen_cross_aggregate(items: list[SynthItem]) -> None:
+    """Known-valid cross-document calculations, answered by the deterministic compute route."""
+    import pandas as pd
+    questions = pd.read_csv(settings.QUESTIONS_VALID).set_index("index")
+    truths = pd.read_csv(settings.VALID_GROUND_TRUTH, header=None, index_col=0)
+    for idx in (3, 8, 13):
+        q = str(questions.at[idx, "question"])
+        truth = str(truths.at[idx, 1])
+        items.append(SynthItem(f"cross::{idx}", "cross_aggregate", "numeric", q, truth,
+                               "横断", "valid deterministic ground truth"))
+
+
 def build() -> list[SynthItem]:
     items: list[SynthItem] = []
     gen_config(items)
@@ -244,6 +256,7 @@ def build() -> list[SynthItem]:
     gen_glossary(items)
     gen_version_diff(items)
     gen_pivot_condition(items)
+    gen_cross_aggregate(items)
     return items
 
 

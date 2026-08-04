@@ -13,7 +13,7 @@ import re
 import tiktoken
 
 from config import settings
-from src.rag import archetype, diffpair, llm, pivotcond, retrieve
+from src.rag import archetype, compute, diffpair, llm, pivotcond, retrieve
 from src.rag.corpus import nfc
 
 _ENC = tiktoken.get_encoding("cl100k_base")
@@ -171,6 +171,17 @@ def _draft(prompt: str, system: str, model: str, images, temperature: float, thi
 
 def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: bool = True,
                     consistency: bool = True, apply_trust_gate: bool = True) -> dict:
+    # Preserve the additive trust policy even for deterministic routes: an explicitly measured and
+    # disabled archetype remains disabled, while an unmapped cross-aggregate proceeds to computation.
+    if apply_trust_gate and _trust_blocks(question):
+        return _result(question, settings.ABSTAIN, "untrusted-archetype", "", [], [], verified=False)
+
+    if compute.is_compute_question(question):
+        computed = compute.answer_question(question)
+        if computed is not None:
+            return _result(question, _clip_tokens(computed), "high", computed, [], [], verified=True)
+        return _result(question, settings.ABSTAIN, "compute-unresolved", "", [], [], verified=False)
+
     # Version-diff questions ("old版と最新版の変更点") are answered by a deterministic structural
     # diff of the two versions, not by retrieval+LLM (the two files are near-identical and the single
     # changed value is buried). When the pair/diff resolves uniquely we return it; when it's clearly a
@@ -202,9 +213,6 @@ def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: b
 
     # Trust gate (additive): abstain up-front on archetypes measured as unreliable, before any LLM
     # call. scoring.selfimprove passes apply_trust_gate=False because that loop *measures* trust.
-    if apply_trust_gate and _trust_blocks(question):
-        return _result(question, settings.ABSTAIN, "untrusted-archetype", "", [], [], verified=False)
-
     r = retrieve.get()
     evidence = r.retrieve(question, k=k)
     images = _gather_images(question, evidence)
