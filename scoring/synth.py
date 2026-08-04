@@ -216,6 +216,26 @@ def gen_version_diff(items: list[SynthItem]) -> None:
             q, truth, company, _rel(p.new.path)))
 
 
+def gen_pivot_condition(items: list[SynthItem]) -> None:
+    """One item per PivotTable measure and per active AutoFilter in the corpus.
+
+    Ground truth is the deterministic ``src.rag.pivotcond`` answer, so scoring a RAG run against it
+    measures whether the generator routes a condition question to the pivot/filter reader and
+    reproduces the answer — the same path that answers valid idx6 / idx11 / idx21."""
+    from src.rag import pivotcond
+
+    try:
+        bench = pivotcond.benchmark_items()
+    except Exception:
+        return
+    for n, b in enumerate(bench):
+        if not b.truth:
+            continue
+        items.append(SynthItem(
+            f"pivotcond::{b.company}::{b.source}::{n}",
+            "pivot_condition", "string", b.question, nfc(b.truth), b.company, b.source))
+
+
 def build() -> list[SynthItem]:
     items: list[SynthItem] = []
     gen_config(items)
@@ -223,6 +243,7 @@ def build() -> list[SynthItem]:
     gen_csv(items)
     gen_glossary(items)
     gen_version_diff(items)
+    gen_pivot_condition(items)
     return items
 
 
