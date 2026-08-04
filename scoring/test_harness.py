@@ -43,6 +43,9 @@ def test_classify_known_archetypes():
     assert archetype.classify("metrics.json における accuracy の値を答えてください。") == "metric_score"
     assert archetype.classify("社内用語集で「PP」の正式名称は何ですか。") == "glossary_formal"
     assert archetype.classify("この契約書の太字箇所をすべて抜き出してください。") == "unknown"
+    assert archetype.classify(
+        "青嶺の提案書について、oldフォルダ内の旧版と最新版を比較し、変更された箇所を変更前と変更後で答えてください。"
+    ) == "version_diff"
 
 
 def test_kind_of():
@@ -52,18 +55,37 @@ def test_kind_of():
 
 
 # ------------------------------- synthetic benchmark ------------------------------------------
+# The 8 core archetypes are bulk-generated (≥10 each); version_diff is corpus-limited (one item per
+# real version pair) so it is validated separately below.
+_CORE_ARCHETYPES = {
+    "config_model_type", "config_hyperparam", "metric_score", "data_shape",
+    "csv_column_mean", "csv_column_max", "glossary_formal", "glossary_abbrev",
+}
+
+
 def test_synth_builds_and_self_scores_perfect():
     items = synth.build()
     assert len(items) >= 100, f"expected at least 100 benchmark items, got {len(items)}"
     counts = collections.Counter(it.archetype for it in items)
-    assert len(counts) == 8, f"expected 8 archetypes, got {counts}"
-    assert min(counts.values()) >= 10, f"every archetype needs at least 10 items: {counts}"
+    core = {a: n for a, n in counts.items() if a in _CORE_ARCHETYPES}
+    assert set(core) == _CORE_ARCHETYPES, f"expected the 8 core archetypes, got {counts}"
+    assert min(core.values()) >= 10, f"every core archetype needs at least 10 items: {counts}"
     # every programmatically-extracted truth must score Perfect against itself (rubric alignment)
     for it in items:
         assert D.score(it.truth, it.truth, it.kind) == "Perfect", f"{it.id}: {it.truth!r}"
     # archetype labels are all known comparators
     for it in items:
         assert it.kind in ("numeric", "set", "string")
+
+
+def test_synth_version_diff_present_and_labelled():
+    items = synth.build()
+    vd = [it for it in items if it.archetype == "version_diff"]
+    assert len(vd) >= 3, f"expected several version_diff benchmark items, got {len(vd)}"
+    for it in vd:
+        assert it.kind == "string"
+        assert "→" in it.truth  # a "変更前 → 変更後" rendering
+        assert archetype.classify(it.question) == "version_diff"
 
 
 # ------------------------------- additive trust gate ------------------------------------------
