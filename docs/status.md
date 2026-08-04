@@ -23,11 +23,18 @@ Metric: Perfect +1 / Acceptable +0.5 / Missing 0 / Incorrect −1, mean.
 
 ## SIGNATE submissions
 
-| # | date | memo | test answers | 該当なし | abstain | official score |
-|---|---|---|---|---|---|---|
-| 1 | 2026-08-04 | baseline hybrid RAG + abstention | 37 substantive | 19 | 44 | _see SIGNATE leaderboard_ |
+| # | date | memo | official Public score | note |
+|---|---|---|---|---|
+| 1 | 2026-08-04 | baseline hybrid RAG + abstention | **−0.2333** (−7/30) | below blank baseline; committed answers net-negative |
+| 2 | 2026-08-04 | precision-first (high-conf + strict verify) | _pending_ | valid proxy +0.25, Incorrect 15→5 |
 
-The official gpt-5.2 score is shown on the SIGNATE competition page (the CLI cannot read it back).
+**Public LB is 30 questions**; score = mean of Perfect+1/Acceptable+0.5/Missing0/Incorrect−1
+(so a blank all-abstain submission = 0.0). Top ~11 teams = 30/30 = 1.0 → the task is fully saturable.
+
+**Key learning — the real gpt-5.2 judge is ~0.2 harsher than the local Gemini proxy.** Baseline was
+proxy ≈0 but real −0.23. Under Incorrect=−1, **precision beats recall**: abstain by default, commit
+only high-confidence directly-readable facts. Optimize for **Incorrect→0**, not proxy mean.
+The official score is on the SIGNATE page (CLI cannot read it back) — it is the only trustworthy signal.
 
 ## Live backend
 
