@@ -13,10 +13,33 @@ import re
 import tiktoken
 
 from config import settings
-from src.rag import llm, retrieve
+from src.rag import archetype, llm, retrieve
 from src.rag.corpus import nfc
 
 _ENC = tiktoken.get_encoding("cl100k_base")
+
+# Trust map (config/archetype_trust.json) produced by scoring.selfimprove: which question
+# archetypes the RAG answers reliably. The gate is strictly *additive* — it can only turn a
+# would-be answer into an abstention for a measured-unreliable archetype, so it never raises the
+# Incorrect rate. Unknown archetypes and a missing map leave behaviour unchanged.
+_TRUST_PATH = settings.REPO_ROOT / "config" / "archetype_trust.json"
+
+
+def _load_trust() -> dict[str, dict]:
+    try:
+        data = json.loads(_TRUST_PATH.read_text(encoding="utf-8"))
+        return data.get("archetypes", data) if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _trust_blocks(question: str) -> bool:
+    """True when the question's archetype was *measured* and marked untrusted (→ abstain)."""
+    arch = archetype.classify(question)
+    if arch == "unknown":
+        return False
+    entry = _load_trust().get(arch)
+    return bool(entry is not None and entry.get("trust") is False)
 
 SYSTEM = """あなたは社内共有ドライブの資料に基づいて質問へ回答するRAGアシスタントです。
 以下を厳守してください。
@@ -147,7 +170,12 @@ def _draft(prompt: str, system: str, model: str, images, temperature: float, thi
 
 
 def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: bool = True,
-                    consistency: bool = True) -> dict:
+                    consistency: bool = True, apply_trust_gate: bool = True) -> dict:
+    # Trust gate (additive): abstain up-front on archetypes measured as unreliable, before any LLM
+    # call. scoring.selfimprove passes apply_trust_gate=False because that loop *measures* trust.
+    if apply_trust_gate and _trust_blocks(question):
+        return _result(question, settings.ABSTAIN, "untrusted-archetype", "", [], [], verified=False)
+
     r = retrieve.get()
     evidence = r.retrieve(question, k=k)
     images = _gather_images(question, evidence)

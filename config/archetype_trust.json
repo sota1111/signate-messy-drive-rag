@@ -1,0 +1,121 @@
+{
+  "_meta": {
+    "generator": "scoring.selfimprove",
+    "threshold": 0.8,
+    "min_committed": 5
+  },
+  "archetypes": {
+    "config_hyperparam": {
+      "trust": true,
+      "precision": 1.0,
+      "coverage": 1.0,
+      "mean_score": 1.0,
+      "n": 20,
+      "committed": 20,
+      "verdicts": {
+        "Perfect": 20,
+        "Acceptable": 0,
+        "Missing": 0,
+        "Incorrect": 0
+      }
+    },
+    "config_model_type": {
+      "trust": true,
+      "precision": 1.0,
+      "coverage": 1.0,
+      "mean_score": 1.0,
+      "n": 10,
+      "committed": 10,
+      "verdicts": {
+        "Perfect": 10,
+        "Acceptable": 0,
+        "Missing": 0,
+        "Incorrect": 0
+      }
+    },
+    "csv_column_max": {
+      "trust": true,
+      "precision": 1.0,
+      "coverage": 0.8824,
+      "mean_score": 0.7353,
+      "n": 17,
+      "committed": 15,
+      "verdicts": {
+        "Perfect": 10,
+        "Acceptable": 5,
+        "Missing": 2,
+        "Incorrect": 0
+      }
+    },
+    "csv_column_mean": {
+      "trust": true,
+      "precision": 0.9375,
+      "coverage": 0.9412,
+      "mean_score": 0.8235,
+      "n": 17,
+      "committed": 16,
+      "verdicts": {
+        "Perfect": 15,
+        "Acceptable": 0,
+        "Missing": 1,
+        "Incorrect": 1
+      }
+    },
+    "data_shape": {
+      "trust": true,
+      "precision": 1.0,
+      "coverage": 1.0,
+      "mean_score": 1.0,
+      "n": 40,
+      "committed": 40,
+      "verdicts": {
+        "Perfect": 40,
+        "Acceptable": 0,
+        "Missing": 0,
+        "Incorrect": 0
+      }
+    },
+    "glossary_abbrev": {
+      "trust": true,
+      "precision": 1.0,
+      "coverage": 0.8,
+      "mean_score": 0.8,
+      "n": 15,
+      "committed": 12,
+      "verdicts": {
+        "Perfect": 12,
+        "Acceptable": 0,
+        "Missing": 3,
+        "Incorrect": 0
+      }
+    },
+    "glossary_formal": {
+      "trust": true,
+      "precision": 1.0,
+      "coverage": 0.6,
+      "mean_score": 0.6,
+      "n": 15,
+      "committed": 9,
+      "verdicts": {
+        "Perfect": 9,
+        "Acceptable": 0,
+        "Missing": 6,
+        "Incorrect": 0
+      }
+    },
+    "metric_score": {
+      "trust": true,
+      "precision": 1.0,
+      "coverage": 0.8636,
+      "mean_score": 0.8636,
+      "n": 22,
+      "committed": 19,
+      "verdicts": {
+        "Perfect": 19,
+        "Acceptable": 0,
+        "Missing": 3,
+        "Incorrect": 0
+      }
+    }
+  }
+}
