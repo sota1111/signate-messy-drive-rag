@@ -25,8 +25,9 @@ Metric: Perfect +1 / Acceptable +0.5 / Missing 0 / Incorrect −1, mean.
 
 | # | date | memo | official Public score | note |
 |---|---|---|---|---|
-| 1 | 2026-08-04 | baseline hybrid RAG + abstention | **−0.2333** (−7/30) | below blank baseline; committed answers net-negative |
-| 2 | 2026-08-04 | precision-first (high-conf + strict verify) | _pending_ | valid proxy +0.25, Incorrect 15→5 |
+| 1 | 2026-08-04 | baseline hybrid RAG + abstention | **−0.2333** (−7/30) | below blank; committed answers net-negative |
+| 2 | 2026-08-04 | precision-first (high-conf + strict verify) | **−0.0667** (−2/30) | +0.167; 該当なし 19→2; still slightly net-neg |
+| 3 | 2026-08-04 | + answer self-consistency gate | _pending_ | 24 committed / 74 abstain; valid Incorrect 5→2 |
 
 **Public LB is 30 questions**; score = mean of Perfect+1/Acceptable+0.5/Missing0/Incorrect−1
 (so a blank all-abstain submission = 0.0). Top ~11 teams = 30/30 = 1.0 → the task is fully saturable.
