@@ -77,6 +77,21 @@ python -m scoring.selfimprove --self-test   # offline scorer/GT validation (no L
 python -m scoring.overfit_check          # block adoption if the last change overfit the dev slice
 ```
 
+## Real-score calibration (SOT-2426)
+
+`scoring/ledger.jsonl` records every real submission's local proxy, committed-answer archetype mix,
+and Public score. The calibration model applies small-sample ridge shrinkage and reports
+proxy↔real Spearman rank correlation as the evaluator KPI.
+
+```bash
+python -m scoring.calibrate
+python -m scoring.predict --answers artifacts/predictions_test.csv --local-score 0.58
+```
+
+`predict` prints the estimated Public score, a 95% uncertainty interval, archetype contributions,
+and the current correlation KPI. Without arguments it uses the latest available predictions and the
+latest ledger proxy as an explicit fallback; pass both options for an actual new candidate.
+
 ## Live backend
 
 - URL: `https://signate-messy-drive-rag-backend-4kvjtj6qvq-uc.a.run.app`
