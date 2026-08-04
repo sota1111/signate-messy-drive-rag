@@ -26,10 +26,8 @@ gcloud artifacts repositories describe "$REPO" --location="$REGION" --project="$
     --location="$REGION" --project="$PROJECT_ID" --description="RAG images"
 
 echo "== building & pushing image: $IMAGE =="
-gcloud builds submit "$ROOT" --project="$PROJECT_ID" --tag="$IMAGE" \
-  --gcs-source-staging-dir="gs://${PROJECT_ID}_cloudbuild/source" --timeout=1200s \
-  --ignore-file=.gcloudignore 2>/dev/null || \
-gcloud builds submit "$ROOT" --project="$PROJECT_ID" --tag="$IMAGE" --timeout=1200s
+gcloud builds submit "$ROOT" --project="$PROJECT_ID" \
+  --config=cloudbuild.yaml --substitutions=_IMAGE="$IMAGE" --timeout=1200s
 
 echo "== terraform apply =="
 cd infra/terraform
