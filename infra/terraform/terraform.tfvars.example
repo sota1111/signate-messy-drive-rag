@@ -1,0 +1,9 @@
+project_id      = "signate-messy-drive-rag"
+region          = "us-central1"
+vertex_location = "us-central1"
+gcs_location    = "US"
+
+# Image ref is set by scripts/deploy.sh (which builds & pushes first, then applies).
+backend_image = "us-central1-docker.pkg.dev/signate-messy-drive-rag/rag/backend:latest"
+
+allow_unauthenticated = true

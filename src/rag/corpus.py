@@ -5,6 +5,7 @@ The corpus is a messy shared drive whose Japanese directory names are NFD-normal
 """
 from __future__ import annotations
 
+import functools
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,9 +58,12 @@ def _category_of(parts: list[str]) -> str:
     return ""
 
 
+@functools.lru_cache(maxsize=4)
 def walk(corpus_dir: Path | None = None) -> list[FileRef]:
-    """Return every content file in the corpus as a classified FileRef."""
+    """Return every content file in the corpus as a classified FileRef (memoized; static corpus)."""
     root = corpus_dir or settings.CORPUS_DIR
+    if not root.exists():
+        return []
     proj_dir_name = {nfc(d.name): d for d in root.iterdir() if d.is_dir()}
     refs: list[FileRef] = []
     for f in root.rglob("*"):

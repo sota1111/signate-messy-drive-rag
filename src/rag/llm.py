@@ -89,24 +89,33 @@ def generate(
     raise RuntimeError(f"Gemini generate failed after {retries} attempts: {last_err}")
 
 
-def embed(texts: Sequence[str], *, model: str | None = None, batch: int = 64,
+def _embed_batch(mdl: str, chunk: list[str], task_type: str, retries: int) -> list[list[float]]:
+    """Embed one batch; on a token/size 400 error, split and recurse (Vertex caps ~20k tok/req)."""
+    for attempt in range(retries):
+        try:
+            resp = client().models.embed_content(
+                model=mdl, contents=chunk,
+                config=types.EmbedContentConfig(task_type=task_type),
+            )
+            return [list(e.values) for e in resp.embeddings]
+        except Exception as e:  # noqa: BLE001
+            msg = str(e)
+            if ("token count" in msg or "INVALID_ARGUMENT" in msg or "400" in msg) and len(chunk) > 1:
+                mid = len(chunk) // 2
+                return (_embed_batch(mdl, chunk[:mid], task_type, retries)
+                        + _embed_batch(mdl, chunk[mid:], task_type, retries))
+            if attempt == retries - 1:
+                raise RuntimeError(f"embed failed: {e}") from e
+            time.sleep(min(2 ** attempt * 2, 30))
+    return []
+
+
+def embed(texts: Sequence[str], *, model: str | None = None, batch: int = 16,
           task_type: str = "RETRIEVAL_DOCUMENT", retries: int = 4) -> list[list[float]]:
-    """Embed a list of texts, batched. task_type is RETRIEVAL_DOCUMENT or RETRIEVAL_QUERY."""
+    """Embed a list of texts, batched (adaptive split on size errors)."""
     mdl = model or settings.EMBED_MODEL
     out: list[list[float]] = []
     for i in range(0, len(texts), batch):
         chunk = [t if t.strip() else " " for t in texts[i : i + batch]]
-        for attempt in range(retries):
-            try:
-                resp = client().models.embed_content(
-                    model=mdl,
-                    contents=chunk,
-                    config=types.EmbedContentConfig(task_type=task_type),
-                )
-                out.extend([list(e.values) for e in resp.embeddings])
-                break
-            except Exception as e:  # noqa: BLE001
-                if attempt == retries - 1:
-                    raise RuntimeError(f"embed failed: {e}") from e
-                time.sleep(min(2 ** attempt * 2, 30))
+        out.extend(_embed_batch(mdl, chunk, task_type, retries))
     return out
