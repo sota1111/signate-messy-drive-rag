@@ -28,7 +28,7 @@ from pathlib import Path
 
 from config import settings
 from scoring.calibrate import load_ledger, spearman
-from scoring import deterministic, synth
+from scoring import deterministic, dist_match, perturb, synth
 from src.rag.corpus import nfc
 
 TRUST_PATH = Path(settings.REPO_ROOT) / "config" / "archetype_trust.json"
@@ -137,6 +137,21 @@ def split_rows(rows: list[dict]) -> tuple[list[dict], list[dict]]:
 
 def _overall_mean(rows: list[dict]) -> float:
     return sum(r["points"] for r in rows) / len(rows) if rows else 0.0
+
+
+def production_weighted_score(items: list[synth.SynthItem], rows: list[dict],
+                              test_questions: list[str]) -> tuple[float, dist_match.DistributionMatch]:
+    """Score the benchmark under the production test-question archetype mixture."""
+    match = dist_match.assess(items, test_questions)
+    weights = dist_match.item_weights(items, match.test_counts)
+    return dist_match.weighted_mean([float(r["points"]) for r in rows], weights), match
+
+
+def perturbation_robustness(items: list[synth.SynthItem], preds: dict[str, dict],
+                            variant_preds: dict[str, list[object]]) -> perturb.Robustness:
+    groups = [(it.id, (preds.get(it.id) or {}).get("answer", settings.ABSTAIN),
+               variant_preds.get(it.id, [])) for it in items]
+    return perturb.score(groups)
 
 
 def aggregate(rows: list[dict], threshold: float, min_committed: int) -> dict[str, dict]:
@@ -271,6 +286,10 @@ def main() -> int:
     ap.add_argument("--label", default="run", help="label recorded in the hold-out history ledger")
     ap.add_argument("--preds", type=Path, default=None,
                     help="score a cached RAG run (jsonl of {id, answer}) instead of calling the LLM")
+    ap.add_argument("--test-questions", type=Path,
+                    default=Path(settings.REPO_ROOT) / "data/questions/questions_test.csv")
+    ap.add_argument("--perturb", action="store_true",
+                    help="also answer meaning-preserving variants and report answer stability")
     args = ap.parse_args()
 
     if not self_test():
@@ -301,6 +320,26 @@ def main() -> int:
         print(f"cached RAG answers → {cache}")
 
     rows = score_results(items, preds)
+    test_questions = dist_match.load_questions(args.test_questions)
+    prod_score, match = production_weighted_score(items, rows, test_questions)
+    print("\n============== production distribution ==============")
+    print(f"test archetypes ({sum(match.test_archetype_counts.values())}): {match.test_archetype_counts}")
+    print(f"test answer-mode distribution: {match.test_counts}")
+    print(f"evaluation answer-mode distribution: {match.eval_counts}")
+    print(f"production-weighted generalization score: {prod_score:+.4f}")
+    if match.missing_archetypes:
+        print(f"WARNING missing evaluation archetypes: {list(match.missing_archetypes)}")
+
+    if args.perturb:
+        from src.rag import generate
+        variant_preds: dict[str, list[object]] = {}
+        for it in items:
+            variant_preds[it.id] = [generate.answer_question(q, hard=args.hard,
+                                                              apply_trust_gate=False).get("answer")
+                                    for q in perturb.variants(it.question)]
+        robust = perturbation_robustness(items, preds, variant_preds)
+        print(f"perturbation robustness: {robust.score:.4f} ({robust.stable}/{robust.total})")
+        print(f"unstable/overfit candidates: {list(robust.unstable_ids)}")
     dev_rows, hold_rows = split_rows(rows)
     dev_agg = aggregate(dev_rows, args.threshold, args.min_committed)
     hold_agg = aggregate(hold_rows, args.threshold, args.holdout_min_committed)
