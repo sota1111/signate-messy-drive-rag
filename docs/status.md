@@ -21,6 +21,14 @@ _Last updated: 2026-08-04 (initial build)._
 Metric: Perfect +1 / Acceptable +0.5 / Missing 0 / Incorrect −1, mean.
 (Official score would be computed by SIGNATE's gpt-5.2 judge on submission.)
 
+## SIGNATE submissions
+
+| # | date | memo | test answers | 該当なし | abstain | official score |
+|---|---|---|---|---|---|---|
+| 1 | 2026-08-04 | baseline hybrid RAG + abstention | 37 substantive | 19 | 44 | _see SIGNATE leaderboard_ |
+
+The official gpt-5.2 score is shown on the SIGNATE competition page (the CLI cannot read it back).
+
 ## Live backend
 
 - URL: `https://signate-messy-drive-rag-backend-4kvjtj6qvq-uc.a.run.app`
