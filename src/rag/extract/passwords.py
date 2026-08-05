@@ -73,15 +73,18 @@ def _candidate_dates(ref: FileRef) -> list[str]:
     return list(dict.fromkeys(dates))
 
 
-def resolve(ref: FileRef) -> bytes | None:
-    """Return decrypted bytes for an encrypted Office file, or None if unresolved."""
-    # Scheme A: filename hint
+def _candidate_passwords(ref: FileRef):
+    """Yield candidate passwords for ``ref`` in the same order the brute force tries them.
+
+    Scheme A (filename ``pw-<token>`` hint) first, then Scheme B (glossary 案件略号 × mined
+    contract-start dates × format variants). Sharing one generator keeps :func:`resolve` (bytes)
+    and :func:`resolve_password` (the working string) in exact lockstep.
+    """
     hint = _PW_HINT.search(ref.name)
     if hint:
-        for pw in (hint.group(1), hint.group(1).lower(), hint.group(1).upper()):
-            b = _try(ref.path, pw)
-            if b:
-                return b
+        yield hint.group(1)
+        yield hint.group(1).lower()
+        yield hint.group(1).upper()
 
     g = glossary.load()
     # 案件略号 candidates from the file's project
@@ -102,18 +105,33 @@ def resolve(ref: FileRef) -> bytes | None:
     for code in codes:
         for date in dates:
             # Scheme A-like: bare lowercase code+date (as the contract docx uses)
-            for pw in (f"{code}{date}", f"{code.lower()}{date}"):
-                b = _try(ref.path, pw)
-                if b:
-                    return b
+            yield f"{code}{date}"
+            yield f"{code.lower()}{date}"
             # Scheme B: rule DA-code-date-ext and variants
             for pre in prefixes:
                 for sep in seps:
                     for ec in ext_codes:
                         parts = [p for p in [pre, code, date, ec] if p]
-                        b = _try(ref.path, sep.join(parts))
-                        if b:
-                            return b
+                        yield sep.join(parts)
+
+
+def resolve(ref: FileRef) -> bytes | None:
+    """Return decrypted bytes for an encrypted Office file, or None if unresolved."""
+    for pw in _candidate_passwords(ref):
+        b = _try(ref.path, pw)
+        if b:
+            return b
+    return None
+
+
+def resolve_password(ref: FileRef) -> str | None:
+    """Return the password that decrypts ``ref`` (for the adaptation-layer cache), or None.
+
+    Same candidate order as :func:`resolve`; returns the *string* so the caller can persist the
+    self-discovered secret into the runtime ``corpus_profile.json`` (never into source)."""
+    for pw in _candidate_passwords(ref):
+        if _try(ref.path, pw) is not None:
+            return pw
     return None
 
 
