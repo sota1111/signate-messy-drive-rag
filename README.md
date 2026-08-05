@@ -180,11 +180,20 @@ data/share_drive (416 files, gitignored)
 手元採点は公式 `evaluator.py` の採点ルールをそのまま移植（`scoring/`）。審査バックエンドは
 **Codex CLI（`codex exec`, GPT-5.x）が既定**（SOT-2457）: 公式採点者 gpt-5.2 と同系列モデルで
 審査するため、Gemini 代理審査で確認された「約0.2の甘さ・実LBと無相関(ρ=−0.09)」のギャップを
-詰める。OpenAI キーは不要（Codex CLI の認証を利用）。Codex CLI が無い環境や
-`JUDGE_BACKEND=gemini` 指定時は従来の Gemini 審査、Codex 呼び出し失敗（使用上限等）時も
-Gemini に自動フォールバックする。チューニングは環境変数
+詰める。OpenAI キーは不要（Codex CLI の認証を利用）。**Gemini への自動フォールバックは無い**
+（SOT-2457 指示）: Codex 呼び出し失敗（使用上限等）は明示エラーで停止し、Gemini/openai 審査は
+`JUDGE_BACKEND` の明示指定時のみ。審査はバッチ実行（既定30問=valid30を1回の `codex exec` で採点）。
+チューニングは環境変数
 `CODEX_JUDGE_MODEL` / `CODEX_JUDGE_BATCH` / `CODEX_JUDGE_VOTES` / `CODEX_JUDGE_TIMEOUT`
 （`scoring/codex_judge.py`）。注意: ローカル採点は依然 proxy であり、採用ゲートは実LB確認のみ。
+
+**回答生成の Opus バックエンド**（SOT-2457）: `--gen opus` で回答生成を Vertex Gemini でなく
+**Claude Opus**（`claude -p --model opus`, `src/rag/opus_gen.py`）が担当する。検索・決定論
+モジュール・確信度ゲート棄権は共通で、Opus 呼び出しは1問1回（自己検証込み）。環境変数
+`OPUS_GEN_MODEL` / `OPUS_GEN_TIMEOUT`。
+
+**関門3（実提出）は人間許可ゲート付き**（SOT-2457）: `scoring.gate3 --submit` は
+`SIGNATE_SUBMIT_ALLOWED=1` を明示した実行のみ許可（許可があるまで提出枠を消費しない）。
 
 ### 決定論的な自己改善ハーネス（archetype別 trust map, SOT-2407）
 
@@ -224,11 +233,12 @@ bash scripts/fetch_data.sh      # SIGNATE からデータ取得（要 signate CL
 
 ```bash
 python -m src.rag.build_index                    # 抽出 + 索引構築
-python -m src.rag.run --split valid              # 関門1: valid30 に回答
-python -m scoring.gate1                          # 関門1: 客観採点
+python -m src.rag.run --split valid              # 関門1: valid30 に回答 (Gemini)
+python -m src.rag.run --split valid --gen opus   # 関門1: valid30 に回答 (Claude Opus)
+python -m scoring.gate1                          # 関門1: 客観採点 (codex一括審査)
 python -m scoring.gate2                          # 関門2: 自動生成ホールドアウト採点
 python -m src.rag.run --split test               # 関門3: test100 -> predictions.csv
-python -m scoring.gate3 --submit                 # 関門3: signate 提出
+SIGNATE_SUBMIT_ALLOWED=1 python -m scoring.gate3 --submit  # 関門3: signate 提出（要・人間許可）
 ```
 
 ## リポジトリ構成
@@ -236,7 +246,7 @@ python -m scoring.gate3 --submit                 # 関門3: signate 提出
 ```
 config/settings.py     設定（GCP/モデル/パス）
 src/rag/               抽出→索引→検索→生成→バッチ実行
-scoring/               3関門の採点ハーネス（CRAG審査: Codex CLI既定 / Geminiフォールバック）
+scoring/               3関門の採点ハーネス（CRAG審査: Codex CLI一括・フォールバック無し）
 infra/terraform/       GCP バックエンド（Cloud Run/Vertex/Firestore/GCS）
 backend/               FastAPI サービス（Cloud Run）
 scripts/fetch_data.sh  SIGNATE データ再取得

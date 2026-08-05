@@ -31,6 +31,13 @@ def build_submission(preds: Path, run_first: bool, hard: bool) -> Path:
 
 
 def submit(zip_path: Path, memo: str) -> None:
+    # 関門3 (real submission) is human-gated (SOT-2457): the submission budget may only be
+    # spent with explicit permission, recorded by setting this env for the one run.
+    import os
+    if os.getenv("SIGNATE_SUBMIT_ALLOWED", "").strip().lower() not in ("1", "true", "yes", "on"):
+        raise SystemExit(
+            "関門3 submission is blocked: human permission required (SOT-2457). "
+            "Set SIGNATE_SUBMIT_ALLOWED=1 for this run only after explicit approval.")
     cmd = ["signate", "submit", "--task_key", settings.SIGNATE_TASK_KEY,
            "--path", str(zip_path), "--memo", memo]
     print("running:", " ".join(cmd))

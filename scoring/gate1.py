@@ -2,9 +2,10 @@
 
 official GT = data/questions/valid_txt.csv (headerless index,answer).
 Runs the RAG over the valid split if predictions are missing, then scores with the local
-CRAG judge (Gemini proxy of the official gpt-5.2 rubric).
+CRAG judge (codex batch judge on the official grader's model family; SOT-2457).
 
     python -m scoring.gate1                # run RAG on valid + score
+    python -m scoring.gate1 --gen opus     # answer with Claude Opus, score with codex
     python -m scoring.gate1 --preds path   # score an existing predictions.csv
 """
 from __future__ import annotations
@@ -24,14 +25,14 @@ def _read_headerless(path: Path) -> dict[int, str]:
     return {int(i): ("" if pd.isna(v) else str(v)) for i, v in df[1].items()}
 
 
-def main(preds: Path | None, run_first: bool) -> None:
+def main(preds: Path | None, run_first: bool, gen: str = "gemini", workers: int = 8) -> None:
     gt = _read_headerless(settings.VALID_GROUND_TRUTH)
     preds_path = preds or (settings.ARTIFACTS_DIR / "predictions_valid.csv")
 
     if run_first and not preds_path.exists():
         from src.rag import run as runner
-        print("no predictions found — running RAG on valid split...")
-        runner.run("valid", preds_path, limit=None, workers=8, hard=False)
+        print(f"no predictions found — running RAG ({gen}) on valid split...")
+        runner.run("valid", preds_path, limit=None, workers=workers, hard=False, gen=gen)
 
     pred_map = _read_headerless(preds_path)
     idxs = sorted(gt)
@@ -62,5 +63,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--preds", type=Path, default=None)
     ap.add_argument("--no-run", action="store_true", help="do not run RAG; score existing preds")
+    ap.add_argument("--gen", choices=["gemini", "opus"], default="gemini",
+                    help="answer backend when predictions are missing (SOT-2457: opus)")
+    ap.add_argument("--workers", type=int, default=8)
     args = ap.parse_args()
-    main(args.preds, run_first=not args.no_run)
+    main(args.preds, run_first=not args.no_run, gen=args.gen, workers=args.workers)
