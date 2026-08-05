@@ -13,7 +13,8 @@ would pay ~10s of process startup per question; batching amortises it.
 
 Env knobs (read directly from the environment — config/ is intentionally untouched):
 - CODEX_JUDGE_MODEL   model id passed as `codex exec -m` (default: CLI default model)
-- CODEX_JUDGE_BATCH   pairs per codex call (default 20)
+- CODEX_JUDGE_BATCH   pairs per codex call (default 30 — the whole valid30 in one call,
+                      per the SOT-2457 "まとめて採点" directive)
 - CODEX_JUDGE_VOTES   votes per pair (default 1; strict mode aggregates worst-case)
 - CODEX_JUDGE_TIMEOUT seconds per codex call (default 600)
 """
@@ -71,7 +72,7 @@ def votes() -> int:
 
 
 def batch_size() -> int:
-    return _int_env("CODEX_JUDGE_BATCH", 20)
+    return _int_env("CODEX_JUDGE_BATCH", 30)
 
 
 def timeout_s() -> int:

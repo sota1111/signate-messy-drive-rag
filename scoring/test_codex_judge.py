@@ -25,10 +25,12 @@ def test_explicit_env_backend_wins_over_codex(monkeypatch):
     assert crag.resolve_backend() == "gemini"
 
 
-def test_no_cli_falls_back_to_settings_default(monkeypatch):
+def test_no_cli_raises_instead_of_silent_gemini(monkeypatch):
+    # SOT-2457 directive: no automatic Gemini substitution — a missing codex CLI is an error.
     monkeypatch.delenv("JUDGE_BACKEND", raising=False)
     monkeypatch.setattr(codex_judge, "available", lambda: False)
-    assert crag.resolve_backend() == "gemini"
+    with pytest.raises(RuntimeError, match="codex CLI not found"):
+        crag.resolve_backend()
 
 
 # ---- codex exec invocation / parsing ----
@@ -129,15 +131,20 @@ def test_crag_judge_codex_applies_strict_downgrade(monkeypatch):
     assert crag.judge(pred, truth) == "Incorrect"
 
 
-def test_crag_judge_falls_back_to_gemini_on_codex_error(monkeypatch):
+def test_crag_judge_codex_error_propagates_no_gemini_fallback(monkeypatch):
+    # SOT-2457 directive: a codex failure stops the run; Gemini must never be called.
     monkeypatch.setenv("JUDGE_BACKEND", "codex")
 
     def boom(*_a, **_k):
         raise codex_judge.CodexJudgeError("usage limit")
 
+    def gemini_forbidden(*_a, **_k):
+        raise AssertionError("gemini judge must not be called")
+
     monkeypatch.setattr(codex_judge, "judge_one", boom)
-    monkeypatch.setattr(crag, "_judge_gemini", lambda *_a, **_k: "Acceptable")
-    assert crag.judge(_PROSE_PRED, _PROSE_TRUTH) == "Acceptable"
+    monkeypatch.setattr(crag, "_judge_gemini", gemini_forbidden)
+    with pytest.raises(codex_judge.CodexJudgeError):
+        crag.judge(_PROSE_PRED, _PROSE_TRUTH)
 
 
 def test_score_pairs_codex_batches_only_nondeterministic(monkeypatch):
@@ -159,15 +166,16 @@ def test_score_pairs_codex_batches_only_nondeterministic(monkeypatch):
     assert all(r["backend"] == "codex" for r in results)
 
 
-def test_score_pairs_falls_back_to_gemini_on_codex_error(monkeypatch):
+def test_score_pairs_codex_error_propagates_no_gemini_fallback(monkeypatch):
     monkeypatch.setenv("JUDGE_BACKEND", "codex")
 
     def boom(*_a, **_k):
         raise codex_judge.CodexJudgeError("timeout")
 
+    def gemini_forbidden(*_a, **_k):
+        raise AssertionError("gemini judge must not be called")
+
     monkeypatch.setattr(codex_judge, "judge_batch", boom)
-    monkeypatch.setattr(crag, "_judge_gemini", lambda *_a, **_k: "Missing")
-    score, results = crag.score_pairs([(_PROSE_PRED, _PROSE_TRUTH)])
-    assert [r["judged"] for r in results] == ["Missing"]
-    assert results[0]["backend"] == "gemini"
-    assert score == 0.0
+    monkeypatch.setattr(crag, "_judge_gemini", gemini_forbidden)
+    with pytest.raises(codex_judge.CodexJudgeError):
+        crag.score_pairs([(_PROSE_PRED, _PROSE_TRUTH)])

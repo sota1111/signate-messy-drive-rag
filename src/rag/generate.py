@@ -202,12 +202,17 @@ def _draft(prompt: str, system: str, model: str, images, temperature: float, thi
         return {"answer": raw.strip(), "confidence": "low"}
 
 
-def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: bool = True,
-                    consistency: bool = True, apply_trust_gate: bool = True) -> dict:
+def deterministic_front(question: str, *, apply_trust_gate: bool = True) -> tuple[dict | None, list[str]]:
+    """Trust gate + deterministic hard modules, shared by every generation backend.
+
+    Returns ``(result, advisory)``: ``result`` is a finished answer dict when a gate/module
+    resolves the question outright (direct-commit or abstain), else None; ``advisory`` collects
+    unvalidated module extractions to inject as hints into the LLM prompt.
+    """
     # Preserve the additive trust policy even for deterministic routes: an explicitly measured and
     # disabled archetype remains disabled, while an unmapped cross-aggregate proceeds to computation.
     if apply_trust_gate and _trust_blocks(question):
-        return _result(question, settings.ABSTAIN, "untrusted-archetype", "", [], [], verified=False)
+        return _result(question, settings.ABSTAIN, "untrusted-archetype", "", [], [], verified=False), []
 
     # Hard-module advisory gate (SOT-2424). The deterministic modules below (compute / enumeration /
     # diffpair / pivotcond) DIRECTLY commit a confident answer only for archetypes proven to generalize
@@ -231,24 +236,24 @@ def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: b
         stat = compute.column_stat_answer(question)
         if stat is not None:
             if measuring or _holdout_validated(_csv_arch):
-                return _result(question, _clip_tokens(stat), "high", stat, [], [], verified=True)
+                return _result(question, _clip_tokens(stat), "high", stat, [], [], verified=True), advisory
             advisory.append(stat)
 
     if compute.is_compute_question(question):
         computed = compute.answer_question(question)
         if computed is not None:
             if measuring or _holdout_validated("cross_aggregate"):
-                return _result(question, _clip_tokens(computed), "high", computed, [], [], verified=True)
+                return _result(question, _clip_tokens(computed), "high", computed, [], [], verified=True), advisory
             advisory.append(computed)
         elif measuring or _holdout_validated("cross_aggregate"):
-            return _result(question, settings.ABSTAIN, "compute-unresolved", "", [], [], verified=False)
+            return _result(question, settings.ABSTAIN, "compute-unresolved", "", [], [], verified=False), advisory
 
     if enumeration.is_enumeration_question(question):
         enum_answer = enumeration.answer_question(question)
         if enum_answer is not None:
             enum_arch = archetype.classify(question)  # enum_set / highlight_set
             if measuring or _holdout_validated(enum_arch):
-                return _result(question, _clip_tokens(enum_answer), "high", enum_answer, [], [], verified=True)
+                return _result(question, _clip_tokens(enum_answer), "high", enum_answer, [], [], verified=True), advisory
             advisory.append(enum_answer)
 
     # Version-diff questions ("old版と最新版の変更点") are answered by a deterministic structural
@@ -263,10 +268,10 @@ def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: b
             diff_ans = None
         if diff_ans:
             if measuring or _holdout_validated("version_diff"):
-                return _result(question, _clip_tokens(diff_ans), "high", diff_ans, [], [], verified=True)
+                return _result(question, _clip_tokens(diff_ans), "high", diff_ans, [], [], verified=True), advisory
             advisory.append(diff_ans)
         elif measuring or _holdout_validated("version_diff"):
-            return _result(question, settings.ABSTAIN, "diff-unresolved", "", [], [], verified=False)
+            return _result(question, settings.ABSTAIN, "diff-unresolved", "", [], [], verified=False), advisory
 
     # PivotTable / AutoFilter extraction-condition questions ("PivotTableの抽出条件", "フィルターで
     # 抽出されている条件") are answered by reading the workbook's pivot definition / autofilter XML and
@@ -280,10 +285,29 @@ def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: b
             pv_ans = None
         if pv_ans:
             if measuring or _holdout_validated("pivot_condition"):
-                return _result(question, _clip_tokens(pv_ans), "high", pv_ans, [], [], verified=True)
+                return _result(question, _clip_tokens(pv_ans), "high", pv_ans, [], [], verified=True), advisory
             advisory.append(pv_ans)
         elif measuring or _holdout_validated("pivot_condition"):
-            return _result(question, settings.ABSTAIN, "pivot-unresolved", "", [], [], verified=False)
+            return _result(question, settings.ABSTAIN, "pivot-unresolved", "", [], [], verified=False), advisory
+
+    return None, advisory
+
+
+def advisory_block(advisory: list[str]) -> str:
+    """Prompt block offering unvalidated hard-module extractions as unverified hints."""
+    if not advisory:
+        return ""
+    return (
+        "\n\n【未検証の自動抽出候補（hold-out未実証。参考情報に過ぎない。"
+        "根拠資料から独立に確認できる場合のみ採用し、確認できなければ採用せず confidence=\"low\"）】\n"
+        + "\n".join(f"- {a}" for a in advisory))
+
+
+def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: bool = True,
+                    consistency: bool = True, apply_trust_gate: bool = True) -> dict:
+    resolved, advisory = deterministic_front(question, apply_trust_gate=apply_trust_gate)
+    if resolved is not None:
+        return resolved
 
     # Retrieval + LLM path (reached when no hard module direct-committed above). The additive trust
     # gate already abstained measured-unreliable archetypes up front; scoring.selfimprove passes
@@ -294,15 +318,9 @@ def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: b
     # Advisory hints from unvalidated hard modules: offered as *unverified* candidates only. The verify
     # pass (疑わしきは false) requires the answer to be independently supported by the evidence, so a
     # hint that isn't corroborated leads to abstention rather than a confident commit.
-    advisory_block = ""
-    if advisory:
-        advisory_block = (
-            "\n\n【未検証の自動抽出候補（hold-out未実証。参考情報に過ぎない。"
-            "根拠資料から独立に確認できる場合のみ採用し、確認できなければ採用せず confidence=\"low\"）】\n"
-            + "\n".join(f"- {a}" for a in advisory))
     prompt = (
         f"質問:\n{question}\n\n"
-        f"根拠資料:\n{_format_evidence(evidence)}{advisory_block}\n\n"
+        f"根拠資料:\n{_format_evidence(evidence)}{advisory_block(advisory)}\n\n"
         "上記の根拠のみに基づき、質問へ回答してください。JSONで reasoning, answer, confidence を返す。"
     )
     model = settings.GEN_MODEL_HARD if (hard or images) else settings.GEN_MODEL

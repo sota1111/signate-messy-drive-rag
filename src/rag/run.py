@@ -34,14 +34,21 @@ def load_questions(split: str) -> list[tuple[int, str]]:
     return [(int(r["index"]), str(r[col])) for _, r in df.iterrows()]
 
 
-def run(split: str, out: Path, limit: int | None, workers: int, hard: bool) -> None:
+def run(split: str, out: Path, limit: int | None, workers: int, hard: bool,
+        gen: str = "gemini") -> None:
     questions = load_questions(split)
     if limit:
         questions = questions[:limit]
     results: dict[int, dict] = {}
 
-    def work(idx: int, q: str) -> tuple[int, dict]:
-        return idx, generate.answer_question(q, hard=hard)
+    if gen == "opus":
+        from src.rag import opus_gen
+
+        def work(idx: int, q: str) -> tuple[int, dict]:
+            return idx, opus_gen.answer_question(q)
+    else:
+        def work(idx: int, q: str) -> tuple[int, dict]:
+            return idx, generate.answer_question(q, hard=hard)
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [ex.submit(work, idx, q) for idx, q in questions]
@@ -73,6 +80,8 @@ if __name__ == "__main__":
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--hard", action="store_true", help="use the stronger model for all questions")
+    ap.add_argument("--gen", choices=["gemini", "opus"], default="gemini",
+                    help="answer backend: gemini (Vertex) or opus (Claude CLI, SOT-2457)")
     args = ap.parse_args()
     out = args.out or (settings.ARTIFACTS_DIR / f"predictions_{args.split}.csv")
-    run(args.split, out, args.limit, args.workers, args.hard)
+    run(args.split, out, args.limit, args.workers, args.hard, gen=args.gen)

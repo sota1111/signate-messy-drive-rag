@@ -2,11 +2,12 @@
 
 The OFFICIAL SIGNATE score is computed server-side with OpenAI gpt-5.2. We reproduce the
 SAME judging prompt/rubric locally. Backends (JUDGE_BACKEND env):
-- codex  — the DEFAULT whenever the Codex CLI is on PATH (SOT-2457): `codex exec` judges on
-  the official grader's own model family (GPT-5.x) without an OpenAI key, closing the ~0.2
-  leniency gap the Gemini proxy showed against the real judge. Falls back to gemini if a
-  codex call fails (usage limit / timeout) so scoring never wedges.
-- gemini — Vertex proxy judge (used when the codex CLI is absent, or set explicitly).
+- codex  — the DEFAULT (SOT-2457): `codex exec` judges on the official grader's own model
+  family (GPT-5.x) without an OpenAI key, closing the ~0.2 leniency gap the Gemini proxy
+  showed against the real judge. There is NO automatic fallback: a codex failure raises
+  and the scoring run stops loudly (per the SOT-2457 directive, Gemini must never be
+  silently substituted for the judge).
+- gemini — Vertex proxy judge (explicit opt-in only, e.g. the network-free test suite).
 - openai — exact official parity spot-checks (needs OPENAI_API_KEY).
 
 Score: Perfect +1, Acceptable +0.5, Missing 0, Incorrect -1; final = mean over questions.
@@ -68,14 +69,19 @@ _POINTS = {"Perfect": 1.0, "Acceptable": 0.5, "Missing": 0.0, "Incorrect": -1.0}
 
 def resolve_backend() -> str:
     """Effective judge backend. An explicit JUDGE_BACKEND env always wins; with none set,
-    codex (the real grader's model family) is preferred whenever its CLI is available,
-    otherwise the settings default (gemini). config/ stays untouched — env read directly."""
+    the judge is codex (the real grader's model family). A missing codex CLI is an error —
+    per the SOT-2457 directive there is no silent Gemini substitution; using gemini/openai
+    requires an explicit JUDGE_BACKEND. config/ stays untouched — env read directly."""
     explicit = os.getenv("JUDGE_BACKEND", "").strip().lower()
     if explicit:
         return explicit
     from scoring import codex_judge
 
-    return "codex" if codex_judge.available() else settings.JUDGE_BACKEND.lower()
+    if not codex_judge.available():
+        raise RuntimeError(
+            "codex CLI not found on PATH — the judge backend is codex with no automatic "
+            "fallback (SOT-2457). Install codex or set JUDGE_BACKEND explicitly.")
+    return "codex"
 
 
 def strict_enabled() -> bool:
@@ -197,11 +203,9 @@ def judge(pred: str, truth: str, votes: int = 3, strict: bool | None = None,
     if backend == "codex":
         from scoring import codex_judge
 
-        try:
-            verdict = codex_judge.judge_one(pred, truth, _system_prompt(strict), strict)
-        except codex_judge.CodexJudgeError as e:
-            codex_judge.warn(f"codex judge failed ({e}); falling back to gemini")
-            return judge(pred, truth, votes=votes, strict=strict, backend="gemini")
+        # No fallback: a codex failure (usage limit / timeout) propagates and stops the
+        # scoring run — Gemini must never silently replace the judge (SOT-2457 directive).
+        verdict = codex_judge.judge_one(pred, truth, _system_prompt(strict), strict)
         return strict_downgrade(pred, truth, verdict) if strict else verdict
     base = _judge_openai if backend == "openai" else _judge_gemini
     one = (lambda p, t: base(p, t, strict))
@@ -230,17 +234,11 @@ def score_pairs(pairs: list[tuple[str, str]]) -> tuple[float, list[dict]]:
     """pairs = [(prediction, ground_truth), ...] -> (mean_score, per_item results).
 
     codex backend judges in BATCHES (one `codex exec` per chunk of pairs) — a per-pair
-    call would pay CLI startup per question. On codex failure the unresolved pairs are
-    rescored on the gemini path so a usage limit never blocks a scoring run."""
+    call would pay CLI startup per question. A codex failure raises: per the SOT-2457
+    directive scoring never silently reroutes to Gemini."""
     backend = resolve_backend()
     if backend == "codex":
-        from scoring import codex_judge
-
-        try:
-            return _score_pairs_codex(pairs)
-        except codex_judge.CodexJudgeError as e:
-            codex_judge.warn(f"batch codex scoring failed ({e}); rescoring via gemini")
-            backend = "gemini"
+        return _score_pairs_codex(pairs)
     return _score_pairs_threaded(pairs, backend)
 
 
