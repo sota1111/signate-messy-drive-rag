@@ -1,9 +1,13 @@
 """Local CRAG judge — a faithful port of the official evaluator.py rubric.
 
 The OFFICIAL SIGNATE score is computed server-side with OpenAI gpt-5.2. We reproduce the
-SAME judging prompt/rubric locally, backed by Gemini by default (JUDGE_BACKEND=gemini), so
-gate1/gate2 give an objective self-score without any OpenAI key. Set JUDGE_BACKEND=openai
-(with OPENAI_API_KEY) for exact official parity spot-checks.
+SAME judging prompt/rubric locally. Backends (JUDGE_BACKEND env):
+- codex  — the DEFAULT whenever the Codex CLI is on PATH (SOT-2457): `codex exec` judges on
+  the official grader's own model family (GPT-5.x) without an OpenAI key, closing the ~0.2
+  leniency gap the Gemini proxy showed against the real judge. Falls back to gemini if a
+  codex call fails (usage limit / timeout) so scoring never wedges.
+- gemini — Vertex proxy judge (used when the codex CLI is absent, or set explicitly).
+- openai — exact official parity spot-checks (needs OPENAI_API_KEY).
 
 Score: Perfect +1, Acceptable +0.5, Missing 0, Incorrect -1; final = mean over questions.
 """
@@ -60,6 +64,18 @@ _SCHEMA = {
 }
 
 _POINTS = {"Perfect": 1.0, "Acceptable": 0.5, "Missing": 0.0, "Incorrect": -1.0}
+
+
+def resolve_backend() -> str:
+    """Effective judge backend. An explicit JUDGE_BACKEND env always wins; with none set,
+    codex (the real grader's model family) is preferred whenever its CLI is available,
+    otherwise the settings default (gemini). config/ stays untouched — env read directly."""
+    explicit = os.getenv("JUDGE_BACKEND", "").strip().lower()
+    if explicit:
+        return explicit
+    from scoring import codex_judge
+
+    return "codex" if codex_judge.available() else settings.JUDGE_BACKEND.lower()
 
 
 def strict_enabled() -> bool:
@@ -164,15 +180,29 @@ def _judge_openai(pred: str, truth: str, strict: bool = True) -> str:
     return json.loads(resp)["judged"]
 
 
-def judge(pred: str, truth: str, votes: int = 3, strict: bool | None = None) -> str:
+def judge(pred: str, truth: str, votes: int = 3, strict: bool | None = None,
+          backend: str | None = None) -> str:
     """Hybrid judge: deterministic first, then LLM. Strict mode (default, JUDGE_STRICT)
     aggregates the votes by worst case rather than majority and applies a deterministic
-    verbosity/format downgrade, narrowing the Gemini proxy's ~0.2 leniency gap."""
+    verbosity/format downgrade, narrowing the Gemini proxy's ~0.2 leniency gap.
+
+    codex backend: votes are governed by CODEX_JUDGE_VOTES (default 1 — each vote is a
+    CLI call, and the worst-case-of-3 voting existed to narrow GEMINI leniency, which
+    does not apply when judging on the official grader's own model family)."""
     strict = strict_enabled() if strict is None else strict
     resolved = deterministic_judge(pred, truth)
     if resolved is not None:
         return resolved
-    backend = settings.JUDGE_BACKEND.lower()
+    backend = resolve_backend() if backend is None else backend
+    if backend == "codex":
+        from scoring import codex_judge
+
+        try:
+            verdict = codex_judge.judge_one(pred, truth, _system_prompt(strict), strict)
+        except codex_judge.CodexJudgeError as e:
+            codex_judge.warn(f"codex judge failed ({e}); falling back to gemini")
+            return judge(pred, truth, votes=votes, strict=strict, backend="gemini")
+        return strict_downgrade(pred, truth, verdict) if strict else verdict
     base = _judge_openai if backend == "openai" else _judge_gemini
     one = (lambda p, t: base(p, t, strict))
     verdict = _aggregate(one, pred, truth, votes, strict)
@@ -197,17 +227,53 @@ def _majority(one, pred: str, truth: str, votes: int) -> str:
 
 
 def score_pairs(pairs: list[tuple[str, str]]) -> tuple[float, list[dict]]:
-    """pairs = [(prediction, ground_truth), ...] -> (mean_score, per_item results)."""
+    """pairs = [(prediction, ground_truth), ...] -> (mean_score, per_item results).
+
+    codex backend judges in BATCHES (one `codex exec` per chunk of pairs) — a per-pair
+    call would pay CLI startup per question. On codex failure the unresolved pairs are
+    rescored on the gemini path so a usage limit never blocks a scoring run."""
+    backend = resolve_backend()
+    if backend == "codex":
+        from scoring import codex_judge
+
+        try:
+            return _score_pairs_codex(pairs)
+        except codex_judge.CodexJudgeError as e:
+            codex_judge.warn(f"batch codex scoring failed ({e}); rescoring via gemini")
+            backend = "gemini"
+    return _score_pairs_threaded(pairs, backend)
+
+
+def _score_pairs_codex(pairs: list[tuple[str, str]]) -> tuple[float, list[dict]]:
+    """Deterministic pre-pass, then ONE batched codex judgement for the rest."""
+    from scoring import codex_judge
+
+    strict = strict_enabled()
+    verdicts: list[str | None] = [deterministic_judge(p, t) for p, t in pairs]
+    todo = [i for i, v in enumerate(verdicts) if v is None]
+    if todo:
+        judged = codex_judge.judge_batch([pairs[i] for i in todo],
+                                         _system_prompt(strict), strict)
+        for i, v in zip(todo, judged):
+            verdicts[i] = strict_downgrade(pairs[i][0], pairs[i][1], v) if strict else v
+    results = [{"pred": p, "truth": t, "judged": v, "points": _POINTS.get(v, 0.0),
+                "backend": "codex"} for (p, t), v in zip(pairs, verdicts)]
+    total = sum(r["points"] for r in results)
+    return (total / len(results) if results else 0.0), results
+
+
+def _score_pairs_threaded(pairs: list[tuple[str, str]],
+                          backend: str) -> tuple[float, list[dict]]:
     from concurrent.futures import ThreadPoolExecutor
 
     def one(p):
         pred, truth = p
         try:
-            verdict = judge(pred, truth, votes=3)
+            verdict = judge(pred, truth, votes=3, backend=backend)
         except Exception as e:  # noqa: BLE001
             verdict = f"ERROR:{e}"
         return {"pred": pred, "truth": truth, "judged": verdict,
-                "points": _POINTS.get(verdict, 0.0)}
+                "points": _POINTS.get(verdict, 0.0), "backend": backend}
 
     with ThreadPoolExecutor(max_workers=8) as ex:
         results = list(ex.map(one, pairs))
