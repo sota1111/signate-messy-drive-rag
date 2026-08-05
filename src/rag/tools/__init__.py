@@ -7,6 +7,7 @@
 * :mod:`~src.rag.tools.extract_tools` — thin contract wrappers over corpus/passwords/glossary/
   office/vision extraction.
 * :mod:`~src.rag.tools.file_grep` — NFC-aware cross-corpus full-text / cell grep (``file_grep``).
+* :mod:`~src.rag.tools.pdf_faux_italic` — detect faux-italic (matrix-shear) emphasis in a PDF.
 """
 from src.rag.tools.compute_sandbox import ComputeError
 from src.rag.tools.compute_sandbox import run as compute_run
@@ -21,6 +22,7 @@ from src.rag.tools.extract_tools import (
     resolve_ref,
 )
 from src.rag.tools.file_grep import FileGrepError, file_grep
+from src.rag.tools.pdf_faux_italic import detect_faux_italic, emphasized_words
 from src.rag.tools.profile import CorpusProfile
 
 # ``run`` kept as the compute_sandbox entry point for backward compatibility.
@@ -45,4 +47,6 @@ __all__ = [
     "resolve_ref",
     "file_grep",
     "FileGrepError",
+    "detect_faux_italic",
+    "emphasized_words",
 ]
