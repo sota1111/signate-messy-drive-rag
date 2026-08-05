@@ -3,6 +3,9 @@
 The test ground truth is hidden; this gate produces the official submission and (optionally)
 submits it. The real score comes back from the SIGNATE leaderboard.
 
+The production answer path is Gemini-only: ``runner.run`` defaults to the ``investigator`` backend
+(the Gemini tool-driven investigation agent), so Claude is not involved in a submission (SOT-2469).
+
     python -m scoring.gate3                    # build predictions_test.csv + zip
     python -m scoring.gate3 --submit --memo "baseline hybrid RAG"
 """

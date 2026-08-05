@@ -1,26 +1,23 @@
-# SOT-2407 Final Report
+# SOT-2469 Final Report
 
 ## Summary
 
-Implemented a deterministic, GT-backed self-improvement harness. It synthesizes 156 labelled Q/A
-items across eight archetypes, runs the real RAG, reports committed precision and coverage, writes an
-archetype trust map, and applies that map as an additive abstention gate in answer generation.
+Routed the production answer path to the Gemini tool-driven investigator. The legacy text-only
+Gemini and Claude Opus backends remain available only through explicit experimental selection; the
+default `run.run(...)` and CLI path no longer depend on Claude.
 
 ## Verification
 
-- Full real-RAG run: 156/156 completed; overall deterministic mean `+0.8750`.
-- All eight archetypes trusted; committed precision `0.94–1.00`, coverage `0.60–1.00`.
-- Offline tests: 10 passed.
-- Self-test: 156 synthetic truths all Perfect; scorer invariants passed.
-- valid30 regression: the generated trust map marks the only classified valid question as trusted;
-  all other valid questions are unknown and retain existing behavior. Therefore the additive gate does
-  not alter the valid30 predictions, whose established baseline has 2 Incorrect results.
+- Python compile check passed for `src`, `scoring`, and `tests`.
+- Full offline suite: 336 passed, 7 non-fatal openpyxl warnings.
+- Real test-split smoke run: one question answered through `gemini-2.5-pro` investigator in three
+  iterations, producing `artifacts/sot2469_investigator_smoke.csv` with no abstention.
 
 ## Acceptance
 
-- [x] Reproducible archetype precision and coverage output.
-- [x] Trust map controls answer/abstention behavior.
-- [x] valid30 Incorrect remains at the established baseline of 2.
+- [x] Production answer path is Gemini-only and Claude-independent.
+- [x] Legacy text backends remain available only by explicit experimental selection.
+- [x] A test-split prediction is generated through the investigator backend.
 
 ## Acceptance: PASS
 
