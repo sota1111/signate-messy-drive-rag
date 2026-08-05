@@ -177,8 +177,14 @@ data/share_drive (416 files, gitignored)
 | **関門2 推測した未知** | 同ドライブから**自動生成**したQ/A ＋ **1案件を封印** | 機械生成GT | 30問への過学習を検知・汎化測定 |
 | **関門3 完全な未知** | `questions_test.csv` 100問 | 非公開 | SIGNATE本提出＝真の汎化KPI |
 
-手元採点は公式 `evaluator.py` の採点ルールを **Gemini 審査**へ移植（`scoring/`）。公式は gpt-5.2 だが、
-提出物にOpenAIキーは不要（採点はSIGNATE側）。境界事例のみ差が出る程度。
+手元採点は公式 `evaluator.py` の採点ルールをそのまま移植（`scoring/`）。審査バックエンドは
+**Codex CLI（`codex exec`, GPT-5.x）が既定**（SOT-2457）: 公式採点者 gpt-5.2 と同系列モデルで
+審査するため、Gemini 代理審査で確認された「約0.2の甘さ・実LBと無相関(ρ=−0.09)」のギャップを
+詰める。OpenAI キーは不要（Codex CLI の認証を利用）。Codex CLI が無い環境や
+`JUDGE_BACKEND=gemini` 指定時は従来の Gemini 審査、Codex 呼び出し失敗（使用上限等）時も
+Gemini に自動フォールバックする。チューニングは環境変数
+`CODEX_JUDGE_MODEL` / `CODEX_JUDGE_BATCH` / `CODEX_JUDGE_VOTES` / `CODEX_JUDGE_TIMEOUT`
+（`scoring/codex_judge.py`）。注意: ローカル採点は依然 proxy であり、採用ゲートは実LB確認のみ。
 
 ### 決定論的な自己改善ハーネス（archetype別 trust map, SOT-2407）
 
@@ -230,7 +236,7 @@ python -m scoring.gate3 --submit                 # 関門3: signate 提出
 ```
 config/settings.py     設定（GCP/モデル/パス）
 src/rag/               抽出→索引→検索→生成→バッチ実行
-scoring/               3関門の採点ハーネス（Gemini CRAG）
+scoring/               3関門の採点ハーネス（CRAG審査: Codex CLI既定 / Geminiフォールバック）
 infra/terraform/       GCP バックエンド（Cloud Run/Vertex/Firestore/GCS）
 backend/               FastAPI サービス（Cloud Run）
 scripts/fetch_data.sh  SIGNATE データ再取得

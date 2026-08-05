@@ -115,8 +115,16 @@ def main() -> None:
         "ledger_backward_consistency": ledger_fidelity_report(),
     }
     if args.compare_llm:
-        backend = crag._judge_openai if crag.settings.JUDGE_BACKEND.lower() == "openai" else crag._judge_gemini
-        report["llm_only"] = evaluate(lambda p, t: crag._aggregate(backend, p, t, 3, crag.strict_enabled()))
+        backend_name = crag.resolve_backend()
+        strict = crag.strict_enabled()
+        if backend_name == "codex":
+            from scoring import codex_judge
+
+            report["llm_only"] = evaluate(
+                lambda p, t: codex_judge.judge_one(p, t, crag._system_prompt(strict), strict))
+        else:
+            base = crag._judge_openai if backend_name == "openai" else crag._judge_gemini
+            report["llm_only"] = evaluate(lambda p, t: crag._aggregate(base, p, t, 3, strict))
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 

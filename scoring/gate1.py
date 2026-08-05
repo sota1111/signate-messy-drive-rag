@@ -40,7 +40,9 @@ def main(preds: Path | None, run_first: bool) -> None:
 
     dist = collections.Counter(r["judged"] for r in results)
     print("\n==================== 関門1 (valid 30) ====================")
-    print(f"JUDGE backend: {settings.JUDGE_BACKEND} ({settings.JUDGE_MODEL})")
+    backend = crag.resolve_backend()
+    print(f"JUDGE backend: {backend}"
+          + (f" ({settings.JUDGE_MODEL})" if backend != "codex" else " (codex exec)"))
     print(f"SCORE (mean): {score:+.4f}   [Perfect+1 / Acceptable+0.5 / Missing0 / Incorrect-1]")
     print("verdicts:", dict(dist))
     print("-" * 58)
