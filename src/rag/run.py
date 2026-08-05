@@ -41,7 +41,7 @@ from src.rag import generate
 
 # Answer backends. The production default is the Gemini investigation agent; the text-only backends
 # (``gemini``/``opus``) are retained for backward-compatible experiments only (SOT-2469).
-GEN_CHOICES = ("investigator", "resolve", "gemini", "opus")
+GEN_CHOICES = ("investigator", "resolve", "gated", "gemini", "opus")
 DEFAULT_GEN = "investigator"
 # ``opus`` (Claude) is explicitly excluded from the production answer path — Gemini-only (SOT-2460).
 EXPERIMENTAL_GEN = ("gemini", "opus")
@@ -82,6 +82,12 @@ def make_worker(gen: str, hard: bool) -> Callable[[int, str], tuple[int, dict]]:
 
         def work(idx: int, q: str) -> tuple[int, dict]:
             return idx, _agent_result(tiebreak.resolve_question(q).to_dict())
+    elif gen == "gated":
+        # Full 合議 + precision-first confidence gate (SOT-2473): commit only 合議一致・高確信, else 棄権.
+        from src.rag.agent import gate
+
+        def work(idx: int, q: str) -> tuple[int, dict]:
+            return idx, _agent_result(gate.gate_question(q).to_dict())
     elif gen == "opus":
         # Legacy Claude backend — excluded from the production path, experiments only (SOT-2469).
         from src.rag import opus_gen
@@ -141,8 +147,9 @@ if __name__ == "__main__":
     ap.add_argument("--gen", choices=list(GEN_CHOICES), default=DEFAULT_GEN,
                     help="answer backend (SOT-2469): investigator (Gemini tool-agent, production "
                          "default) | resolve (investigator→verifier→tiebreak, full Gemini chain) | "
-                         "gemini (legacy text-only RAG, experimental) | opus (legacy Claude CLI, "
-                         "experimental/non-production)")
+                         "gated (resolve + precision-first confidence gate, SOT-2473: commit only "
+                         "合議一致・高確信, else 棄権) | gemini (legacy text-only RAG, experimental) | "
+                         "opus (legacy Claude CLI, experimental/non-production)")
     args = ap.parse_args()
     out = args.out or (settings.ARTIFACTS_DIR / f"predictions_{args.split}.csv")
     run(args.split, out, args.limit, args.workers, args.hard, gen=args.gen)
