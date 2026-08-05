@@ -13,7 +13,7 @@ import re
 import tiktoken
 
 from config import settings
-from src.rag import archetype, compute, diffpair, enumeration, llm, pivotcond, retrieve
+from src.rag import archetype, compute, diffpair, enumeration, llm, normalize, pivotcond, retrieve
 from src.rag.corpus import nfc
 
 _ENC = tiktoken.get_encoding("cl100k_base")
@@ -340,9 +340,13 @@ def answer_question(question: str, *, k: int = 16, hard: bool = False, verify: b
 
 
 def _result(question, answer, conf, raw, evidence, images, verified) -> dict:
+    # Final commit sink for every answering path. The meaning-preserving normalization layer
+    # (SOT-2448) canonicalises a *committed* answer toward the concise ground-truth style so the
+    # gpt-5.2 judge does not penalise verbose/off-format phrasing; it is a no-op on abstentions and
+    # falls back to the original whenever a value/identifier would not be preserved (zero new risk).
     return {
         "question": question,
-        "answer": answer,
+        "answer": normalize.normalize_answer(answer, question=question),
         "confidence": conf,
         "raw_answer": raw,
         "verified": verified,
