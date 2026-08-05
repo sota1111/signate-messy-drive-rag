@@ -89,6 +89,74 @@ def generate(
     raise RuntimeError(f"Gemini generate failed after {retries} attempts: {last_err}")
 
 
+# ------------------------------------- LLM reranker (R4 / SOT-2450) --------------------------
+_RERANK_SYSTEM = (
+    "あなたは検索結果の関連度を採点するリランカです。質問に答えるための根拠として"
+    "各資料がどれだけ直接的に役立つかを 0〜10 の整数で採点してください。\n"
+    "- 質問が求める具体的な値・条件・識別子・列挙対象がその資料に明示されていれば高得点(8〜10)。\n"
+    "- 話題は近いが答えそのものは含まない資料は中程度(3〜6)。\n"
+    "- 無関係・別案件・別ファイルの資料は低得点(0〜2)。\n"
+    "推測や外部知識で補わず、資料の記載内容のみで判断してください。"
+)
+
+_RERANK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "scores": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "score": {"type": "number"},
+                },
+                "required": ["index", "score"],
+            },
+        }
+    },
+    "required": ["scores"],
+}
+
+
+def rerank(question: str, candidates: Sequence[str], *, model: str | None = None,
+           max_chars: int = 600, retries: int = 3) -> list[float]:
+    """Score each candidate snippet 0–10 for relevance to ``question`` (same order as input).
+
+    Deterministic (temperature 0, thinking disabled, fixed seed) so a rerank run is reproducible.
+    Any failure — parse error, missing index, empty candidates — degrades to all-zero scores, which
+    leaves the caller's stable sort on the original fusion order untouched (a safe no-op fallback).
+    """
+    if not candidates:
+        return []
+    listing = "\n".join(
+        f"[{i}] {c[:max_chars]}" for i, c in enumerate(candidates)
+    )
+    prompt = (
+        f"質問:\n{question}\n\n"
+        f"候補資料(各行 [番号] 本文):\n{listing}\n\n"
+        "各候補の関連度を 0〜10 で採点し、JSONで {\"scores\":[{\"index\":番号,\"score\":点数}, ...]} "
+        "を全候補分返してください。"
+    )
+    scores = [0.0] * len(candidates)
+    try:
+        raw = generate(
+            prompt, system=_RERANK_SYSTEM, model=model or settings.GEN_MODEL,
+            temperature=0.0, thinking_budget=0, max_output_tokens=1024,
+            response_schema=_RERANK_SCHEMA, retries=retries,
+        )
+        import json
+        for item in (json.loads(raw).get("scores") or []):
+            idx = item.get("index")
+            if isinstance(idx, int) and 0 <= idx < len(scores):
+                try:
+                    scores[idx] = float(item.get("score", 0.0))
+                except (TypeError, ValueError):
+                    scores[idx] = 0.0
+    except Exception:  # noqa: BLE001 — rerank is best-effort; fall back to fusion order
+        return [0.0] * len(candidates)
+    return scores
+
+
 def _embed_batch(mdl: str, chunk: list[str], task_type: str, retries: int) -> list[list[float]]:
     """Embed one batch; on a token/size 400 error, split and recurse (Vertex caps ~20k tok/req)."""
     for attempt in range(retries):
