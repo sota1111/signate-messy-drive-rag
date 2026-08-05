@@ -158,6 +158,11 @@ class Report:
     def _rate(self, count: int) -> float:
         return count / self.n if self.n else 0.0
 
+    @property
+    def match_rate(self) -> float:
+        """Gold match rate over scored items (0.0 when empty). Used by 関門3 gating (SOT-2477)."""
+        return self._rate(sum(1 for it in self.items if it.is_match))
+
     def to_dict(self) -> dict:
         matches = [it for it in self.items if it.is_match]
         abstains = [it for it in self.items if it.is_abstain]
