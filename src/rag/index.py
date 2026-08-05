@@ -75,11 +75,13 @@ def tokenize(text: str) -> list[str]:
 
 
 def build(caption_images: bool = True, verbose: bool = True) -> None:
+    from src.rag import facts  # deterministic fact-row distillation (SOT-2449)
     from src.rag.extract import extract  # heavy deps, only needed for building
 
     refs = corpus.walk()
     chunks: list[Chunk] = []
     cid = 0
+    n_facts = 0
     for i, ref in enumerate(refs):
         doc = extract(ref, caption_images=caption_images)
         if not doc.text.strip():
@@ -90,8 +92,19 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
             chunks.append(Chunk(cid, ref.project, ref.category, ref.name, ref.rel, doc.kind,
                                 f"{header}\n{bc}"))
             cid += 1
+        # Fact-level index (SOT-2449): high-signal extracted artifacts (highlights / bold /
+        # Pivot conditions / code params) as independent 1-fact-per-line embedded rows. The raw
+        # chunks above stay in place (BM25 + dense); fact rows are additive. Opt-in — a
+        # structural no-op unless RAG_FACT_INDEX=1.
+        if facts.enabled():
+            for fr in facts.fact_rows(ref, doc.text):
+                chunks.append(Chunk(cid, ref.project, ref.category, ref.name, ref.rel, "fact", fr))
+                cid += 1
+                n_facts += 1
         if verbose and (i + 1) % 50 == 0:
-            print(f"  extracted {i + 1}/{len(refs)} files, {len(chunks)} chunks")
+            print(f"  extracted {i + 1}/{len(refs)} files, {len(chunks)} chunks ({n_facts} facts)")
+    if verbose:
+        print(f"  fact rows indexed: {n_facts}")
 
     if verbose:
         print(f"embedding {len(chunks)} chunks...")
