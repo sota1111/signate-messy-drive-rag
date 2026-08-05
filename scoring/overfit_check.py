@@ -65,6 +65,79 @@ def assess(dev_gain: float, holdout_gain: float, *, eps: float = EPS,
     return Verdict(overfit, round(dev_gain, 4), round(holdout_gain, 4), reasons)
 
 
+# =========================== two-axis adoption gate (SOT-2447 / A2) ============================
+# The single sealed hold-out axis let the #5 regression through (dev 0.87 / hold-out 0.98 proxy but
+# real −0.1333): the hold-out is scored with the same synthetic phrasings the RAG was tuned against,
+# so a change can climb it while failing on the real test100 wording. Adoption is now gated on TWO
+# independent generalization axes — the sealed hold-out AND the real-style transcription bench
+# (`scoring.realstyle`, test100-style phrasing) — and a change is BLOCKED unless BOTH keep up with the
+# dev gain. valid30/dev is NOT an adoption axis (it is the burnt-out dev set, isolated here).
+
+# A generalization axis that drops at least this far in absolute terms blocks adoption outright, even
+# if dev did not move — a change that regresses transfer is never worth adopting.
+ABS_REGRESSION_FLOOR = 0.05
+
+
+@dataclass
+class TwoAxisVerdict:
+    block: bool
+    dev_gain: float
+    holdout_gain: float
+    realstyle_gain: float
+    reasons: list[str]
+
+    @property
+    def label(self) -> str:
+        return "ADOPTION_BLOCKED" if self.block else "OK_TO_ADOPT"
+
+
+def assess_two_axis(dev_gain: float, holdout_gain: float, realstyle_gain: float, *,
+                    eps: float = EPS, margin: float = MARGIN,
+                    floor: float = ABS_REGRESSION_FLOOR) -> TwoAxisVerdict:
+    """Block adoption unless BOTH generalization axes keep up with dev.
+
+    An axis fails (→ block) when it is overfit-suspected relative to the dev gain (``assess``) OR it
+    regressed by more than ``floor`` in absolute terms. This is what catches #5: the sealed hold-out
+    rose (passes single-axis) but the real-style axis fell, so the two-axis gate still blocks."""
+    reasons: list[str] = []
+    block = False
+    for name, gain in (("sealed hold-out", holdout_gain), ("real-style bench", realstyle_gain)):
+        v = assess(dev_gain, gain, eps=eps, margin=margin)
+        if v.overfit:
+            block = True
+            reasons.append(f"{name}: overfit — {v.reasons[0]}")
+        elif gain < -floor:
+            block = True
+            reasons.append(f"{name}: regressed {gain:+.4f} (below −{floor}) — a change that drops a "
+                           "generalization axis is not adopted")
+    if not block:
+        reasons.append(f"both generalization axes kept up with dev (hold-out {holdout_gain:+.4f}, "
+                       f"real-style {realstyle_gain:+.4f}) — safe to adopt")
+    return TwoAxisVerdict(block, round(dev_gain, 4), round(holdout_gain, 4),
+                          round(realstyle_gain, 4), reasons)
+
+
+def adoption_axes(prev: dict, curr: dict) -> tuple[float, float, float]:
+    """Return (dev_gain, holdout_gain, realstyle_gain) between two history records.
+
+    valid30/dev is reported as ``dev_gain`` for context ONLY — it never enters the block decision, so
+    a change that improves only the burnt-out valid30/dev slice cannot earn adoption (valid30 isolation)."""
+    dev_gain = curr.get("dev_mean", 0.0) - prev.get("dev_mean", 0.0)
+    holdout_gain = curr.get("holdout_mean", 0.0) - prev.get("holdout_mean", 0.0)
+    realstyle_gain = curr.get("realstyle_mean", 0.0) - prev.get("realstyle_mean", 0.0)
+    return dev_gain, holdout_gain, realstyle_gain
+
+
+def assess_last_two_axes(history: list[dict]) -> TwoAxisVerdict | None:
+    """Two-axis adoption verdict for the last two history records (None if <2 or no real-style axis)."""
+    if len(history) < 2:
+        return None
+    prev, curr = history[-2], history[-1]
+    if "realstyle_mean" not in curr or "realstyle_mean" not in prev:
+        return None
+    return assess_two_axis(*adoption_axes(prev, curr))
+
+
 def load_history(path=HISTORY_PATH) -> list[dict]:
     if not path.exists():
         return []
@@ -108,12 +181,22 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dev-gain", type=float, default=None)
     ap.add_argument("--holdout-gain", type=float, default=None)
+    ap.add_argument("--realstyle-gain", type=float, default=None,
+                    help="real-style bench gain — enables the two-axis adoption gate")
     args = ap.parse_args()
 
+    # ---- ad-hoc mode ----
     if args.dev_gain is not None and args.holdout_gain is not None:
+        if args.realstyle_gain is not None:
+            return _report_two_axis(assess_two_axis(
+                args.dev_gain, args.holdout_gain, args.realstyle_gain))
         v = assess(args.dev_gain, args.holdout_gain)
     else:
         history = load_history()
+        # ---- two-axis gate when the real-style axis is recorded (the current adoption gate) ----
+        tv = assess_last_two_axes(history)
+        if tv is not None:
+            return _report_two_axis(tv)
         v = assess_last_two(history)
         if v is None:
             print(f"insufficient history in {HISTORY_PATH} (need ≥2 runs) — cannot assess overfit.")
@@ -134,6 +217,21 @@ def main() -> int:
         print("\n→ ADOPTION BLOCKED: the change did not generalize to the hold-out slice.")
         return 3
     print("\n→ OK to adopt (or no adoption to judge).")
+    return 0
+
+
+def _report_two_axis(tv: TwoAxisVerdict) -> int:
+    print(f"\ntwo-axis adoption gate: {tv.label}")
+    print(f"  dev gain        : {tv.dev_gain:+.4f}   (valid30/dev — context only, NOT an adoption axis)")
+    print(f"  hold-out gain   : {tv.holdout_gain:+.4f}   (sealed-project axis)")
+    print(f"  real-style gain : {tv.realstyle_gain:+.4f}   (test100-style transfer axis)")
+    for r in tv.reasons:
+        print(f"  · {r}")
+    if tv.block:
+        print("\n→ ADOPTION BLOCKED: a change must clear BOTH the sealed hold-out AND the real-style "
+              "bench.")
+        return 3
+    print("\n→ OK to adopt: both generalization axes kept up with dev.")
     return 0
 
 
