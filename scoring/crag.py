@@ -10,6 +10,7 @@ Score: Perfect +1, Acceptable +0.5, Missing 0, Incorrect -1; final = mean over q
 from __future__ import annotations
 
 import json
+import os
 import re
 import textwrap
 import unicodedata
@@ -41,6 +42,16 @@ JUDGE_SYSTEM = textwrap.dedent("""
     JSON形式でkey "judged" に結果を入れて出力すること. 出力例: {"judged":"Perfect"}
 """).strip()
 
+# Strict addendum: the Gemini proxy over-awards "Perfect" (~0.2 more lenient than the real
+# gpt-5.2 judge). These clauses tip verbose / format-mismatched answers away from Perfect.
+JUDGE_STRICT_ADDENDUM = textwrap.dedent("""
+    # 厳格化ルール（過大評価の抑制）
+    - answerがground_truthより著しく冗長で、ground_truthから確認できない具体的情報（数値・固有名詞・日付・条件・単位）を追加している場合は"Perfect"にせず、追加情報が誤り・未確認なら"Incorrect"、無害な言い換え程度なら"Acceptable"とする.
+    - 求められている書式（単位・記法・列挙形式・キー: 値の形）とanswerの書式が食い違う場合、意味が同じでも"Perfect"にはせず"Acceptable"以下とする.
+    - ground_truthの主要要素をanswerが省略・言い換えで曖昧化している場合は"Perfect"にしない.
+    - 判定に迷う場合は寛容側（Perfect）ではなく厳格側（Acceptable/Incorrect）に倒す.
+""").strip()
+
 _SCHEMA = {
     "type": "object",
     "properties": {"judged": {"type": "string",
@@ -49,6 +60,15 @@ _SCHEMA = {
 }
 
 _POINTS = {"Perfect": 1.0, "Acceptable": 0.5, "Missing": 0.0, "Incorrect": -1.0}
+
+
+def strict_enabled() -> bool:
+    """Strict rubric is on by default; JUDGE_STRICT=0/false/no/off falls back to majority."""
+    return os.getenv("JUDGE_STRICT", "1").strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _system_prompt(strict: bool) -> str:
+    return f"{JUDGE_SYSTEM}\n\n{JUDGE_STRICT_ADDENDUM}" if strict else JUDGE_SYSTEM
 
 
 def _norm(value: str) -> str:
@@ -89,10 +109,36 @@ def deterministic_judge(pred: str, truth: str) -> str | None:
     return None
 
 
-def _judge_gemini(pred: str, truth: str) -> str:
+def strict_downgrade(pred: str, truth: str, verdict: str) -> str:
+    """Deterministically knock a lenient "Perfect" down for verbose / format-mismatched
+    free-text answers (the idx17/23/28 failure type). Only ever downgrades, never upgrades,
+    and only fires on free-text pairs — short/numeric/enumeration answers are untouched.
+    """
+    if verdict != "Perfect":
+        return verdict
+    p, t = _norm(pred), _norm(truth)
+    # Free-text only: at least one side reads like prose (sentence punctuation or long).
+    prose = bool(re.search(r"[。．！？!?、,]", p + t)) or max(len(p), len(t)) > 24
+    if not prose:
+        return verdict
+    # Verbosity: the answer is materially longer than the reference model answer.
+    verbose = len(p) >= len(t) + 12 and len(p) >= 1.5 * len(t)
+    # Extra specific claims the ground_truth cannot confirm: numbers present in the answer
+    # but absent from the ground_truth (unconfirmable specifics → the rubric forbids Perfect).
+    p_nums = set(re.findall(r"-?\d[\d,]*(?:\.\d+)?", p))
+    t_nums = set(re.findall(r"-?\d[\d,]*(?:\.\d+)?", t))
+    extra_numeric = bool(p_nums - t_nums)
+    if extra_numeric and verbose:
+        return "Incorrect"  # adds unverifiable numeric specifics on top of padding
+    if verbose or extra_numeric:
+        return "Acceptable"  # over-long or format-drifted paraphrase; not a clean Perfect
+    return verdict
+
+
+def _judge_gemini(pred: str, truth: str, strict: bool = True) -> str:
     raw = llm.generate(
         f"ground_truth: {truth} answer: {pred}\n",
-        system=JUDGE_SYSTEM,
+        system=_system_prompt(strict),
         model=settings.JUDGE_MODEL,
         temperature=0.0,
         thinking_budget=128,  # gemini-2.5-pro requires thinking>0; keeps judging deterministic-ish
@@ -102,7 +148,7 @@ def _judge_gemini(pred: str, truth: str) -> str:
     return json.loads(raw)["judged"]
 
 
-def _judge_openai(pred: str, truth: str) -> str:
+def _judge_openai(pred: str, truth: str, strict: bool = True) -> str:
     from openai import OpenAI
 
     client = OpenAI()
@@ -112,29 +158,42 @@ def _judge_openai(pred: str, truth: str) -> str:
         response_format={"type": "json_schema", "json_schema": {
             "name": "judgement_schema",
             "schema": {**_SCHEMA, "additionalProperties": False}}},
-        messages=[{"role": "system", "content": JUDGE_SYSTEM},
+        messages=[{"role": "system", "content": _system_prompt(strict)},
                   {"role": "user", "content": f"ground_truth: {truth} answer: {pred}\n"}],
     ).choices[0].message.content
     return json.loads(resp)["judged"]
 
 
-def judge(pred: str, truth: str, votes: int = 3) -> str:
-    """Hybrid judge: deterministic first, majority-of-3 LLM when ambiguous."""
+def judge(pred: str, truth: str, votes: int = 3, strict: bool | None = None) -> str:
+    """Hybrid judge: deterministic first, then LLM. Strict mode (default, JUDGE_STRICT)
+    aggregates the votes by worst case rather than majority and applies a deterministic
+    verbosity/format downgrade, narrowing the Gemini proxy's ~0.2 leniency gap."""
+    strict = strict_enabled() if strict is None else strict
     resolved = deterministic_judge(pred, truth)
     if resolved is not None:
         return resolved
     backend = settings.JUDGE_BACKEND.lower()
-    one = _judge_openai if backend == "openai" else _judge_gemini
-    return _majority(one, pred, truth, votes)
+    base = _judge_openai if backend == "openai" else _judge_gemini
+    one = (lambda p, t: base(p, t, strict))
+    verdict = _aggregate(one, pred, truth, votes, strict)
+    return strict_downgrade(pred, truth, verdict) if strict else verdict
+
+
+def _aggregate(one, pred: str, truth: str, votes: int, strict: bool) -> str:
+    """Strict → worst-value aggregation (min points over the votes); else majority-of-N."""
+    if votes <= 1:
+        return one(pred, truth)
+    verdicts = [one(pred, truth) for _ in range(votes)]
+    if strict:
+        return min(verdicts, key=lambda v: _POINTS.get(v, 0.0))
+    import collections
+
+    return collections.Counter(verdicts).most_common(1)[0][0]
 
 
 def _majority(one, pred: str, truth: str, votes: int) -> str:
-    if votes <= 1:
-        return one(pred, truth)
-    import collections
-
-    tally = collections.Counter(one(pred, truth) for _ in range(votes))
-    return tally.most_common(1)[0][0]
+    """Backwards-compatible majority aggregation (non-strict path / callers)."""
+    return _aggregate(one, pred, truth, votes, strict=False)
 
 
 def score_pairs(pairs: list[tuple[str, str]]) -> tuple[float, list[dict]]:

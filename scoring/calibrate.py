@@ -20,7 +20,10 @@ LEDGER_PATH = Path(settings.REPO_ROOT) / "scoring" / "ledger.jsonl"
 MODEL_PATH = settings.ARTIFACTS_DIR / "real_score_calibration.json"
 
 
-def load_ledger(path: Path = LEDGER_PATH) -> list[dict]:
+def load_ledger(path: Path = LEDGER_PATH, scored_only: bool = True) -> list[dict]:
+    """Load submission rows. By default only rows with a realised ``real_public_score`` are
+    returned (pending forward-recorded predictions have it ``null`` and are skipped for
+    calibration); pass ``scored_only=False`` to get the full ledger."""
     rows = []
     for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip():
@@ -31,6 +34,8 @@ def load_ledger(path: Path = LEDGER_PATH) -> list[dict]:
                 raise ValueError(f"{path}:{line_no}: missing {key}")
         if not isinstance(row["archetype_committed"], dict):
             raise ValueError(f"{path}:{line_no}: archetype_committed must be an object")
+        if scored_only and row["real_public_score"] is None:
+            continue  # prediction recorded but SIGNATE score not yet returned
         rows.append(row)
     if len(rows) < 2:
         raise ValueError("at least two scored submissions are required")
@@ -121,6 +126,7 @@ def calibrate(rows: list[dict], ridge: float = 1.0) -> dict:
         "proxy_real_spearman": spearman([r["local_score"] for r in rows], y.tolist()),
         "calibrated_real_spearman": spearman(fitted.tolist(), y.tolist()),
         "in_sample_rmse": rmse,
+        "loo_mae": round(float(np.mean([r["absolute_error"] for r in loo])), 4) if loo else None,
         "backtest": backtest,
         "leave_one_out": loo,
     }
