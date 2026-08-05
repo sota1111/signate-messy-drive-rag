@@ -44,16 +44,16 @@ def test_pending_rows_are_skipped_by_calibration(tmp_path):
 
 
 def test_real_ledger_is_complete_and_loo_mae_not_worse():
-    """The committed ledger has all 5 real submissions with predicted/actual/error, and the
+    """Every real submission in the committed ledger has predicted/actual/error, and the
     calibration leave-one-out MAE is no worse than the pre-completion n=4 baseline (0.0848)."""
     rows = calibrate.load_ledger()
-    assert len(rows) == 5
+    assert len(rows) >= 5  # the ledger only grows as submissions are made
     for r in rows:
         assert r["real_public_score"] is not None
         assert r["predicted"] is not None and r["absolute_error"] is not None
         assert "archetype_committed" in r and r["archetype_committed"]
     report = judge_fidelity.ledger_fidelity_report()
-    assert report["n_submissions"] == 5
+    assert report["n_submissions"] == len(rows)
     assert report["loo_mae"] <= 0.0848  # must not regress vs the recorded n=4 baseline
 
 
