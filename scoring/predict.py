@@ -67,6 +67,12 @@ def main() -> int:
                     help="gate1/hold-out proxy score (default: latest ledger value)")
     ap.add_argument("--ledger", type=Path, default=calibrate.LEDGER_PATH)
     ap.add_argument("--model", type=Path, default=calibrate.MODEL_PATH)
+    ap.add_argument("--record", metavar="SUBMISSION",
+                    help="append this prediction to the ledger as SUBMISSION (e.g. '#6')")
+    ap.add_argument("--date", default="", help="submission date for --record (YYYY-MM-DD)")
+    ap.add_argument("--config", default="", help="config label for --record")
+    ap.add_argument("--commit", default="", help="commit sha for --record")
+    ap.add_argument("--notes", default="", help="notes for --record")
     args = ap.parse_args()
     ledger = calibrate.load_ledger(args.ledger)
     model = calibrate.calibrate(ledger)
@@ -80,6 +86,13 @@ def main() -> int:
         source = f"latest ledger mix ({ledger[-1]['submission']}); pass --answers for a new set"
     result = predict(model, local_score, counts)
     result["answers_source"] = source
+    if args.record:
+        from scoring import ledger
+        row = ledger.record_prediction(
+            args.record, result, date=args.date, config=args.config,
+            commit=args.commit, notes=args.notes or f"machine-recorded from {source}",
+            path=args.ledger)
+        result["recorded"] = row
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
