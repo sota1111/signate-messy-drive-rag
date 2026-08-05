@@ -3,6 +3,13 @@ region          = "us-central1"
 vertex_location = "us-central1"
 gcs_location    = "US"
 
+# Gemini-only model wiring (SOT-2480). Override to pin different Vertex models; defaults match
+# config/settings.py so the deployed backend runs Vertex Gemini exclusively (Claude-independent).
+gen_model      = "gemini-2.5-flash"
+gen_model_hard = "gemini-2.5-pro"
+vision_model   = "gemini-2.5-flash"
+embed_model    = "text-embedding-005"
+
 # Image ref is set by scripts/deploy.sh (which builds & pushes first, then applies).
 backend_image = "us-central1-docker.pkg.dev/signate-messy-drive-rag/rag/backend:latest"
 
