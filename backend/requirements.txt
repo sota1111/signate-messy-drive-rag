@@ -9,4 +9,14 @@ numpy==1.26.4
 pandas==2.2.2
 rank-bm25==0.2.2
 tiktoken==0.7.0
-python-docx==1.1.2      # glossary parsing at startup
+# --- Office extraction for the Gemini agent stack (SOT-2480) ---
+# /ask routes to src.rag.agent.gate (SOT-2479), whose import chain eagerly loads
+# gate -> investigator -> compute_sandbox / extract_tools -> src.rag.extract.office/passwords.
+# Those modules import openpyxl / python-pptx / msoffcrypto at module load time, so the
+# serving image MUST ship them or the first real /ask crashes with ModuleNotFoundError
+# (/health stays up because it is static). These also cover the shipped 社内管理 corpus
+# (docx/pptx/md). Heavier pdf/vision deps stay out — no pdf/image is shipped in the lean corpus.
+python-docx==1.1.2      # .docx glossary + office extraction
+openpyxl==3.1.5         # .xlsx cells / chart numCache + compute_sandbox (eager import)
+python-pptx==1.0.2      # .pptx text / shapes (eager import via extract.office)
+msoffcrypto-tool==6.0.0 # encrypted Office decryption (eager import via extract.passwords)

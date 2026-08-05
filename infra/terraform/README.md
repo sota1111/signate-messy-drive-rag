@@ -9,14 +9,23 @@ GCS) but is deliberately scoped down to what this SIGNATE competition backend ac
 ## Is this "backend-only" extraction complete? — Yes
 
 This module provisions everything the backend needs to run, and nothing it doesn't. The backend
-(`backend/app/main.py`, `src/rag/*`) reads exactly four runtime settings, all wired here:
+(`backend/app/main.py`, `src/rag/*`) reads these runtime settings, all wired here. Since SOT-2479
+`/ask` routes to the Vertex **Gemini agent** stack (`src.rag.agent.gate`), so the Gemini model
+selection is pinned in IaC to keep the deploy reproducible and Claude-independent (SOT-2480):
 
 | Env var | Wired by | Purpose |
 |---|---|---|
 | `GCP_PROJECT_ID` | `main.tf` Cloud Run env | Vertex project (`src/rag/llm.py`) |
 | `VERTEX_LOCATION` | `main.tf` Cloud Run env | Vertex region for Gemini + embeddings |
+| `GEN_MODEL` / `GEN_MODEL_HARD` | `main.tf` Cloud Run env | Gemini generation models (default + hard-question escalation) |
+| `VISION_MODEL` | `main.tf` Cloud Run env | Gemini model for chart / image-PDF understanding |
+| `EMBED_MODEL` | `main.tf` Cloud Run env | Vertex text-embedding model for dense retrieval |
 | `INDEX_DIR` | `backend/Dockerfile` (`/app/index_store`) | Retrieval index baked into the image |
 | `CORPUS_DIR` | `backend/Dockerfile` (`/app/corpus`) | Minimal glossary corpus baked into the image |
+
+> The serving image (`backend/requirements.txt`) also ships the Office-extraction deps the agent
+> stack imports at load time (`openpyxl` / `python-pptx` / `msoffcrypto-tool`) — without them the
+> first real `/ask` fails with `ModuleNotFoundError` while `/health` (static) stays up.
 
 There is **no auth** (public demo endpoint), so no Secret Manager references are needed, and the
 retrieval index/corpus are **baked into the container image** at build time, so there is **no

@@ -105,6 +105,24 @@ resource "google_cloud_run_v2_service" "backend" {
         name  = "VERTEX_LOCATION"
         value = var.vertex_location
       }
+      # Gemini-only model wiring (SOT-2480): pin the Vertex models explicitly so the
+      # deployed backend is Claude-independent and reproducible from IaC, not from code defaults.
+      env {
+        name  = "GEN_MODEL"
+        value = var.gen_model
+      }
+      env {
+        name  = "GEN_MODEL_HARD"
+        value = var.gen_model_hard
+      }
+      env {
+        name  = "VISION_MODEL"
+        value = var.vision_model
+      }
+      env {
+        name  = "EMBED_MODEL"
+        value = var.embed_model
+      }
       env {
         name  = "INDEX_DIR"
         value = "/app/index_store"
