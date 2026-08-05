@@ -1,8 +1,14 @@
 """Claude Opus answer backend (SOT-2457) — 正答作成を Opus が担当する.
 
-The Vertex Gemini generation path plateaued (real-LB commit accuracy collapses on unseen
-questions), so per the SOT-2457 directive the answer set is produced by **Claude Opus** via
-the Claude CLI (`claude -p --model opus`) instead of Gemini, and scored locally by the
+.. note:: **Non-production / experimental only (SOT-2469).** The production answer path is now the
+   Gemini tool-driven investigation agent (:mod:`src.rag.agent.investigator`); Claude is excluded
+   from the production path (parent SOT-2460's Gemini-only mandate). This module is retained solely
+   for backward-compatible experiments (reachable via ``run.py --gen opus`` / ``gate1 --gen opus``),
+   never by the default production run (``run.run`` defaults to ``gen='investigator'``).
+
+The Vertex Gemini *text-only* generation path plateaued (real-LB commit accuracy collapses on unseen
+questions), so per the SOT-2457 directive this experimental answer set is produced by **Claude Opus**
+via the Claude CLI (`claude -p --model opus`) instead of Gemini, and scored locally by the
 Codex batch judge. This module mirrors ``generate.answer_question``'s contract:
 
 - the shared deterministic front (trust gate + hard modules) runs first, unchanged;
