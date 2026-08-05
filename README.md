@@ -219,6 +219,25 @@ python -m scoring.selfimprove                       # 実RAG→決定論採点�
 .venv/bin/python -m pytest scoring/test_harness.py -q   # ハーネスの単体テスト
 ```
 
+### ゴールド100問 offline ランナー（回帰基準, SOT-2472）
+
+統合系（調査AG→異種検証→tie-break; `src.rag.run --gen resolve`）の test100 回答を **ゴールド100問**
+（`artifacts/predictions_test_v3_final.csv`）に照合し、一致率・棄権率・**設問型(archetype)別内訳**・
+誤答/棄権リスト・コストを算出する回帰基準。照合は他の採点と同じ CRAG 判定（既定 codex）を使う:
+一致=`Perfect|Acceptable` / 棄権=ABSTAINセンチネル/空/`Missing` / 誤答=`Incorrect`。
+
+```bash
+# 既存の予測セットを採点（details.jsonl は cost/method も持つ。headerless csv も可）
+python -m scoring.gold_offline --answers artifacts/predictions_test.details.jsonl
+# 統合系を test100 に流してから採点
+python -m scoring.gold_offline --run --gen resolve --workers 8
+# 「誤答を棄権へ落とす」挙動の確認: baseline→primary の Incorrect→Missing 変換を計測
+python -m scoring.gold_offline --answers <primary> --baseline-answers <baseline>
+```
+
+一致率は手動実績（26/30ペース = 86.7%）を pass 閾値としてゲート表示（`baseline.meets`）。非一致のうち
+棄権に落ちた割合（`wrong_to_abstain.abstain_share`）で、誤答(−1)を棄権(0)へ落とす安全挙動を可視化する。
+
 ## セットアップ
 
 ```bash
