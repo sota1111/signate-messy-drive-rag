@@ -13,7 +13,7 @@ import re
 import numpy as np
 from rank_bm25 import BM25Okapi
 
-from src.rag import index, llm
+from src.rag import archetype, facts, index, llm
 from src.rag.corpus import nfc
 from src.rag.extract import glossary
 
@@ -21,6 +21,17 @@ from src.rag.extract import glossary
 # modeling.py, 01_eda.ipynb, スケジュール_r2.xlsx, T09 …). Chunks from a matching file are
 # strongly boosted — questions very often pin the exact document.
 _FILE_TOKEN = re.compile(r"[A-Za-z0-9_]+\.[A-Za-z0-9]+|[A-Za-z0-9_]{3,}")
+
+# Archetypes whose answers live in an extracted artifact (a highlighted cell / bold run /
+# Pivot condition / code parameter). A matching fact row is exactly the evidence they need,
+# so it gets the stronger lift; other archetypes get only a mild lift (a precise short fact
+# is still worth surfacing, but must not displace a genuinely better chunk). See SOT-2449.
+_FACT_FAVORING = frozenset({
+    "highlight_set", "enum_set", "document_extract", "fact_lookup", "pivot_condition",
+    "config_model_type", "config_hyperparam",
+})
+_FACT_BOOST_STRONG = 1.8
+_FACT_BOOST_MILD = 1.25
 
 
 class Retriever:
@@ -72,6 +83,17 @@ class Retriever:
                     rrf[i] *= 2.2                      # exact filename hit
                 elif any(t in rel for t in q_tokens if len(t) >= 4):
                     rrf[i] *= 1.3                      # path/identifier hit
+
+        # fact-row boost (SOT-2449): lift high-signal 1-fact-per-line rows so the exact
+        # highlighted cell / bold term / Pivot condition / code parameter isn't buried under
+        # long chunks. Additive — only affects fact rows already retrieved into the pool, and a
+        # structural no-op when fact indexing is disabled (no kind=="fact" rows exist).
+        if facts.enabled():
+            boost = _FACT_BOOST_STRONG if archetype.classify(question) in _FACT_FAVORING \
+                else _FACT_BOOST_MILD
+            for i in list(rrf):
+                if self.chunks[i].get("kind") == "fact":
+                    rrf[i] *= boost
 
         ranked = sorted(rrf, key=lambda i: -rrf[i])[:k]
         out = []

@@ -167,7 +167,11 @@ def _gather_images(question: str, evidence: list[dict], limit: int = 16) -> list
 def _format_evidence(evidence: list[dict], max_chars: int = 16000) -> str:
     out, total = [], 0
     for i, c in enumerate(evidence, 1):
-        block = f"--- 根拠{i} ---\n{c['text']}\n"
+        # Fact rows (SOT-2449) are deterministic extractions of a single high-signal artifact
+        # (a highlighted cell / bold term / Pivot condition / code parameter). Flag them so the
+        # reader weights them as directly-readable evidence rather than incidental chunk text.
+        tag = "【高信頼・抽出済fact】" if c.get("kind") == "fact" else ""
+        block = f"--- 根拠{i}{tag} ---\n{c['text']}\n"
         if total + len(block) > max_chars:
             break
         out.append(block)
