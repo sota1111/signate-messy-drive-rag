@@ -60,10 +60,13 @@ resource "google_storage_bucket_iam_member" "index_reader" {
 
 # ---------------- Cloud Run service ----------------
 resource "google_cloud_run_v2_service" "backend" {
-  project  = var.project_id
-  name     = var.backend_service
-  location = var.region
-  ingress  = "INGRESS_TRAFFIC_ALL"
+  project = var.project_id
+  name    = var.backend_service
+  # Ephemeral competition/demo project — allow `terraform destroy` to tear the
+  # service down without first flipping deletion_protection (matches toddler-private-rag).
+  deletion_protection = false
+  location            = var.region
+  ingress             = "INGRESS_TRAFFIC_ALL"
 
   template {
     service_account = google_service_account.runtime.email
@@ -76,6 +79,23 @@ resource "google_cloud_run_v2_service" "backend" {
       image = var.backend_image
       resources {
         limits = { cpu = "2", memory = "2Gi" }
+      }
+      # /health (backend/app/main.py) returns static ok and lazy-loads the index,
+      # so it is safe to poll during warm-up. Startup probe gates traffic until
+      # ready; liveness probe restarts a hung container.
+      startup_probe {
+        http_get { path = "/health" }
+        initial_delay_seconds = 0
+        timeout_seconds       = 5
+        period_seconds        = 10
+        failure_threshold     = 6
+      }
+      liveness_probe {
+        http_get { path = "/health" }
+        initial_delay_seconds = 10
+        timeout_seconds       = 5
+        period_seconds        = 30
+        failure_threshold     = 3
       }
       env {
         name  = "GCP_PROJECT_ID"
