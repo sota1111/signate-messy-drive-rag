@@ -29,6 +29,11 @@ FIELDS = ("date", "submission", "config", "commit", "local_score", "archetype_co
           "predicted", "ci_95", "prediction_basis", "real_public_score", "absolute_error",
           "notes")
 
+# Promotion-attribution ledger (SOT-2478): one append-only row per single diff, recording the
+# 関門2 汎化 (gate2 sealed) non-regression promotion判定 that adopted or rejected it. Kept SEPARATE
+# from the submission ledger above so calibration/fidelity (which read LEDGER_PATH) are untouched.
+PROMOTIONS_PATH = Path(settings.REPO_ROOT) / "scoring" / "promotions.jsonl"
+
 
 def load(path: Path = LEDGER_PATH) -> list[dict]:
     rows = []
@@ -100,6 +105,37 @@ def set_actual(submission: str, real_public_score: float, path: Path = LEDGER_PA
     raise KeyError(f"submission {submission!r} not found in {path}")
 
 
+def load_promotions(path: Path = PROMOTIONS_PATH) -> list[dict]:
+    """Load the promotion-attribution ledger (empty list when it does not exist yet)."""
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+    return rows
+
+
+def record_promotion(decision: dict, *, date: str, commit: str = "", notes: str = "",
+                     path: Path = PROMOTIONS_PATH) -> dict:
+    """Append (or upsert by ``diff``) one promotion-attribution row (SOT-2478).
+
+    ``decision`` is a ``scoring.selfimprove.PromotionDecision.to_dict()`` — it carries the single diff
+    label, the champion vs candidate 関門2 汎化 (gate2 sealed) scores and their delta, the gold match
+    rates (recorded for attribution only — never the promotion basis) and the ``promote`` verdict with
+    its reasons. One single diff → one row; re-recording the same ``diff`` upserts in place."""
+    row = {"date": date, "commit": commit, **decision, "notes": notes}
+    rows = load_promotions(path)
+    for i, existing in enumerate(rows):
+        if existing.get("diff") == row.get("diff"):
+            rows[i] = row
+            break
+    else:
+        rows.append(row)
+    _write(rows, path)
+    return row
+
+
 def _main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -118,11 +154,38 @@ def _main() -> int:
     act.add_argument("--submission", required=True)
     act.add_argument("--real", type=float, required=True)
 
+    pro = sub.add_parser("promote", help="関門2汎化非劣化ゲートで単一差分を判定し ledger に帰属記録 (SOT-2478)")
+    pro.add_argument("--diff", required=True, help="単一差分のラベル (帰属キー)")
+    pro.add_argument("--champion", type=Path, required=True, help="champion の gate2 JSON レポート")
+    pro.add_argument("--candidate", type=Path, required=True,
+                     help="champion+単一差分 (candidate) の gate2 JSON レポート")
+    pro.add_argument("--gold-champion", type=float, default=None,
+                     help="champion のゴールド一致率 (帰属記録用; 昇格根拠ではない)")
+    pro.add_argument("--gold-candidate", type=float, default=None,
+                     help="candidate のゴールド一致率 (帰属記録用; 昇格根拠ではない)")
+    pro.add_argument("--date", required=True)
+    pro.add_argument("--commit", default="")
+    pro.add_argument("--notes", default="")
+
     args = ap.parse_args()
     if args.cmd == "actual":
         row = set_actual(args.submission, args.real)
         print(json.dumps(row, ensure_ascii=False))
         return 0
+
+    if args.cmd == "promote":
+        from scoring import selfimprove
+        champion = json.loads(args.champion.read_text(encoding="utf-8"))
+        candidate = json.loads(args.candidate.read_text(encoding="utf-8"))
+        decision, row = selfimprove.promote_and_record(
+            args.diff, champion, candidate, date=args.date, commit=args.commit,
+            gold_champion=args.gold_champion, gold_candidate=args.gold_candidate, notes=args.notes)
+        print(json.dumps(row, ensure_ascii=False))
+        for r in decision.reasons:
+            print(f"  · {r}")
+        # Exit 0 when the diff is adopted, 3 when 却下 (mirrors scoring.overfit_check) so a pipeline
+        # can gate on it; either way the attribution row is written.
+        return 0 if decision.promote else 3
 
     from scoring import calibrate, predict
     ledger = calibrate.load_ledger()

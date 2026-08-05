@@ -24,6 +24,7 @@ import itertools
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from config import settings
@@ -298,6 +299,114 @@ def report(decided: dict[str, dict], dev_rows: list[dict], hold_rows: list[dict]
         print(f"proxy↔real Spearman KPI ({len(ledger)} submissions): {rho:+.4f}")
     except (FileNotFoundError, ValueError) as exc:
         print(f"proxy↔real Spearman KPI: unavailable ({exc})")
+
+
+# ============================ 昇格ゲート: 関門2汎化非劣化 (SOT-2478) ============================
+# 過適合の再発防止。改善は「関門2(汎化)を劣化させない」場合のみ採用する。判定は champion と
+# champion+単一差分(candidate)の 関門2汎化スコア = scoring.gate2 GateReport の **sealed**
+# (未知案件への転移) を直接比較し、**非劣化** (candidate >= champion) のときだけ promote する。
+# ゴールド一致率 (scoring.gold_offline.match_rate) は帰属記録として残すが、それ単独では絶対に
+# 昇格させない — 汎化が劣化していれば gold が上がっても却下する (#4/#5 過適合回帰の再発防止)。
+# 単一差分ごとに1行、判断を ledger (scoring.ledger.record_promotion) に帰属記録する。
+
+# The non-regression comparison uses this float tolerance so a byte-identical re-score (Δ≈0 with
+# rounding noise) still counts as 非劣化. A real drop below −eps is a regression → 却下.
+PROMOTION_EPS = 1e-9
+PROMOTION_BASIS = "gate2_generalization_non_regression"
+
+
+def gate2_generalization_score(report: dict | None) -> float | None:
+    """The 関門2 汎化スコア = the sealed (未知案件への転移) slice mean of a gate2 GateReport dict.
+
+    Returns None when the report lacks a usable sealed slice (``sealed.score`` is null / absent),
+    i.e. the generalization score is undefined and cannot ground a promotion decision."""
+    sealed = (report or {}).get("sealed") or {}
+    score = sealed.get("score")
+    return None if score is None else float(score)
+
+
+@dataclass
+class PromotionDecision:
+    """One single-diff promotion判定 keyed on 関門2 汎化 non-regression (SOT-2478).
+
+    ``promote`` is True ONLY when the candidate's 関門2 汎化 (sealed) score does not regress below
+    the champion's. Gold match rate (``gold_*``) is carried for attribution but is never the basis —
+    a gold improvement can never flip ``promote`` to True while 汎化 regressed."""
+
+    diff: str
+    promote: bool
+    basis: str
+    usable: bool
+    champion_gen: float | None
+    candidate_gen: float | None
+    gen_delta: float | None
+    champion_overall: float | None
+    candidate_overall: float | None
+    gold_champion: float | None
+    gold_candidate: float | None
+    gold_delta: float | None
+    reasons: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def decide_promotion(diff: str, champion: dict, candidate: dict, *,
+                     gold_champion: float | None = None, gold_candidate: float | None = None,
+                     eps: float = PROMOTION_EPS) -> PromotionDecision:
+    """Decide whether a single diff (``champion`` → ``candidate``) may be adopted.
+
+    ``champion`` / ``candidate`` are ``scoring.gate2.GateReport.to_dict()`` outputs. The gate is the
+    関門2 汎化 (sealed) score non-regression: promote iff ``candidate_gen >= champion_gen - eps`` AND
+    both reports expose a usable sealed slice. Gold match rates are recorded for attribution only and
+    NEVER promote on their own — if 汎化 regressed the diff is 却下 even when gold improved."""
+    champ_gen = gate2_generalization_score(champion)
+    cand_gen = gate2_generalization_score(candidate)
+    usable = bool(champion.get("usable")) and bool(candidate.get("usable")) \
+        and champ_gen is not None and cand_gen is not None
+    gen_delta = None if (champ_gen is None or cand_gen is None) else round(cand_gen - champ_gen, 6)
+    gold_delta = (None if gold_champion is None or gold_candidate is None
+                  else round(float(gold_candidate) - float(gold_champion), 6))
+
+    reasons: list[str] = []
+    if not usable:
+        promote = False
+        reasons.append("関門2の汎化スコアが未定義 (seen/sealed 両slice必須) — 昇格判定不可のため却下")
+    else:
+        promote = gen_delta >= -eps
+        if promote:
+            reasons.append(f"関門2汎化 非劣化 (Δ={gen_delta:+.4f} ≥ 0) — 採用")
+        else:
+            reasons.append(f"関門2汎化 劣化 (Δ={gen_delta:+.4f} < 0) — 却下")
+    # Gold is informational: make the "gold alone never promotes" rule explicit in the record.
+    if gold_delta is not None:
+        if not promote and gold_delta > 0:
+            reasons.append(f"ゴールド一致率は改善 (Δ={gold_delta:+.4f}) だが関門2汎化が非劣化でない → 昇格させない")
+        else:
+            reasons.append(f"ゴールド一致率 Δ={gold_delta:+.4f} (参考; 昇格根拠ではない)")
+
+    return PromotionDecision(
+        diff=diff, promote=promote, basis=PROMOTION_BASIS, usable=usable,
+        champion_gen=champ_gen, candidate_gen=cand_gen, gen_delta=gen_delta,
+        champion_overall=(champion or {}).get("overall_score"),
+        candidate_overall=(candidate or {}).get("overall_score"),
+        gold_champion=(None if gold_champion is None else round(float(gold_champion), 6)),
+        gold_candidate=(None if gold_candidate is None else round(float(gold_candidate), 6)),
+        gold_delta=gold_delta, reasons=reasons)
+
+
+def promote_and_record(diff: str, champion: dict, candidate: dict, *, date: str, commit: str = "",
+                       gold_champion: float | None = None, gold_candidate: float | None = None,
+                       notes: str = "", path: Path | None = None,
+                       eps: float = PROMOTION_EPS) -> tuple[PromotionDecision, dict]:
+    """Decide the single-diff promotion and append its attribution row to the promotion ledger."""
+    from scoring import ledger
+
+    decision = decide_promotion(diff, champion, candidate, gold_champion=gold_champion,
+                                gold_candidate=gold_candidate, eps=eps)
+    row = ledger.record_promotion(decision.to_dict(), date=date, commit=commit, notes=notes,
+                                  path=path or ledger.PROMOTIONS_PATH)
+    return decision, row
 
 
 def main() -> int:
