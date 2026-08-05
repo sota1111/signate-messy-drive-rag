@@ -118,10 +118,21 @@ def generate_holdout() -> list[QA]:
 def main(show: bool) -> None:
     holdout = generate_holdout()
     print(f"generated {len(holdout)} holdout Q/A (sealed={_company(SEALED_PROJECT_CODE)})")
+    # Adoption is decided on TWO axes now (SOT-2447): this sealed hold-out AND the real-style
+    # transcription bench (`scoring.realstyle`). The sealed hold-out alone let the #5 regression
+    # through; a change must clear both. See `scoring.overfit_check.assess_two_axis`.
+    from scoring import realstyle
+
+    rs = realstyle.build()
+    print(f"real-style bench (2nd adoption axis): {len(rs)} items → judged by "
+          f"`python -m scoring.overfit_check` (two-axis gate)")
     if show:
         for i, qa in enumerate(holdout):
             tag = "🔒" if qa.sealed else "  "
             print(f"{tag}[{i}] ({qa.skill}) {qa.question}\n      GT: {qa.answer}")
+        print("\n---- real-style transcription bench (test100-style, deterministic GT) ----")
+        for it in rs:
+            print(f"[{it.mode:9}] ({it.archetype}) {it.question}\n      GT: {it.truth}")
         return
 
     from src.rag import generate as gen

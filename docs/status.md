@@ -77,6 +77,27 @@ python -m scoring.selfimprove --self-test   # offline scorer/GT validation (no L
 python -m scoring.overfit_check          # block adoption if the last change overfit the dev slice
 ```
 
+## Two-axis adoption gate + real-style bench (SOT-2447)
+
+The sealed hold-out alone let **#5** through (dev 0.87 / hold-out 0.98 proxy but real −0.1333): it is
+scored with the same synthetic phrasings the RAG was tuned on, so a change can climb it while failing
+the real test100 wording. Adoption is now gated on **two independent generalization axes**:
+
+- **Real-style transcription bench** (`scoring.realstyle`, ≥50 deterministic-GT items) transcribes the
+  real test100 question STYLE onto known corpus facts, balanced to test100's answer-mode mixture
+  (計算/比較/抽出/参照) across the 8 core archetypes. No LLM/GCP and **no valid30 leakage** (valid30 is
+  the burnt-out dev set, isolated from the adoption decision).
+- **Two-axis gate** (`scoring.overfit_check.assess_two_axis`): a change is adopted only if BOTH the
+  sealed hold-out AND the real-style bench keep up with the dev gain; either axis regressing → BLOCK.
+  Back-tested: it flags both #4 (valid +0.5833 / real −0.10) and #5 as `ADOPTION_BLOCKED`, whereas the
+  single hold-out axis would have adopted #5. valid30/dev alone can never grant adoption.
+
+```bash
+python -m scoring.realstyle              # build the real-style bench → artifacts/realstyle_qa.jsonl
+python -m scoring.selfimprove --realstyle-preds <cached>   # record realstyle_mean (2nd axis)
+python -m scoring.overfit_check          # two-axis gate when realstyle_mean is present in history
+```
+
 ## Real-score calibration (SOT-2426)
 
 `scoring/ledger.jsonl` records every real submission's local proxy, committed-answer archetype mix,

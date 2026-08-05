@@ -28,7 +28,7 @@ from pathlib import Path
 
 from config import settings
 from scoring.calibrate import load_ledger, spearman
-from scoring import deterministic, dist_match, perturb, synth
+from scoring import deterministic, dist_match, perturb, realstyle, synth
 from src.rag.corpus import nfc
 
 TRUST_PATH = Path(settings.REPO_ROOT) / "config" / "archetype_trust.json"
@@ -62,9 +62,12 @@ def self_test() -> bool:
     """Offline sanity: every synthetic truth must score Perfect against itself, and the rubric
     rounding / abstention invariants must hold. Returns True on success (no LLM calls)."""
     items = synth.build()
+    # The real-style transcription bench (SOT-2447) is validated by the same self-scoring invariant:
+    # its deterministic GT must score Perfect against itself, or the second adoption axis is unsound.
+    rs_items = realstyle.build()
     ok = True
     bad: list[str] = []
-    for it in items:
+    for it in list(items) + list(rs_items):
         v = deterministic.score(it.truth, it.truth, it.kind)
         if v != "Perfect":
             ok = False
@@ -78,7 +81,7 @@ def self_test() -> bool:
         deterministic.score("A、B", "B、A", "set") == "Perfect",
         deterministic.score("cat", "dog", "string") == "Incorrect",
     ]
-    print(f"self-test: {len(items)} synthetic truths, "
+    print(f"self-test: {len(items)} synthetic + {len(rs_items)} real-style truths, "
           f"{'ALL Perfect' if ok else f'{len(bad)} FAILED'}")
     for b in bad[:10]:
         print("   MISMATCH", b)
@@ -224,15 +227,38 @@ def write_trust(trust: dict[str, dict], threshold: float, min_committed: int,
     TRUST_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def realstyle_score(preds: dict[str, dict]) -> float | None:
+    """Production-weighted mean of the real-style bench (SOT-2447) — the second adoption axis.
+
+    ``preds`` maps real-style item id → RAG result ({"answer": ...}); returns None when no real-style
+    predictions are supplied (the axis is simply absent from that run's history record)."""
+    if not preds:
+        return None
+    items = realstyle.build()
+    points = []
+    for it in items:
+        pred = (preds.get(it.id) or {}).get("answer", settings.ABSTAIN)
+        points.append(deterministic.POINTS[deterministic.score(str(pred), it.truth, it.kind)])
+    # Weight items to the real test100 answer-mode mixture (same production weighting as the sealed
+    # hold-out axis), so the bench score reflects 計算/比較/抽出/参照 as they appear in production.
+    test_questions = dist_match.load_questions(
+        Path(settings.REPO_ROOT) / "data/questions/questions_test.csv")
+    weights = dist_match.item_weights(items, dist_match.family_histogram(test_questions))
+    return round(dist_match.weighted_mean(points, weights), 4)
+
+
 def append_history(label: str, dev_rows: list[dict], hold_rows: list[dict],
-                   decided: dict[str, dict], when: str | None = None) -> dict:
+                   decided: dict[str, dict], when: str | None = None,
+                   realstyle_mean: float | None = None) -> dict:
     """Append this run's dev/hold-out means (overall + per archetype) to the history ledger, so
-    overfit_check can compare consecutive runs (valid gain vs hold-out gain)."""
+    overfit_check can compare consecutive runs. When a real-style bench score is provided it is
+    recorded as ``realstyle_mean`` — the second adoption axis (two-axis gate, SOT-2447)."""
     rec = {
         "recordedAt": when or _dt.datetime.now().isoformat(timespec="seconds"),
         "label": label,
         "dev_mean": round(_overall_mean(dev_rows), 4),
         "holdout_mean": round(_overall_mean(hold_rows), 4),
+        **({"realstyle_mean": realstyle_mean} if realstyle_mean is not None else {}),
         "archetypes": {
             a: {"dev_mean": (decided[a]["dev"] or {}).get("mean_score"),
                 "holdout_mean": (decided[a]["holdout"] or {}).get("mean_score")}
@@ -286,6 +312,9 @@ def main() -> int:
     ap.add_argument("--label", default="run", help="label recorded in the hold-out history ledger")
     ap.add_argument("--preds", type=Path, default=None,
                     help="score a cached RAG run (jsonl of {id, answer}) instead of calling the LLM")
+    ap.add_argument("--realstyle-preds", type=Path, default=None,
+                    help="score a cached real-style bench RAG run (jsonl of {id, answer}) → records "
+                         "the second adoption axis (realstyle_mean) for the two-axis gate")
     ap.add_argument("--test-questions", type=Path,
                     default=Path(settings.REPO_ROOT) / "data/questions/questions_test.csv")
     ap.add_argument("--perturb", action="store_true",
@@ -347,7 +376,20 @@ def main() -> int:
                            args.holdout_min_committed)
     write_trust(decided, args.threshold, args.min_committed, args.holdout_min_committed)
     report(decided, dev_rows, hold_rows)
-    rec = append_history(args.label, dev_rows, hold_rows, decided)
+
+    # Second adoption axis: score the real-style transcription bench when a cached run is supplied.
+    rs_mean = None
+    if args.realstyle_preds and args.realstyle_preds.exists():
+        rs_preds: dict[str, dict] = {}
+        with open(args.realstyle_preds, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    o = json.loads(line)
+                    rs_preds[o["id"]] = o
+        rs_mean = realstyle_score(rs_preds)
+        print(f"real-style bench (production-weighted): {rs_mean:+.4f}  (second adoption axis)")
+    rec = append_history(args.label, dev_rows, hold_rows, decided, realstyle_mean=rs_mean)
     print(f"appended hold-out history → {HISTORY_PATH} "
           f"(dev {rec['dev_mean']:+.4f} / hold-out {rec['holdout_mean']:+.4f})")
     scored = settings.ARTIFACTS_DIR / "synth_scored.csv"
