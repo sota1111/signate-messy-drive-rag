@@ -6,6 +6,9 @@
 # ---- Secrets / credentials ----
 .env
 .env.*
+# Runtime adaptation layer — caches self-discovered raw secrets (passwords / alias answers).
+corpus_profile.json
+**/corpus_profile.json
 !.env.example
 *-sa-key.json
 service-account*.json

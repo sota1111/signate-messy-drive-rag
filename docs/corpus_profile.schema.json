@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "corpus_profile.json",
+  "description": "Runtime adaptation layer: a cache of facts the tools self-discover about THIS messy drive at run time. Written under a gitignored artifacts dir and gitignored by name — it holds raw secrets (decrypted passwords / alias answers) and MUST NOT be committed. This schema is the secret-free contract; only a live run populates values. See src/rag/tools/profile.py.",
+  "type": "object",
+  "required": ["version"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "integer",
+      "description": "Schema version (currently 1)."
+    },
+    "passwords": {
+      "type": "object",
+      "description": "corpus-relative file path -> the password that decrypted it (self-discovered at run time; NEVER hard-coded in source).",
+      "additionalProperties": { "type": "string" }
+    },
+    "aliases": {
+      "type": "object",
+      "description": "canonical company name -> list of aliases/case-codes observed to refer to it.",
+      "additionalProperties": {
+        "type": "array",
+        "items": { "type": "string" }
+      }
+    },
+    "formats": {
+      "type": "object",
+      "description": "free-form key -> discovered format fact (e.g. real xlsx data-sheet name, resolved highlight colour).",
+      "additionalProperties": true
+    }
+  }
+}
