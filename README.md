@@ -226,10 +226,16 @@ python -m scoring.selfimprove                       # 実RAG→決定論採点�
 誤答/棄権リスト・コストを算出する回帰基準。照合は他の採点と同じ CRAG 判定（既定 codex）を使う:
 一致=`Perfect|Acceptable` / 棄権=ABSTAINセンチネル/空/`Missing` / 誤答=`Incorrect`。
 
+既定の答案経路は **investigator 単一パス**（SOT-2490: 調査AG＋自己確信ベース棄権、Vertex のみで
+Claude 非依存・低コスト）。異種検証／tie-break を含む重い合議（`resolve`）は削除せず **opt-in** として
+残してあり、高精度が必要な場面で `--gen resolve` を明示指定できる。
+
 ```bash
 # 既存の予測セットを採点（details.jsonl は cost/method も持つ。headerless csv も可）
 python -m scoring.gold_offline --answers artifacts/predictions_test.details.jsonl
-# 統合系を test100 に流してから採点
+# 既定(investigator 単一)を test100 に流してから採点
+python -m scoring.gold_offline --run --workers 8
+# opt-in の合議(investigator→異種検証→tie-break)で流す場合
 python -m scoring.gold_offline --run --gen resolve --workers 8
 # 「誤答を棄権へ落とす」挙動の確認: baseline→primary の Incorrect→Missing 変換を計測
 python -m scoring.gold_offline --answers <primary> --baseline-answers <baseline>

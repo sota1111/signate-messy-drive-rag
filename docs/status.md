@@ -117,6 +117,8 @@ latest ledger proxy as an explicit fallback; pass both options for an actual new
 
 - URL: `https://signate-messy-drive-rag-backend-4kvjtj6qvq-uc.a.run.app`
 - `GET /health` · `POST /ask {"question": "...", "hard": false}`
+- `/ask` 既定 = **investigator 単一パス**（SOT-2490: Vertex のみ・Claude 非依存）。重い合議(resolve)は
+  `{"mode": "resolve"}` もしくは env `ASK_RESOLVE=1` / `ASK_MODE=resolve` で **opt-in**。
 
 ## Commands
 
