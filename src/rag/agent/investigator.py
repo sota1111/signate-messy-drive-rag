@@ -71,8 +71,11 @@ SYSTEM_PROMPT = (
     "3. まず関連ファイルを探索し、必要なツールを反復呼び出しして値を確定する。ツールがエラー/空を返しても"
     "諦めず、原因(列名違い・ファイル違い・値表記違い)を切り分けて別のファイルや式で必ず再試行する。安易に"
     "棄権しない。\n"
-    "4. 数値計算(平均・合計・件数など)は必ず compute ツールで行う。列名や絞り込み値が不明なときは、まず"
-    "`df.columns.tolist()` や `df['列'].unique().tolist()` を compute で確認してから集計式を組む。\n"
+    "4. 数値計算(平均・合計・件数など)は必ず compute ツールで行う。train.xlsx/train.csv 等は案件ごとに"
+    "同名で複数存在するので、質問が指す案件名を compute の project 引数(会社名の一部)で渡してファイルを"
+    "特定する。曖昧エラーが返ったら、そのエラーが挙げる『存在プロジェクト』から該当案件を選んで project を"
+    "付けて再試行する(棄権しない)。列名や絞り込み値が不明なときは、まず `df.columns.tolist()` や"
+    "`df['列'].unique().tolist()` を compute で確認してから集計式を組む。\n"
     "5. 旧版(old版)と最新版の比較・変更点を問う質問は、grepで手作業比較せず version_diff ツールに質問文を"
     "そのまま渡す。決定論の構造diffが『変更前 → 変更後』を返すので、その value をそのまま回答にする。value が"
     "null のときのみ他手段(grep等)を検討する。\n"
@@ -307,9 +310,12 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
         ),
         AgentTool(
             "compute",
-            "csv/xlsxに対し単一のpandas式(dfを参照)を実行し、計算値と根拠(列・範囲)を返す。暗算の代替。",
-            _obj({"file": _STR, "expr": _STR, "sheet": _STR}, ["file", "expr"]),
-            lambda file, expr, sheet=None: compute_run(file, expr, sheet=sheet),
+            "csv/xlsxに対し単一のpandas式(dfを参照)を実行し、計算値と根拠(列・範囲)を返す。暗算の代替。"
+            "train.xlsx/train.csv等は案件ごとに同名で複数存在するため、案件名を project(会社名の一部)で"
+            "渡してファイルを特定する。曖昧エラー時は返された『存在プロジェクト』から project を選び再試行する。",
+            _obj({"file": _STR, "expr": _STR, "sheet": _STR, "project": _STR}, ["file", "expr"]),
+            lambda file, expr, sheet=None, project=None: compute_run(
+                file, expr, sheet=sheet, project=project),
         ),
         AgentTool(
             "read_chart_values",

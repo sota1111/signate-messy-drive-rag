@@ -56,11 +56,33 @@ def _ref_from_path(path: Path) -> FileRef:
                    ext=p.suffix.lower().lstrip("."))
 
 
-def _resolve(file: str | Path | FileRef) -> FileRef:
+def _project_matches(ref: FileRef, hint: str) -> bool:
+    """NFC substring match between a file's ``project`` and a caller-supplied project hint.
+
+    Match is symmetric so a partial company name resolves either way: the question typically names
+    the project loosely (e.g. ``青葉バイオメディカル機器``) while the corpus folder carries the full
+    legal name (``株式会社青葉バイオメディカル機器``), and vice-versa. Empty projects never match a
+    non-empty hint.
+    """
+    proj = nfc(ref.project or "")
+    if not proj:
+        return False
+    return hint in proj or proj in hint
+
+
+def _resolve(file: str | Path | FileRef, project: str | None = None) -> FileRef:
     """Resolve a file reference to an NFC-aware :class:`FileRef`.
 
     Accepts a :class:`FileRef`, an absolute/relative path, or a corpus-relative string matched
-    (NFC) against the walked corpus by exact rel, rel-suffix, or filename. Ambiguous matches raise.
+    (NFC) against the walked corpus by exact rel, rel-suffix, or filename.
+
+    ``project`` optionally scopes an otherwise-ambiguous bare filename to a single case folder
+    (source-location aid, SOT-2487): many projects each ship a ``train.xlsx`` / ``train.csv``, so
+    ``compute("train.xlsx")`` alone is ambiguous, but ``project="青葉バイオメディカル機器"`` narrows
+    it to that project's table. It only *narrows* candidates — it never widens or reorders them, so
+    an already-unambiguous reference resolves identically whether or not a project is given.
+    Ambiguous matches raise, and the error lists the candidate projects so the caller can retry with
+    a ``project`` filter.
     """
     if isinstance(file, FileRef):
         return file
@@ -76,6 +98,11 @@ def _resolve(file: str | Path | FileRef) -> FileRef:
 
     key = nfc(str(file))
     refs = walk()
+    hint = nfc(project) if project else None
+    if hint:
+        refs = [r for r in refs if _project_matches(r, hint)]
+        if not refs:
+            raise ComputeError(f"no corpus file matches {file!r} in project ~{project!r}")
     exact = [r for r in refs if nfc(r.rel) == key]
     if len(exact) == 1:
         return exact[0]
@@ -87,14 +114,21 @@ def _resolve(file: str | Path | FileRef) -> FileRef:
         return named[0]
     candidates = suffix or named or exact
     if not candidates:
-        # last resort: treat as a filesystem path
-        p = Path(file)
-        if p.exists():
-            return _ref_from_path(p)
-        raise ComputeError(f"no corpus file matches {file!r}")
+        # last resort: treat as a filesystem path (only when unscoped)
+        if hint is None:
+            p = Path(file)
+            if p.exists():
+                return _ref_from_path(p)
+        scope = f" in project ~{project!r}" if hint else ""
+        raise ComputeError(f"no corpus file matches {file!r}{scope}")
+    projects = sorted({r.project for r in candidates if r.project})
+    hint_msg = (
+        f"; disambiguate with project= (存在プロジェクト: {', '.join(projects[:8])})"
+        if projects and hint is None else ""
+    )
     raise ComputeError(
         f"ambiguous file reference {file!r} → {len(candidates)} matches: "
-        + ", ".join(sorted(r.rel for r in candidates)[:5])
+        + ", ".join(sorted(r.rel for r in candidates)[:5]) + hint_msg
     )
 
 
@@ -237,6 +271,7 @@ def run(
     expr: str,
     *,
     sheet: int | str | None = None,
+    project: str | None = None,
     intermediates: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run ``expr`` against ``file`` and return the ``{value, evidence, method}`` contract.
@@ -250,11 +285,15 @@ def run(
     sheet:
         Optional xlsx sheet selector (index or name). Ignored for CSV. When omitted the real
         data sheet is auto-detected (a ``train`` sheet, else the largest, never an empty chart).
+    project:
+        Optional project/case-folder hint (NFC substring) that scopes an otherwise-ambiguous bare
+        filename such as ``train.xlsx`` to a single project's table (source-location aid). Omit for
+        a fully-qualified ``rel`` / path — behaviour is then identical to before.
     intermediates:
         Optional ``name -> sub-expression`` map; each is evaluated in the same sandbox and its
         value recorded under ``method.intermediates`` so the working is traceable.
     """
-    ref = _resolve(file)
+    ref = _resolve(file, project)
     df, sheet_used = _read_frame(ref, sheet)
 
     tree = ast.parse(expr, mode="eval")  # (re-parsed inside _eval too; cheap and keeps _eval standalone)
