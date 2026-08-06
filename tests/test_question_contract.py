@@ -1,0 +1,178 @@
+"""SOT-2493 — offline tests for the question-contract classifier.
+
+Everything here runs network-free:
+
+* the deterministic layer classifies representative questions of all nine contracts;
+* the hybrid ``flash`` arbiter is exercised with an injected fake (and asserted NOT to be called on a
+  confident deterministic hit);
+* the production :func:`flash_classify` wrapper is driven with ``llm.generate`` monkeypatched;
+* the acceptance metric — agreement with the gold-100 ``archetype`` column — is measured deterministically
+  and asserted ``≥0.90`` (受け入れ条件①), with every mismatch surfaced for review.
+"""
+from __future__ import annotations
+
+import csv
+from pathlib import Path
+
+import pytest
+
+from config import settings
+from src.rag.agent import question_contract as qc
+from src.rag.agent.question_contract import (
+    CHART_READ,
+    CONTRACT_ARCHETYPES,
+    CONTRACT_COMPLETION,
+    CONTRACT_LABELS,
+    CONTRACT_ROUTE,
+    CONTRACTS,
+    CROSS_AGGREGATE,
+    FORMAT_CHECK,
+    FULL_ENUMERATION,
+    MULTI_HOP,
+    NUMERIC,
+    SIMPLE_LOOKUP,
+    SPATIAL,
+    VERSION_DIFF,
+    QuestionContract,
+    agreement_rate,
+    classify,
+    flash_classify,
+)
+
+GOLD_CSV = settings.ARTIFACTS_DIR / "gold_100_review.csv"
+
+
+# --------------------------------------------------------------------------- taxonomy invariants
+def test_every_contract_has_completion_route_and_archetypes() -> None:
+    """Each of the nine contracts declares a label, non-empty completion template, route, archetype set."""
+    assert len(CONTRACTS) == 9 and len(set(CONTRACTS)) == 9
+    for c in CONTRACTS:
+        assert CONTRACT_LABELS[c]
+        assert CONTRACT_COMPLETION[c] and all(isinstance(s, str) and s for s in CONTRACT_COMPLETION[c])
+        assert CONTRACT_ROUTE[c]
+        assert isinstance(CONTRACT_ARCHETYPES[c], frozenset) and CONTRACT_ARCHETYPES[c]
+
+
+# --------------------------------------------------------------------------- deterministic classification
+# One representative question per contract; each must be resolved deterministically (no flash).
+_REPRESENTATIVE: list[tuple[str, str]] = [
+    (VERSION_DIFF, "白峰信用リスク評価の提案書old版と最新版を比較して、変更点を挙げてください。"),
+    (FULL_ENUMERATION, "契約書に登場する担当者名をすべて挙げてください。"),
+    (CROSS_AGGREGATE, "全プロジェクトの契約総額を計算してください。"),
+    (CHART_READ, "基礎分析.docxのグラフ1で、x=3のときのyの値を答えてください。"),
+    (SPATIAL, "井上さんの向かいに座っている方のEXTを教えてください。"),
+    (FORMAT_CHECK, "契約書において、太字で記載されている箇所をすべて抽出してください。"),
+    (MULTI_HOP, "もっとも多くの案件にかかわっている人の内線番号を教えてください。"),
+    (NUMERIC, "着手金と検収金の差額はいくらですか。"),
+    (SIMPLE_LOOKUP, "この契約書における甲の正式名称は何ですか。"),
+]
+
+
+@pytest.mark.parametrize("expected,question", _REPRESENTATIVE)
+def test_representative_questions_classified_deterministically(expected: str, question: str) -> None:
+    res = classify(question)
+    assert res.contract == expected, f"{question!r} -> {res.contract} (want {expected})"
+    assert res.method == "deterministic"
+    assert res.completion_conditions == CONTRACT_COMPLETION[expected]
+    assert res.route == CONTRACT_ROUTE[expected]
+    assert 0.0 < res.confidence <= 1.0
+
+
+def test_result_is_immutable_and_serialisable() -> None:
+    res = classify("着手金と検収金の差額はいくらですか。")
+    with pytest.raises(Exception):
+        res.contract = "x"  # type: ignore[misc]  # frozen dataclass
+    d = res.to_dict()
+    assert d["contract"] == NUMERIC and d["label"] == CONTRACT_LABELS[NUMERIC]
+    assert d["completion_conditions"] == list(CONTRACT_COMPLETION[NUMERIC])
+
+
+def test_classification_is_deterministic() -> None:
+    q = "全プロジェクトの契約総額を計算してください。"
+    assert classify(q).contract == classify(q).contract == CROSS_AGGREGATE
+
+
+# --------------------------------------------------------------------------- hybrid flash arbitration
+def _ambiguous_question() -> str:
+    """A bare fact-lookup with no structural cue → the flash-arbitration path."""
+    res = classify("この契約書における甲の正式名称は何ですか。")
+    # glossary/formal cue makes the above concrete; find a truly bare one from gold instead.
+    rows = _load_gold()
+    for r in rows:
+        cand = classify(r["question"])
+        if cand.confidence == qc._CONF_WEAK and cand.method == "deterministic":
+            return r["question"]
+    pytest.skip("no ambiguous gold question found")
+
+
+def test_flash_consulted_only_when_ambiguous() -> None:
+    calls: list[str] = []
+
+    def arbiter(q: str) -> str:
+        calls.append(q)
+        return MULTI_HOP
+
+    # Confident deterministic hit → flash must NOT be called.
+    res = classify("全プロジェクトの契約総額を計算してください。", flash=arbiter)
+    assert res.method == "deterministic" and not calls
+
+    # Ambiguous question → flash IS called and its verdict is used.
+    res2 = classify(_ambiguous_question(), flash=arbiter)
+    assert calls, "flash arbiter was not consulted on an ambiguous question"
+    assert res2.method == "flash" and res2.contract == MULTI_HOP
+
+
+def test_ambiguous_without_flash_falls_back_to_simple_lookup() -> None:
+    res = classify(_ambiguous_question())  # no flash injected
+    assert res.contract == SIMPLE_LOOKUP and res.method == "deterministic"
+
+
+def test_flash_bad_verdict_ignored() -> None:
+    res = classify(_ambiguous_question(), flash=lambda q: "not_a_contract")
+    assert res.contract == SIMPLE_LOOKUP  # invalid code ignored → deterministic default
+
+
+# --------------------------------------------------------------------------- production flash wrapper
+def test_flash_classify_parses_and_validates() -> None:
+    # generate is injected so this never touches the live Gemini client / SDK.
+    assert flash_classify("q", generate=lambda *a, **k: '{"contract": "numeric"}') == NUMERIC
+    assert flash_classify("q", generate=lambda *a, **k: "version_diff") == VERSION_DIFF  # bare code
+    assert flash_classify("q", generate=lambda *a, **k: '{"contract": "bogus"}') is None  # OOV → None
+
+    def boom(*a, **k):
+        raise RuntimeError("network down")
+
+    assert flash_classify("q", generate=boom) is None  # unreachable model → None
+
+
+# --------------------------------------------------------------------------- acceptance metric
+def _load_gold() -> list[dict[str, str]]:
+    if not GOLD_CSV.exists():
+        pytest.skip(f"gold csv not present: {GOLD_CSV}")
+    with GOLD_CSV.open(encoding="utf-8-sig") as fh:
+        return list(csv.DictReader(fh))
+
+
+def test_agreement_with_gold_archetypes_meets_target() -> None:
+    """受け入れ条件①: 分類一致率 ≥90% against the gold-100 archetype column; mismatches are recorded."""
+    rows = _load_gold()
+    report = agreement_rate(rows)  # flash=None → fully deterministic, network-free
+    assert report.total >= 30, "expected a populated gold set"
+    assert report.rate >= 0.90, (
+        f"agreement {report.rate:.1%} < 90%; mismatches="
+        + "; ".join(f"{m['contract']}!={m['gold_archetype']} ({m['question'][:30]})"
+                    for m in report.mismatches)
+    )
+    # Every recorded mismatch must be a real (question, gold, contract) triple for human review.
+    for m in report.mismatches:
+        assert m["question"] and m["gold_archetype"] and m["contract"]
+
+
+def test_refinements_are_consistent_specialisations() -> None:
+    """The specificity gains (spatial/chart/format/multi_hop) must each be consistent with their gold archetype."""
+    rows = _load_gold()
+    report = agreement_rate(rows)
+    assert report.refinements, "expected at least one contract to refine a coarser archetype"
+    for r in report.refinements:
+        contract, gold = r["contract"], r["gold_archetype"]
+        assert gold in CONTRACT_ARCHETYPES[contract] or gold == "unknown"
