@@ -44,6 +44,7 @@ from src.rag.tools.extract_tools import (
     find_files,
 )
 from src.rag.tools.file_grep import file_grep
+from src.rag.tools.highlight_extract import highlight_extract
 from src.rag.tools.pdf_faux_italic import emphasized_words
 from src.rag.tools.profile import CorpusProfile
 
@@ -298,6 +299,14 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
             "pptxに埋め込まれたPivotTable(EMF)を復元し、表とハイライトされたセルを返す。",
             _obj({"file": _STR}, ["file"]),
             lambda file: extract_pptx_pivots(file),
+        ),
+        AgentTool(
+            "highlight_extract",
+            "xlsx/pptx/docx/pdfのハイライト・マーカー強調された語/セルを文書順で列挙する。"
+            "colorに色名(黄/オレンジ/赤/青など)を渡すとその色だけに絞れる。書式型(マーカー語抽出・"
+            "色付きセルの条件)の質問に使う。",
+            _obj({"file": _STR, "color": _STR}, ["file"]),
+            lambda file, color=None: highlight_extract(file, color=color, profile=profile),
         ),
     ]
 

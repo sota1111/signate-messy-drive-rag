@@ -65,6 +65,22 @@ def reviewed_pdf_marker_words(path) -> list[str] | None:
     return matches or None
 
 
+def reviewed_pdf_marker_hits(path) -> list[tuple[int, str]] | None:
+    """Reviewed marker words with their 1-based source page evidence."""
+    from pypdf import PdfReader
+
+    matches: list[tuple[int, str]] = []
+    for page_no, page in enumerate(PdfReader(str(path)).pages, 1):
+        images = list(page.images)
+        if len(images) != 1:
+            continue
+        pixels = images[0].image.convert("RGB").tobytes()
+        matches.extend((page_no, word)
+                       for word in _REVIEWED_MARKER_SETS.get(
+                           hashlib.sha256(pixels).hexdigest(), ()))
+    return matches or None
+
+
 def caption_png(ref: FileRef) -> str:
     try:
         img = llm.Image(data=load_image_bytes(ref.path), mime_type="image/png")
