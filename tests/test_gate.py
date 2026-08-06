@@ -199,6 +199,77 @@ def test_default_thresholds_are_precision_first():
     assert gate.GATE_TIEBREAK_CONFIDENCE >= gate.GATE_COMMIT_CONFIDENCE
 
 
+# --------------------------------------------------------------------------- SOT-2501 execution gate
+from src.rag.agent.exec_verifier import (  # noqa: E402
+    EXEC_CONFLICT,
+    EXEC_MATCH,
+    ExecVerdict,
+)
+
+
+def _exec_verdict(category, *, should_abstain, answer="0.61"):
+    return ExecVerdict(
+        question="Q?", category=category, match=(category == EXEC_MATCH),
+        should_abstain=should_abstain, reason=f"{category} reason",
+        committed_answer=answer, rederived_answer="0.12",
+        conflicts=(("対象列の相違",) if should_abstain else ()),
+    )
+
+
+def test_exec_gate_default_off_leaves_numeric_commit_untouched():
+    """既定OFF: a conflicting execution verdict does NOT change the committed answer (既存数値 MATCH 非劣化)."""
+    r = _resolution("0.61", "0.61", confidence=0.9)
+    conflict = _exec_verdict(EXEC_CONFLICT, should_abstain=True)
+    d = apply_gate(r, commit_confidence=0.7, exec_verdict=conflict)  # exec_verify defaults OFF
+    assert d.commit and d.answer == "0.61"
+    assert gate.GATE_EXEC_VERIFY is False
+
+
+def test_exec_gate_downgrades_conflicting_numeric_commit_when_enabled():
+    """idx4/28/10 相当: 独立再実行が不一致(EVIDENCE_CONFLICT)なら数値 commit を棄権へ倒す。"""
+    r = _resolution("0.61", "0.61", confidence=0.9)
+    conflict = _exec_verdict(EXEC_CONFLICT, should_abstain=True)
+    d = apply_gate(r, commit_confidence=0.7, exec_verdict=conflict, exec_verify=True)
+    assert not d.commit and d.answer == settings.ABSTAIN
+    assert "実行検証" in d.reason and EXEC_CONFLICT in d.reason
+
+
+def test_exec_gate_keeps_confirmed_numeric_commit():
+    r = _resolution("0.42", "0.42", confidence=0.9)
+    ok = _exec_verdict(EXEC_MATCH, should_abstain=False, answer="0.42")
+    d = apply_gate(r, commit_confidence=0.7, exec_verdict=ok, exec_verify=True)
+    assert d.commit and d.answer == "0.42"
+
+
+def test_exec_gate_leaves_non_numeric_commit_to_the_text_verifier():
+    """数値系のみ本検証器が主判定; 非数値(列名等)は heterogeneous verifier のまま = 実行検証は無視。"""
+    r = _resolution("bmi", "bmi", confidence=0.9)
+    conflict = _exec_verdict(EXEC_CONFLICT, should_abstain=True, answer="bmi")
+    d = apply_gate(r, commit_confidence=0.7, exec_verdict=conflict, exec_verify=True)
+    assert d.commit and d.answer == "bmi"
+
+
+def test_exec_gate_does_not_resurrect_an_abstention():
+    # a low-confidence agreement already abstains; a MATCH verdict must not turn it into a commit.
+    r = _resolution("0.42", "0.42", confidence=0.3)
+    ok = _exec_verdict(EXEC_MATCH, should_abstain=False, answer="0.42")
+    d = apply_gate(r, commit_confidence=0.7, exec_verdict=ok, exec_verify=True)
+    assert not d.commit and d.answer == settings.ABSTAIN
+
+
+def test_gate_question_runs_live_exec_verification(monkeypatch):
+    """``gate_question`` wires the committed numeric record through the execution verifier when enabled."""
+    r = _resolution("0.61", "0.61", confidence=0.9)
+    monkeypatch.setattr(gate, "resolve_question", lambda q, **kw: r)
+    from src.rag.agent import exec_verifier
+    monkeypatch.setattr(exec_verifier, "verify_question",
+                        lambda rec, **kw: _exec_verdict(EXEC_CONFLICT, should_abstain=True))
+    record = {"question": "Q?", "answer": "0.61", "typed_value": {},
+              "compute_steps": [{"columns_used": ["age", "loan_amnt"], "input_rows": 44}]}
+    d = gate.gate_question("Q?", commit_confidence=0.7, committed_calc_record=record, exec_verify=True)
+    assert not d.commit and d.answer == settings.ABSTAIN
+
+
 def test_run_gated_backend_routes_to_the_gate(monkeypatch):
     """``run.make_worker('gated')`` serves the gate decision through the run-log schema."""
     from src.rag import run
