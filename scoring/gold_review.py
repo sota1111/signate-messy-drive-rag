@@ -5,9 +5,11 @@
 
 * ``artifacts/gold_100_review.md`` / ``.csv`` — 1 問 1 行。列 =
   ``index, question, gold_v3, system_answer, status(MATCH/ABSTAIN/WRONG), archetype, difficulty,
-  reason, confidence``。**設問全文＋正答を含むため Private 限定**（公開禁止）。
+  state_code, unmet_obligation, reason, confidence``。``state_code`` / ``unmet_obligation`` は
+  SOT-2492 の棄権台帳から棄権行にのみ補完（SOT-2497）。**設問全文＋正答を含むため Private 限定**（公開禁止）。
 * ``docs/gold_offline_history.jsonl`` — per-run 1 行を追記（上書きしない）。**メトリクスのみ**
-  （設問・正答・システム解答を含めない）なので、公開しても安全な run 間比較用サマリ。
+  （設問・正答・システム解答を含めない）。原因別棄権集計 ``abstain_state_codes``（コード別カウント・
+  SOT-2497）を含むので、改善の効果を run 間でコード別に比較できる。
 
 ``reason`` / ``confidence`` は resolve/investigator が書き出す ``*.details.jsonl``
 （``status`` / ``reason`` / ``confidence`` 等）から index で補完する。details が無い項目は空欄。
@@ -40,10 +42,11 @@ _HARD_ARCHETYPES = {
     "contract_amount", "csv_column_mean", "csv_column_max", "pivot_condition",
 }
 
+# 状態コード列 (SOT-2497): 棄権行に SOT-2492 台帳の state_code と未充足義務の要約を表示。MATCH/WRONG は空欄。
 _MD_COLUMNS = ["#", "質問", "正答(v3 gold)", "現在の解答(system)", "status", "型", "難しさ",
-               "理由", "確信度"]
+               "状態コード", "未充足義務", "理由", "確信度"]
 _CSV_COLUMNS = ["index", "question", "gold_v3", "system_answer", "status", "archetype",
-                "difficulty", "reason", "confidence"]
+                "difficulty", "state_code", "unmet_obligation", "reason", "confidence"]
 
 DEFAULT_MD = settings.ARTIFACTS_DIR / "gold_100_review.md"
 DEFAULT_CSV = settings.ARTIFACTS_DIR / "gold_100_review.csv"
@@ -95,10 +98,13 @@ def build_rows(report: "Report", details: dict[int, dict] | None = None) -> list
     from scoring.gold_offline import _bucket  # 遅延 import（循環回避）
 
     details = details or {}
+    # SOT-2497: per-index abstain diagnosis ({state_code, obligation}) joined from the abstain ledger.
+    abstain_codes = getattr(report, "abstain_codes", None) or {}
     rows: list[dict] = []
     for it in sorted(report.items, key=lambda x: x.index):
         status = _STATUS_BY_BUCKET.get(_bucket(it.verdict), it.verdict)
         d = details.get(it.index, {})
+        code = abstain_codes.get(it.index, {})
         rows.append({
             "index": it.index,
             "question": it.question,
@@ -107,6 +113,8 @@ def build_rows(report: "Report", details: dict[int, dict] | None = None) -> list
             "status": status,
             "archetype": it.archetype,
             "difficulty": _difficulty(it.archetype, status),
+            "state_code": str(code.get("state_code", "") or ""),
+            "unmet_obligation": str(code.get("obligation", "") or ""),
             "reason": str(d.get("reason", "") or ""),
             "confidence": _confidence_str(d.get("confidence", "")),
         })
@@ -137,7 +145,8 @@ def render_md(rows: list[dict], report: "Report", gen: str | None = None) -> str
     ]
     for r in rows:
         cells = [r["index"], r["question"], r["gold_v3"], r["system_answer"], r["status"],
-                 r["archetype"], r["difficulty"], r["reason"], r["confidence"]]
+                 r["archetype"], r["difficulty"], r["state_code"], r["unmet_obligation"],
+                 r["reason"], r["confidence"]]
         header.append("| " + " | ".join(_md_cell(c) for c in cells) + " |")
     return "\n".join(header) + "\n"
 
@@ -171,6 +180,9 @@ def _history_entry(report: "Report", gen: str | None, out_md: Path, out_csv: Pat
         "cost_usd": d["cost_usd"],
         "baseline_meets": d["baseline"]["meets"],
         "by_type": by_type,
+        # SOT-2497: 原因別の棄権集計（メトリクスのみ・設問/正答/解答は非含有）。改善の効果を
+        # コード別（NOT_RETRIEVED/EVIDENCE_INCOMPLETE/BUDGET_EXHAUSTED …）の増減で run 間比較できる。
+        "abstain_state_codes": d.get("abstain_state_codes", {}),
         "out_md": str(out_md.relative_to(settings.REPO_ROOT))
         if out_md.is_absolute() and _under_repo(out_md) else str(out_md),
         "out_csv": str(out_csv.relative_to(settings.REPO_ROOT))

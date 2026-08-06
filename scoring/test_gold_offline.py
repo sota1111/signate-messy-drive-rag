@@ -186,3 +186,78 @@ def test_render_is_printable():
     rep = GO.evaluate(preds, gold, judge=_stub_judge({"a": "Perfect"}))
     text = rep.render()
     assert "match" in text and "by type" in text
+
+
+# --------------------------------------------------------------------------- SOT-2497: abstain codes
+
+def _ledger_line(question, state_code, kind, detail):
+    return json.dumps({
+        "recorded_at": "2026-08-06T00:00:00+00:00",
+        "question": question,
+        "state_code": state_code,
+        "evidence_obligation": f"{detail} 調査メモ: なし",
+        "missing": [{"kind": kind, "detail": detail, "signals": {}}],
+        "explored_paths": ["find_files"],
+        "stop_reason": "answered", "iterations": 1, "tool_calls": ["find_files"],
+        "model": "gemini-2.5-pro",
+    }, ensure_ascii=False)
+
+
+def test_abstain_state_codes_aggregate_by_code_and_archetype(tmp_path):
+    # Two abstains with ledger codes (one retrieval miss, one budget), one uncoded abstain (no ledger
+    # record), plus a match — the block must split棄権 by cause, metrics only.
+    gold = {0: "a", 1: "b", 2: "c", 3: "d"}
+    q0, q1, q2 = "用語集の略称は何ですか", "train_rows は何行ですか", "契約金額はいくらですか"
+    preds = _preds(
+        {"index": 0, "question": q0, "answer": settings.ABSTAIN},   # abstain, coded NOT_RETRIEVED
+        {"index": 1, "question": q1, "answer": settings.ABSTAIN},   # abstain, coded BUDGET_EXHAUSTED
+        {"index": 2, "question": q2, "answer": settings.ABSTAIN},   # abstain, NOT in ledger -> uncoded
+        {"index": 3, "question": "略称は？", "answer": "d"},        # match
+    )
+    rep = GO.evaluate(preds, gold, judge=_stub_judge({"d": "Perfect"}))
+
+    ledger = tmp_path / "abstain_ledger.jsonl"
+    ledger.write_text(
+        _ledger_line(q0, "NOT_RETRIEVED", "retrieval", "関連文書を検索で特定できなかった") + "\n"
+        + _ledger_line(q1, "BUDGET_EXHAUSTED", "budget", "反復上限で打ち切った") + "\n",
+        encoding="utf-8")
+    GO.attach_abstain_state_codes(rep, ledger)
+
+    block = rep.to_dict()["abstain_state_codes"]
+    assert block["n_abstain"] == 3
+    assert block["coded"] == 2 and block["uncoded"] == 1
+    assert block["by_code"]["NOT_RETRIEVED"] == 1
+    assert block["by_code"]["BUDGET_EXHAUSTED"] == 1
+    assert block["by_code"]["EVIDENCE_INCOMPLETE"] == 0  # all seven codes present, zeros included
+    # archetype split is nested under each code
+    assert block["by_code_archetype"]["NOT_RETRIEVED"] == {"glossary_abbrev": 1}
+    assert block["by_code_archetype"]["BUDGET_EXHAUSTED"] == {"data_shape": 1}
+    # metrics only — no question text leaks into the block
+    assert q0 not in json.dumps(block, ensure_ascii=False)
+
+
+def test_abstain_codes_latest_ledger_record_wins(tmp_path):
+    gold = {0: "a"}
+    q = "行数は？"
+    preds = _preds({"index": 0, "question": q, "answer": settings.ABSTAIN})
+    rep = GO.evaluate(preds, gold, judge=_stub_judge({}))
+    ledger = tmp_path / "l.jsonl"
+    ledger.write_text(
+        _ledger_line(q, "NOT_RETRIEVED", "retrieval", "old") + "\n"
+        + _ledger_line(q, "EVIDENCE_INCOMPLETE", "completeness", "根拠が部分的") + "\n",
+        encoding="utf-8")
+    GO.attach_abstain_state_codes(rep, ledger)
+    assert rep.abstain_codes[0]["state_code"] == "EVIDENCE_INCOMPLETE"  # last line wins
+    assert rep.abstain_codes[0]["obligation"] == "根拠が部分的"
+
+
+def test_abstain_codes_missing_ledger_is_all_uncoded(tmp_path):
+    gold = {0: "a"}
+    preds = _preds({"index": 0, "question": "q", "answer": settings.ABSTAIN})
+    rep = GO.evaluate(preds, gold, judge=_stub_judge({}))
+    GO.attach_abstain_state_codes(rep, tmp_path / "does_not_exist.jsonl")  # fail-open
+    block = rep.to_dict()["abstain_state_codes"]
+    assert block["n_abstain"] == 1 and block["coded"] == 0 and block["uncoded"] == 1
+    assert rep.abstain_codes == {}
+    # every state code is present as a zero so history diffs stay stable
+    assert set(block["by_code"].values()) == {0} and len(block["by_code"]) == 7

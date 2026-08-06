@@ -154,6 +154,10 @@ class Item:
 class Report:
     items: list[Item] = field(default_factory=list)
     baseline_conversion: dict | None = None
+    # SOT-2497: per-index abstain diagnosis joined from SOT-2492's abstain ledger by question text.
+    # ``{index: {"state_code", "kind", "obligation"}}`` for abstains found in the ledger; empty when
+    # no ledger exists (fail-open) or for abstains never routed through the investigator.
+    abstain_codes: dict[int, dict] = field(default_factory=dict)
 
     @property
     def n(self) -> int:
@@ -218,6 +222,9 @@ class Report:
                  "gold": it.gold}
                 for it in sorted(abstains, key=lambda x: x.index)
             ],
+            # SOT-2497: 原因別の棄権集計（メトリクスのみ・設問/正答を含まない）。改善Issueの効果を
+            # 「棄権総数」でなく NOT_RETRIEVED / EVIDENCE_INCOMPLETE / BUDGET_EXHAUSTED … の増減で測れる。
+            "abstain_state_codes": _abstain_state_block(self.items, self.abstain_codes),
         }
         if self.baseline_conversion is not None:
             out["conversion"] = self.baseline_conversion
@@ -243,6 +250,13 @@ class Report:
             lines.append(
                 f"    {arch:<18} n={b['n']:>2}  match={b['match']:>2} "
                 f"({b['match_rate']:.0%})  abstain={b['abstain']:>2}  wrong={b['wrong']:>2}")
+        asc = d["abstain_state_codes"]
+        lines.append(
+            f"  abstain by state-code: coded={asc['coded']}/{asc['n_abstain']} "
+            f"(uncoded={asc['uncoded']})")
+        for code, cnt in asc["by_code"].items():
+            if cnt:
+                lines.append(f"    {code:<20} {cnt:>3}")
         if "conversion" in d:
             c = d["conversion"]
             lines += [
@@ -265,6 +279,103 @@ def _bucket(verdict: str) -> str:
     if verdict == WRONG_VERDICT:
         return "wrong"
     return "error"
+
+
+# --------------------------------------------------------------------------- SOT-2497: abstain codes
+# Join SOT-2492's abstain ledger (``artifacts/abstain_ledger.jsonl`` — one coded record per abstain,
+# keyed by the question text) onto the gold-100 items so a run's 棄権 can be split by *cause*
+# (NOT_RETRIEVED / RETRIEVED_NOT_PARSED / … / BUDGET_EXHAUSTED) rather than collapsed into one number.
+# The ledger is append-only, so the LAST record for a question wins (most recent run). No ledger /
+# no record for a question → that abstain is "uncoded" (fail-open; never raises).
+
+def load_abstain_ledger(path: Path | None = None) -> dict[str, dict]:
+    """Load the abstain ledger into ``{question: latest_record}`` (last line for a question wins).
+
+    ``path`` defaults to :func:`src.rag.agent.abstain_ledger.default_path`
+    (``artifacts/abstain_ledger.jsonl``). A missing file returns ``{}``; malformed lines are skipped —
+    diagnostics must never break scoring."""
+    if path is None:
+        from src.rag.agent import abstain_ledger as _al
+        path = _al.default_path()
+    path = Path(path)
+    out: dict[str, dict] = {}
+    if not path.exists():
+        return out
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        q = str(rec.get("question", "") or "").strip()
+        if q:
+            out[q] = rec
+    return out
+
+
+def _obligation_summary(rec: dict) -> dict:
+    """Extract the concise ``{state_code, kind, obligation}`` from a ledger record.
+
+    ``obligation`` uses the structured ``missing[0].detail`` (the canonical per-code template — short,
+    no model free-text), not the verbose ``evidence_obligation``, so the review表 stays a summary."""
+    code = str(rec.get("state_code", "") or "")
+    missing = rec.get("missing") or []
+    kind = detail = ""
+    if isinstance(missing, (list, tuple)) and missing and isinstance(missing[0], dict):
+        kind = str(missing[0].get("kind", "") or "")
+        detail = str(missing[0].get("detail", "") or "")
+    if not detail:
+        detail = str(rec.get("evidence_obligation", "") or "")
+    return {"state_code": code, "kind": kind, "obligation": detail}
+
+
+def resolve_abstain_codes(report: "Report", ledger_by_q: dict[str, dict]) -> dict[int, dict]:
+    """Map each abstaining item's index to its ledger diagnosis (matched by question text)."""
+    out: dict[int, dict] = {}
+    for it in report.items:
+        if not it.is_abstain:
+            continue
+        rec = ledger_by_q.get((it.question or "").strip())
+        if rec is not None:
+            out[it.index] = _obligation_summary(rec)
+    return out
+
+
+def attach_abstain_state_codes(report: "Report", path: Path | None = None) -> "Report":
+    """Populate ``report.abstain_codes`` from the abstain ledger (best-effort; in place). Returns it."""
+    report.abstain_codes = resolve_abstain_codes(report, load_abstain_ledger(path))
+    return report
+
+
+def _abstain_state_block(items: list[Item], abstain_codes: dict[int, dict]) -> dict:
+    """Aggregate abstains by state code and by state-code × archetype — METRICS ONLY (no text).
+
+    ``by_code`` always lists all seven codes (zeros included) so history diffs are stable and an
+    improvement Issue can read a per-cause increase/decrease straight off the entry."""
+    from src.rag.agent.abstain_ledger import STATE_CODES
+
+    abstains = [it for it in items if it.is_abstain]
+    by_code = {c: 0 for c in STATE_CODES}
+    by_code_archetype: dict[str, dict[str, int]] = {}
+    coded = 0
+    for it in abstains:
+        info = abstain_codes.get(it.index)
+        code = info.get("state_code") if info else None
+        if code in by_code:
+            by_code[code] += 1
+            coded += 1
+            arch = by_code_archetype.setdefault(code, {})
+            arch[it.archetype] = arch.get(it.archetype, 0) + 1
+    return {
+        "n_abstain": len(abstains),
+        "coded": coded,
+        "uncoded": len(abstains) - coded,
+        "by_code": by_code,
+        "by_code_archetype": {c: dict(sorted(v.items()))
+                              for c, v in sorted(by_code_archetype.items())},
+    }
 
 
 def evaluate(predictions: dict[int, dict], gold: dict[int, str],
@@ -368,6 +479,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="also write the JSON report to this path")
     ap.add_argument("--no-review", action="store_true",
                     help="skip regenerating artifacts/gold_100_review.md/.csv + history (SOT-2491)")
+    ap.add_argument("--abstain-ledger", type=Path, default=None,
+                    help="abstain ledger to join for per-code棄権集計 (SOT-2497; default "
+                         "artifacts/abstain_ledger.jsonl)")
     args = ap.parse_args(argv)
 
     if args.run:
@@ -383,6 +497,10 @@ def main(argv: list[str] | None = None) -> int:
         base_report = evaluate(load_predictions(args.baseline_answers), gold, questions,
                                indices=indices)
         report.baseline_conversion = compare_conversion(base_report, report)
+
+    # SOT-2497: join SOT-2492's abstain ledger by question so the report/history/review carry
+    # per-cause棄権集計. Best-effort — a missing ledger just leaves every abstain uncoded.
+    attach_abstain_state_codes(report, args.abstain_ledger)
 
     payload = report.to_dict()
     if args.out:
