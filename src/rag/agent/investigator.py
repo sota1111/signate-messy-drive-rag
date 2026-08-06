@@ -466,7 +466,8 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 clock: Callable[[], float] = time.monotonic,
                 ledger: "str | object | bool | None" = None,
                 calc_ledger: "str | object | bool | None" = None,
-                research: "bool | Mapping[str, Any] | object | None" = None) -> Investigation:
+                research: "bool | Mapping[str, Any] | object | None" = None,
+                enumeration: "bool | Mapping[str, Any] | object | None" = None) -> Investigation:
     """Drive ``model`` through tool-calling until it submits a structured answer.
 
     The loop ends on the first of: the model calls ``submit_answer`` (→ ``answered``); ``max_turns`` is
@@ -500,6 +501,17 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     re-search either reaches a grounded answer or yields a *coded, history-bearing* abstain
     (:data:`~src.rag.agent.abstain_ledger.BUDGET_EXHAUSTED` / ``UNANSWERABLE``). Off by default so the
     answer path stays byte-identical.
+
+    ``enumeration`` (SOT-2500) enables the full-enumeration closure protocol: when it is not
+    ``None``/``False`` and the question is a ``full_enumeration`` contract, a deliberate abstain is
+    intercepted **once** and the :class:`~src.rag.agent.enumeration.EnumerationGate` feeds the closure
+    *procedure* back to the model (権威的母集団の特定 → 各候補の包含/除外理由 → 別経路で新規候補ゼロ →
+    列挙件数と集計件数の一致 → 列挙順序規則) so completeness is *proven* before the model may abstain again.
+    The procedure injects no corpus fact (no 略称/member list — only the source category to read), so the
+    no-fact-injection invariant holds. It only ever turns an enumeration abstain into either a
+    closure-proven answer or a still-coded abstain — the commit threshold is never touched. Off by default
+    so the answer path stays byte-identical; it composes with ``research`` (the enum procedure is tried
+    first, the generic re-search after).
     """
     record_enabled = ledger not in (None, False)
     if record_enabled:
@@ -523,6 +535,13 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
         director = _research_loop.ResearchDirector(question, budget=research)
     else:
         director = None
+
+    enumeration_enabled = enumeration not in (None, False)
+    if enumeration_enabled:
+        from src.rag.agent import enumeration as _enumeration
+        enum_gate = _enumeration.EnumerationGate(question)
+    else:
+        enum_gate = None
 
     by_name = {t.name: t for t in tools}
     usage = Usage()
@@ -562,6 +581,20 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
             tool_calls.append(call.name)
             if call.name == SUBMIT_ANSWER:
                 candidate = _answer_from_args(call.args)
+                # SOT-2500 — full-enumeration closure protocol: for a full_enumeration contract, a
+                # deliberate abstain is intercepted once and the closure *procedure* (権威的母集団の特定 →
+                # 閉包条件ゲート → 列挙順序) is fed back so completeness is proven before an abstain is
+                # accepted. Tried before the generic re-search; one-shot so it cannot loop.
+                if enum_gate is not None and is_abstain(candidate.answer):
+                    enum_directive = enum_gate.review()
+                    if enum_directive is not None:
+                        responses.append(ToolResponse(SUBMIT_ANSWER, {
+                            "abstain_rejected": True,
+                            "reason": "完全列挙の閉包が未確認です。棄権の前に権威的母集団の特定と閉包条件の確認を行ってください。",
+                            "directive": enum_directive,
+                        }))
+                        dispatched_tool = True  # count the guided round; send the procedure next turn
+                        break
                 # SOT-2502 — obligation-driven local re-search: a deliberate abstain is not accepted
                 # immediately. While budget remains and unmet obligations exist, feed a *targeted*
                 # re-search directive back so the model re-searches only the unmet obligation. The
@@ -736,7 +769,8 @@ def answer_question(question: str, *, model: str | None = None,
                     timeout_s: float = DEFAULT_TIMEOUT_S,
                     ledger: "str | object | bool | None" = True,
                     calc_ledger: "str | object | bool | None" = True,
-                    research: "bool | Mapping[str, Any] | object | None" = True) -> Investigation:
+                    research: "bool | Mapping[str, Any] | object | None" = True,
+                    enumeration: "bool | Mapping[str, Any] | object | None" = True) -> Investigation:
     """Convenience live entry point: investigate one ``question`` with a real Gemini conversation.
 
     The abstain ledger (SOT-2492) is **on by default** here so the production answer path records a
@@ -744,10 +778,13 @@ def answer_question(question: str, *, model: str | None = None,
     is likewise **on by default** so every committed numeric answer records its typed calculation証跡
     (``artifacts/calc_ledger.jsonl``). The obligation-driven local re-search loop (SOT-2502) is **on by
     default** so a deliberate abstain re-searches its unmet evidence obligations before it is accepted
-    (即棄権が構造上不可能). Pass ``ledger``/``calc_ledger``/``research`` ``=False``/``None`` to disable,
+    (即棄権が構造上不可能). The full-enumeration closure protocol (SOT-2500) is **on by default** so a
+    ``full_enumeration`` question proves its completeness (権威的母集団の特定 + 閉包条件) before it may
+    abstain. Pass ``ledger``/``calc_ledger``/``research``/``enumeration`` ``=False``/``None`` to disable,
     or a path (ledgers) / budget mapping (research) to configure.
     """
     tools = build_tools(profile or CorpusProfile())
     model_obj = gemini_model_factory(question, tools, model=model)
     return investigate(model_obj, question, tools, max_turns=max_turns, timeout_s=timeout_s,
-                       ledger=ledger, calc_ledger=calc_ledger, research=research)
+                       ledger=ledger, calc_ledger=calc_ledger, research=research,
+                       enumeration=enumeration)
