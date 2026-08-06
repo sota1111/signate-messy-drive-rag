@@ -65,6 +65,10 @@ def _bool_env(key: str, default: bool) -> bool:
 GATE_COMMIT_CONFIDENCE = _float_env("GATE_COMMIT_CONFIDENCE", 0.7)
 # Whether a tie-broken answer (一次意見が割れ、第3判定で決着) may commit at all. Default OFF: a disagreement
 # abstains regardless of confidence (precision-first). When ON it may commit only above the stricter bar.
+# SOT-2483 measured this knob on gold-100: committing the tie-break-adjudicated candidates scores
+# EV −10 (3 Perfect vs 13 Incorrect) and every recovery source that adds a match also adds an
+# Incorrect — so the abstain-leaning default is EV-correct. Keep OFF absent a real-LB / 関門2
+# confirmation (see scoring/abstain_breakdown.py, artifacts/gold_abstain_breakdown.md).
 GATE_COMMIT_ON_TIEBREAK = _bool_env("GATE_COMMIT_ON_TIEBREAK", False)
 GATE_TIEBREAK_CONFIDENCE = _float_env("GATE_TIEBREAK_CONFIDENCE", 0.85)
 
