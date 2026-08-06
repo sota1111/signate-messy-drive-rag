@@ -47,6 +47,7 @@ from src.rag.tools.file_grep import file_grep
 from src.rag.tools.highlight_extract import highlight_extract
 from src.rag.tools.pdf_faux_italic import emphasized_words
 from src.rag.tools.profile import CorpusProfile
+from src.rag.tools.seating_chart import seating_lookup
 
 # --------------------------------------------------------------------------- loop configuration
 DEFAULT_MAX_TURNS = 12            # hard cap on model turns per question (tool rounds + the final answer)
@@ -79,6 +80,9 @@ SYSTEM_PROMPT = (
     "5. 旧版(old版)と最新版の比較・変更点を問う質問は、grepで手作業比較せず version_diff ツールに質問文を"
     "そのまま渡す。決定論の構造diffが『変更前 → 変更後』を返すので、その value をそのまま回答にする。value が"
     "null のときのみ他手段(grep等)を検討する。\n"
+    "6a. 内線番号/EXT/座席/『向かい・隣・同じ列』を問う質問は seating_lookup ツールを使う(座席表は画像1枚で"
+    "grep/office抽出では読めない)。多段(案件→担当者→内線)では先に担当者の氏名を他ツールで特定し、その氏名を"
+    "seating_lookup(name=…)に渡す。『Aさんの向かいの人のEXT』は seating_lookup(name='A', relation='向かい')。\n"
     "6. 十分な根拠が得られたら、最終回答は必ず submit_answer ツールを1回だけ呼んで返す(通常のテキストでは"
     "答えない)。submit_answer には次を渡す: answer=回答本文(値/一覧のみ、列挙は「、」区切り、金額は原文表記)、"
     "confidence=0.0〜1.0の自己確信度、evidence=根拠(参照ファイル・値・ツール結果)、method=導出手順の要約。\n"
@@ -358,6 +362,19 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
             "value=null を返す(その場合は棄権のまま)。",
             _obj({"question": _STR}, ["question"]),
             lambda question: _version_diff(question),
+        ),
+        AgentTool(
+            "seating_lookup",
+            "座席表(フロアマップ)から 氏名⇄内線(EXT)⇄座席 を引く。内線/EXT/座席/『向かい・隣・同じ列』を"
+            "問う質問に使う(座席図は画像1枚で他ツールでは読めない)。name=氏名(『〜さん』可)を渡すとその人の"
+            "EXTを返す。relation に『向かい/隣/同じ列/同じ行』を渡すとその隣人のEXTを返す(例: 井上さんの"
+            "向かいの人のEXT)。ext=内線から人物を、role=役割(Exec/PM/DS/BA/DE/QA)+pod で EXT を引くこともできる。"
+            "多段質問(案件→担当者→内線)では、先に担当者の氏名を他ツールで特定し、その氏名を name で渡す。"
+            "該当なし/曖昧なときは value=null(棄権)を返す。",
+            _obj({"name": _STR, "ext": _STR, "role": _STR, "relation": _STR, "pod": _NUM}),
+            lambda name=None, ext=None, role=None, relation=None, pod=None: seating_lookup(
+                name=name, ext=ext, role=role, relation=relation,
+                pod=int(pod) if isinstance(pod, (int, float)) else None),
         ),
     ]
 

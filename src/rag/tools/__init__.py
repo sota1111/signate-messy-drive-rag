@@ -11,6 +11,7 @@
 * :mod:`~src.rag.tools.highlight_extract` — enumerate highlighted/marker words & cells (xlsx/pptx/docx/pdf).
 * :mod:`~src.rag.tools.emf_pivot` — reconstruct an embedded EMF PivotTable image (text + highlights).
 * :mod:`~src.rag.tools.chart_numcache` — read exact xlsx/pptx chart plot values from ``numCache``.
+* :mod:`~src.rag.tools.seating_chart` — 座席表画像 → 氏名⇄内線(EXT)⇄座席 directory + 空間ルックアップ.
 """
 from src.rag.tools.compute_sandbox import ComputeError
 from src.rag.tools.compute_sandbox import run as compute_run
@@ -40,6 +41,13 @@ from src.rag.tools.file_grep import FileGrepError, file_grep
 from src.rag.tools.pdf_faux_italic import detect_faux_italic, emphasized_words
 from src.rag.tools.highlight_extract import highlight_extract, highlight_words
 from src.rag.tools.profile import CorpusProfile
+from src.rag.tools.seating_chart import (
+    Directory,
+    Seat,
+    build_directory,
+    extract_seating_image,
+    seating_lookup,
+)
 
 # ``run`` kept as the compute_sandbox entry point for backward compatibility.
 run = compute_run
@@ -75,4 +83,9 @@ __all__ = [
     "chart_series",
     "chart_xml_members",
     "series_values",
+    "seating_lookup",
+    "build_directory",
+    "extract_seating_image",
+    "Seat",
+    "Directory",
 ]
