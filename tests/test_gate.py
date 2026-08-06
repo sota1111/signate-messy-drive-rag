@@ -280,3 +280,89 @@ def test_run_gated_backend_routes_to_the_gate(monkeypatch):
     assert res["answer"] == "1526" and res["commit"] is True
     assert res["used_images"] == 0  # agent backends get the uniform run-log key
     assert "gated" in run.GEN_CHOICES
+
+
+# --------------------------------------------------------------------------- SOT-2503 per-slice gate
+def _resolution_q(question, answer, *, confidence=0.9) -> Resolution:
+    """A 合議一致 :class:`Resolution` on ``answer`` for an explicit ``question`` (for contract routing)."""
+    return resolve_answer(
+        question, _investigation(answer, confidence=confidence),
+        verifier_model=_ScriptedModel(answer), max_turns=3,
+    )
+
+
+def test_slice_calibration_default_off_is_byte_identical():
+    """既定OFF: even with a relaxed slice threshold present, a mid-confidence agreement still abstains."""
+    r = _resolution("A", "A", confidence=0.6)
+    d = apply_gate(r, commit_confidence=0.7,
+                   slice_thresholds={"simple_lookup": 0.5}, contract="simple_lookup")
+    assert not d.commit and d.answer == settings.ABSTAIN  # slice_calibrate defaults to GATE_SLICE_CALIBRATE (OFF)
+    assert gate.GATE_SLICE_CALIBRATE is False
+
+
+def test_slice_calibration_relaxes_commit_for_adopted_slice():
+    """緩和スライスでは lower な閾値で commit される（グローバルでは棄権のはずの中確信一致）。"""
+    r = _resolution("A", "A", confidence=0.6)
+    d = apply_gate(r, commit_confidence=0.7, slice_calibrate=True,
+                   slice_thresholds={"simple_lookup": 0.5}, contract="simple_lookup")
+    assert d.commit and d.answer == "A"
+    assert "0.50" in d.reason  # committed against the relaxed slice bar
+
+
+def test_slice_calibration_leaves_unlisted_slice_at_global_bar():
+    """未採用スライスはグローバル閾値のまま（棄権）。"""
+    r = _resolution("A", "A", confidence=0.6)
+    d = apply_gate(r, commit_confidence=0.7, slice_calibrate=True,
+                   slice_thresholds={"chart_read": 0.5}, contract="simple_lookup")
+    assert not d.commit and d.answer == settings.ABSTAIN
+
+
+def test_slice_calibration_is_one_directional_never_tightens():
+    """スライス閾値がグローバルより高くても引き締めない（min で緩和方向のみ）。"""
+    r = _resolution("A", "A", confidence=0.75)
+    d = apply_gate(r, commit_confidence=0.7, slice_calibrate=True,
+                   slice_thresholds={"simple_lookup": 0.9}, contract="simple_lookup")
+    assert d.commit and d.answer == "A"  # 0.75 ≥ min(0.7, 0.9)=0.7 → still commits
+
+
+def test_slice_calibration_classifies_contract_from_question_when_unset():
+    """contract 未指定なら質問文から決定論分類（座席=spatial）してスライス閾値を引く。"""
+    r = _resolution_q("山田さんの隣に座っているのは誰ですか", "田中", confidence=0.6)
+    d = apply_gate(r, commit_confidence=0.7, slice_calibrate=True,
+                   slice_thresholds={"spatial": 0.5})  # contract=None → classified as spatial
+    assert d.commit and d.answer == "田中"
+
+
+def test_load_slice_thresholds_reads_full_model(tmp_path):
+    from scoring.slice_calibration import save_model
+    model = {"schema_version": 1, "adopted_thresholds": {"simple_lookup": 0.55, "numeric": 0.6}}
+    p = tmp_path / "slice.json"
+    save_model(model, p)
+    assert gate.load_slice_thresholds(p) == {"simple_lookup": 0.55, "numeric": 0.6}
+
+
+def test_load_slice_thresholds_accepts_bare_map_and_drops_out_of_range(tmp_path):
+    import json
+    p = tmp_path / "bare.json"
+    p.write_text(json.dumps({"spatial": 0.5, "numeric": 1.5, "chart_read": "x"}), encoding="utf-8")
+    assert gate.load_slice_thresholds(p) == {"spatial": 0.5}  # 1.5 out of range, "x" unparseable
+
+
+def test_load_slice_thresholds_missing_or_unset_is_empty(tmp_path):
+    assert gate.load_slice_thresholds("") == {}
+    assert gate.load_slice_thresholds(tmp_path / "nope.json") == {}
+
+
+def test_gate_question_loads_slice_file_when_enabled(monkeypatch, tmp_path):
+    """``gate_question`` reads GATE_SLICE_CALIBRATION_FILE and relaxes the adopted slice."""
+    import json
+    from src.rag.agent import question_contract as qc
+    question = "山田さんの隣に座っているのは誰ですか"     # deterministically classifies as spatial
+    contract = qc.classify(question).contract
+    p = tmp_path / "slice.json"
+    p.write_text(json.dumps({"adopted_thresholds": {contract: 0.5}}), encoding="utf-8")
+    monkeypatch.setattr(gate, "GATE_SLICE_CALIBRATION_FILE", str(p))
+    r = _resolution_q(question, "田中", confidence=0.6)
+    monkeypatch.setattr(gate, "resolve_question", lambda q, **kw: r)
+    d = gate.gate_question(question, commit_confidence=0.7, slice_calibrate=True)
+    assert d.commit and d.answer == "田中"

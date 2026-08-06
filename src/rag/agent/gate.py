@@ -28,8 +28,10 @@ path), fully overridable per run.
 """
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from config import settings
@@ -79,8 +81,82 @@ GATE_TIEBREAK_CONFIDENCE = _float_env("GATE_TIEBREAK_CONFIDENCE", 0.85)
 # GATE_COMMIT_ON_TIEBREAK precedent (SOT-2483). When ON, a numeric commit whose independent re-execution
 # conflicts / cannot be replayed / cannot be decided is downgraded to 棄権 (Incorrect=−1 回避).
 GATE_EXEC_VERIFY = _bool_env("GATE_EXEC_VERIFY", False)
+# SOT-2503 — whether the 合議一致 commit threshold is calibrated **per question-contract slice** rather
+# than by the single global GATE_COMMIT_CONFIDENCE. Default OFF: the whole slice-calibration path is
+# behavior-neutral (既定は現行同等・byte-identical) until 関門2 非劣化 / 実LB で緩和が確認できるまで — mirrors
+# the GATE_EXEC_VERIFY / GATE_COMMIT_ON_TIEBREAK precedent. When ON, a slice listed in the calibration
+# file (only EV>0 / WRONG-safe slices, scoring/slice_calibration.py) commits at its relaxed threshold;
+# every other slice keeps the global bar. The relaxation is **one-directional** — a slice threshold can
+# only *lower* the bar (commit more), never tighten it (see :func:`_slice_commit_confidence`).
+GATE_SLICE_CALIBRATE = _bool_env("GATE_SLICE_CALIBRATE", False)
+# Path to the per-slice calibration model (or a bare ``{contract: threshold}`` map). Unset/missing → no
+# per-slice relaxation, so the gate is byte-identical even if GATE_SLICE_CALIBRATE is toggled on.
+GATE_SLICE_CALIBRATION_FILE = os.getenv("GATE_SLICE_CALIBRATION_FILE", "")
 
 _TIEBREAK_STATUSES = (STATUS_TIEBREAK_INVESTIGATOR, STATUS_TIEBREAK_VERIFIER)
+
+
+def load_slice_thresholds(path: str | Path | None = None) -> dict[str, float]:
+    """Load the adopted per-contract relaxed commit thresholds (SOT-2503).
+
+    Accepts either a full :func:`scoring.slice_calibration.calibrate_slices` model (reads its
+    ``adopted_thresholds``) or a bare ``{contract: threshold}`` map. Returns ``{}`` when the path is
+    unset/missing/unreadable or the file is malformed — fail-open so a bad/absent calibration file can
+    never break the answer path, it only leaves the gate at its global default. Thresholds outside
+    ``[0, 1]`` are dropped."""
+    raw = GATE_SLICE_CALIBRATION_FILE if path is None else path
+    if not raw:
+        return {}
+    fp = Path(raw)
+    if not fp.exists():
+        return {}
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    thresholds = data.get("adopted_thresholds", data)
+    if not isinstance(thresholds, dict):
+        return {}
+    out: dict[str, float] = {}
+    for key, value in thresholds.items():
+        try:
+            fv = float(value)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 <= fv <= 1.0:
+            out[str(key)] = fv
+    return out
+
+
+def _classify_contract(question: str) -> str | None:
+    """Deterministic (network-free) question-contract label, or ``None`` on any failure."""
+    try:
+        from src.rag.agent import question_contract as qc
+
+        return qc.classify(question or "").contract
+    except Exception:  # noqa: BLE001 — slice routing is advisory; never break the gate
+        return None
+
+
+def _slice_commit_confidence(resolution: Resolution, commit_confidence: float,
+                             slice_thresholds: dict[str, float] | None,
+                             contract: str | None, slice_calibrate: bool) -> float:
+    """The effective 合議一致 commit threshold for this item after per-slice calibration (SOT-2503).
+
+    Returns the global ``commit_confidence`` unchanged unless slice calibration is enabled AND a relaxed
+    threshold exists for this question's contract. The relaxation is one-directional (``min``): a slice
+    entry can only *lower* the bar, so a stale/mis-signed config can never tighten the gate below what a
+    plain global run would commit."""
+    if not slice_calibrate or not slice_thresholds:
+        return commit_confidence
+    if contract is None:
+        contract = _classify_contract(resolution.question)
+    relaxed = slice_thresholds.get(contract) if contract is not None else None
+    if relaxed is None:
+        return commit_confidence
+    return min(commit_confidence, float(relaxed))
 
 
 # --------------------------------------------------------------------------- gate decision result
@@ -167,7 +243,10 @@ def apply_gate(resolution: Resolution, *,
                commit_on_tiebreak: bool | None = None,
                tiebreak_confidence: float | None = None,
                exec_verdict: ExecVerdict | None = None,
-               exec_verify: bool | None = None) -> GateDecision:
+               exec_verify: bool | None = None,
+               slice_thresholds: dict[str, float] | None = None,
+               contract: str | None = None,
+               slice_calibrate: bool | None = None) -> GateDecision:
     """Apply the precision-first confidence gate to an adjudicated :class:`Resolution`.
 
     Commit rules (EV最適, Incorrect=−1 / Missing=0):
@@ -177,6 +256,13 @@ def apply_gate(resolution: Resolution, *,
     * ``STATUS_AGREED`` だが confidence 不足 → 低確信につき棄権。
     * tie-break で決着(``STATUS_TIEBREAK_*``) → 既定は棄権。``commit_on_tiebreak`` 有効時のみ、より厳しい
       ``tiebreak_confidence`` を超えた場合に commit。
+
+    **Per-slice calibration (SOT-2503).** When ``slice_calibrate`` is enabled (defaults to
+    :data:`GATE_SLICE_CALIBRATE`, OFF) and ``slice_thresholds`` supplies a relaxed threshold for this
+    question's contract, the ``STATUS_AGREED`` commit bar is that slice's calibrated (lower) value
+    instead of the global ``commit_confidence`` — see :func:`_slice_commit_confidence`. The relaxation is
+    one-directional and applies only to slices proven EV>0 / WRONG-safe by
+    :mod:`scoring.slice_calibration`; default OFF ⇒ byte-identical to a plain global run.
 
     On top of the confidence decision, a committed **numeric** answer is additionally routed through
     :func:`apply_exec_gate` (SOT-2501): when ``exec_verify`` is enabled and an ``exec_verdict`` refutes the
@@ -188,9 +274,13 @@ def apply_gate(resolution: Resolution, *,
     commit_confidence = GATE_COMMIT_CONFIDENCE if commit_confidence is None else commit_confidence
     commit_on_tiebreak = GATE_COMMIT_ON_TIEBREAK if commit_on_tiebreak is None else commit_on_tiebreak
     tiebreak_confidence = GATE_TIEBREAK_CONFIDENCE if tiebreak_confidence is None else tiebreak_confidence
+    slice_calibrate = GATE_SLICE_CALIBRATE if slice_calibrate is None else slice_calibrate
+
+    effective_commit = _slice_commit_confidence(
+        resolution, commit_confidence, slice_thresholds, contract, slice_calibrate)
 
     decision = _apply_confidence_gate(
-        resolution, commit_confidence=commit_confidence,
+        resolution, commit_confidence=effective_commit,
         commit_on_tiebreak=commit_on_tiebreak, tiebreak_confidence=tiebreak_confidence)
     return apply_exec_gate(decision, exec_verdict, exec_verify=exec_verify)
 
@@ -247,6 +337,8 @@ def gate_question(question: str, *,
                   tiebreak_confidence: float | None = None,
                   committed_calc_record: dict[str, Any] | None = None,
                   exec_verify: bool | None = None,
+                  slice_thresholds: dict[str, float] | None = None,
+                  slice_calibrate: bool | None = None,
                   **resolve_kwargs: Any) -> GateDecision:
     """Convenience live entry point: run the full 合議 then apply the confidence + execution gates.
 
@@ -256,16 +348,23 @@ def gate_question(question: str, *,
     an independent re-execution (:mod:`~src.rag.agent.exec_verifier`) is run and its verdict routed through
     :func:`apply_exec_gate`. Fail-open: any error in the (best-effort, advisory) re-execution leaves the
     confidence decision untouched.
+
+    Per-slice calibration (SOT-2503) is loaded from :data:`GATE_SLICE_CALIBRATION_FILE` when
+    ``slice_thresholds`` is not supplied; with the default OFF toggle / no file this is an empty map and
+    the gate stays byte-identical.
     """
     resolution = resolve_question(
         question, investigator_model=investigator_model,
         verifier_model=verifier_model, judge_model=judge_model, **resolve_kwargs,
     )
     exec_verdict = _live_exec_verdict(committed_calc_record, exec_verify=exec_verify)
+    if slice_thresholds is None:
+        slice_thresholds = load_slice_thresholds()
     return apply_gate(
         resolution, commit_confidence=commit_confidence,
         commit_on_tiebreak=commit_on_tiebreak, tiebreak_confidence=tiebreak_confidence,
         exec_verdict=exec_verdict, exec_verify=exec_verify,
+        slice_thresholds=slice_thresholds, slice_calibrate=slice_calibrate,
     )
 
 
