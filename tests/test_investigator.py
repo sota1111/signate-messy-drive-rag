@@ -85,7 +85,7 @@ def test_is_abstain():
 def test_build_tools_exposes_generic_tools_plus_submit_answer():
     names = {t.name for t in build_tools(CorpusProfile())}
     assert names == {
-        "find_files", "file_grep", "read_office", "decrypt", "compute",
+        "find_files", "file_grep", "read_office", "decrypt", "compute", "canonical_route",
         "read_chart_values", "caption_image", "pdf_emphasis", "pptx_pivot",
         "highlight_extract", "version_diff", "seating_lookup", "corpus_aggregate",
         SUBMIT_ANSWER,
