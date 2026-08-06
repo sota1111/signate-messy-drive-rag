@@ -133,6 +133,9 @@ class AbstainSignals:
 
     stop_reason: str = "answered"
     evidence_text: str = ""            # model's own evidence/method/answer free text (keyword mining)
+    # SOT-2502 — obligation-driven re-search phase results (empty unless the research loop ran):
+    research_trace: tuple[dict[str, Any], ...] = ()  # ordered targeted re-search rounds
+    research_terminal: str = ""        # why re-search stopped: "budget" | "unanswerable" | "answered"
     retrieval_attempts: int = 0
     retrieval_ok: int = 0
     extraction_attempts: int = 0
@@ -186,7 +189,16 @@ def classify(signals: AbstainSignals) -> str:
     8. otherwise → :data:`UNANSWERABLE`.
 
     Never returns ``None`` — this is what makes a code-less abstain structurally impossible.
+
+    SOT-2502: when the obligation-driven re-search phase ran and finalized the abstain, its terminal
+    reason takes precedence — ``"budget"`` → :data:`BUDGET_EXHAUSTED` (反復/ツール上限で打ち切り),
+    ``"unanswerable"`` → :data:`UNANSWERABLE` (全戦術を尽くした不存在確認). An empty terminal (research
+    off, or the model committed) leaves the pre-existing signal-based precedence unchanged.
     """
+    if signals.research_terminal == "budget":
+        return BUDGET_EXHAUSTED
+    if signals.research_terminal == "unanswerable":
+        return UNANSWERABLE
     if signals.stop_reason in ("max_turns", "timeout"):
         return BUDGET_EXHAUSTED
     if signals.stop_reason == "model_error":
@@ -241,6 +253,9 @@ class AbstainRecord:
     confidence: float
     error: str | None
     recorded_at: str
+    # SOT-2502 — the local re-search rounds this abstain went through (empty when research was off).
+    research: tuple[dict[str, Any], ...] = ()
+    research_terminal: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -258,6 +273,8 @@ class AbstainRecord:
             "cost_usd": self.cost_usd,
             "confidence": self.confidence,
             "error": self.error,
+            "research": [dict(r) for r in self.research],
+            "research_terminal": self.research_terminal,
         }
 
 
@@ -313,6 +330,8 @@ def record_from_investigation(investigation: Any, signals: AbstainSignals, *,
         confidence=answer.confidence,
         error=investigation.error,
         recorded_at=(now or _utcnow)(),
+        research=tuple(signals.research_trace),
+        research_terminal=signals.research_terminal,
     )
 
 

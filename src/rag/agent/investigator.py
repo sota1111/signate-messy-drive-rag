@@ -465,7 +465,8 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 max_turns: int = DEFAULT_MAX_TURNS, timeout_s: float = DEFAULT_TIMEOUT_S,
                 clock: Callable[[], float] = time.monotonic,
                 ledger: "str | object | bool | None" = None,
-                calc_ledger: "str | object | bool | None" = None) -> Investigation:
+                calc_ledger: "str | object | bool | None" = None,
+                research: "bool | Mapping[str, Any] | object | None" = None) -> Investigation:
     """Drive ``model`` through tool-calling until it submits a structured answer.
 
     The loop ends on the first of: the model calls ``submit_answer`` (→ ``answered``); ``max_turns`` is
@@ -488,6 +489,17 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     a typed :class:`~src.rag.agent.calc_ledger.CalcRecord` (raw_text / parsed_value / unit / source_range
     / formula + per-compute証跡) is appended (``True`` → ``artifacts/calc_ledger.jsonl``; a ``str``/``Path``
     redirects it). Same observer-only invariant: the answer path is byte-identical with it on or off.
+
+    ``research`` (SOT-2502) enables the obligation-driven local re-search loop: when it is not
+    ``None``/``False``, a deliberate ``submit_answer`` abstain is not accepted immediately — the
+    :class:`~src.rag.agent.research_loop.ResearchDirector` discharges the question's evidence obligations
+    against what the tools actually found and, while budget remains, feeds a *targeted* re-search
+    directive (unmet obligation + per-kind tactics) back to the model so it re-searches only the unmet
+    obligation before it may abstain again. A ``Mapping`` supplies the budget (``max_rounds`` /
+    ``max_tool_calls``). The commit threshold/confidence are never touched (SOT-2483 の軸とは別物): a
+    re-search either reaches a grounded answer or yields a *coded, history-bearing* abstain
+    (:data:`~src.rag.agent.abstain_ledger.BUDGET_EXHAUSTED` / ``UNANSWERABLE``). Off by default so the
+    answer path stays byte-identical.
     """
     record_enabled = ledger not in (None, False)
     if record_enabled:
@@ -504,6 +516,13 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     else:
         _calc_ledger = None
         calc_signals = None
+
+    research_enabled = research not in (None, False)
+    if research_enabled:
+        from src.rag.agent import research_loop as _research_loop
+        director = _research_loop.ResearchDirector(question, budget=research)
+    else:
+        director = None
 
     by_name = {t.name: t for t in tools}
     usage = Usage()
@@ -542,7 +561,26 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
         for call in step.function_calls:
             tool_calls.append(call.name)
             if call.name == SUBMIT_ANSWER:
-                answer = _answer_from_args(call.args)
+                candidate = _answer_from_args(call.args)
+                # SOT-2502 — obligation-driven local re-search: a deliberate abstain is not accepted
+                # immediately. While budget remains and unmet obligations exist, feed a *targeted*
+                # re-search directive back so the model re-searches only the unmet obligation. The
+                # commit threshold is never touched — a committed (non-abstain) answer finalizes as-is.
+                if director is not None and is_abstain(candidate.answer):
+                    ev = " ".join(t for t in (candidate.evidence, candidate.method) if t).strip()
+                    non_submit = sum(1 for c in tool_calls if c != SUBMIT_ANSWER)
+                    directive = director.review(ev, non_submit)
+                    if directive is not None:
+                        responses.append(ToolResponse(SUBMIT_ANSWER, {
+                            "abstain_rejected": True,
+                            "reason": "未充足の証拠義務が残っています。棄権の前に局所再探索を実行してください。",
+                            "directive": directive,
+                        }))
+                        dispatched_tool = True  # count the re-search round; send the directive next turn
+                        break
+                answer = candidate
+                if director is not None and not is_abstain(answer.answer):
+                    director.note_answered()
                 stop_reason = "answered"
                 submitted = True
                 break
@@ -555,6 +593,9 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
             if calc_signals is not None:
                 # observe-only: capture derivation証跡 (compute/aggregate/chart) for the calc ledger
                 calc_signals.observe(call.name, out)
+            if director is not None:
+                # observe-only: collect successful tool evidence so unmet obligations reflect coverage
+                director.observe(call.name, out)
         if dispatched_tool:
             # count only genuine tool rounds; the terminal submit_answer turn is not a round
             iterations += 1
@@ -577,6 +618,11 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
         signals.stop_reason = stop_reason
         signals.evidence_text = " ".join(
             t for t in (answer.evidence, answer.method, answer.answer) if t).strip()
+        if director is not None:
+            # SOT-2502 — record the local re-search history + why it terminated (BUDGET/UNANSWERABLE)
+            # so 探索履歴 always remains on the abstain and 即棄権 leaves an auditable trail.
+            signals.research_trace = director.trace()
+            signals.research_terminal = director.terminal
         _abstain_ledger.record_abstain(
             investigation, signals, path=(None if ledger is True else ledger))
 
@@ -689,16 +735,19 @@ def answer_question(question: str, *, model: str | None = None,
                     max_turns: int = DEFAULT_MAX_TURNS,
                     timeout_s: float = DEFAULT_TIMEOUT_S,
                     ledger: "str | object | bool | None" = True,
-                    calc_ledger: "str | object | bool | None" = True) -> Investigation:
+                    calc_ledger: "str | object | bool | None" = True,
+                    research: "bool | Mapping[str, Any] | object | None" = True) -> Investigation:
     """Convenience live entry point: investigate one ``question`` with a real Gemini conversation.
 
     The abstain ledger (SOT-2492) is **on by default** here so the production answer path records a
     coded diagnosis for every abstain (``artifacts/abstain_ledger.jsonl``). The calc ledger (SOT-2495)
     is likewise **on by default** so every committed numeric answer records its typed calculation証跡
-    (``artifacts/calc_ledger.jsonl``). Pass ``ledger``/``calc_ledger`` ``=False``/``None`` to disable,
-    or a path to redirect either.
+    (``artifacts/calc_ledger.jsonl``). The obligation-driven local re-search loop (SOT-2502) is **on by
+    default** so a deliberate abstain re-searches its unmet evidence obligations before it is accepted
+    (即棄権が構造上不可能). Pass ``ledger``/``calc_ledger``/``research`` ``=False``/``None`` to disable,
+    or a path (ledgers) / budget mapping (research) to configure.
     """
     tools = build_tools(profile or CorpusProfile())
     model_obj = gemini_model_factory(question, tools, model=model)
     return investigate(model_obj, question, tools, max_turns=max_turns, timeout_s=timeout_s,
-                       ledger=ledger, calc_ledger=calc_ledger)
+                       ledger=ledger, calc_ledger=calc_ledger, research=research)
