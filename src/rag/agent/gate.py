@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from config import settings
+from src.rag.agent.calc_ledger import is_numeric_answer
+from src.rag.agent.exec_verifier import ExecVerdict
 from src.rag.agent.investigator import Answer
 from src.rag.agent.tiebreak import (
     STATUS_AGREED,
@@ -71,6 +73,12 @@ GATE_COMMIT_CONFIDENCE = _float_env("GATE_COMMIT_CONFIDENCE", 0.7)
 # confirmation (see scoring/abstain_breakdown.py, artifacts/gold_abstain_breakdown.md).
 GATE_COMMIT_ON_TIEBREAK = _bool_env("GATE_COMMIT_ON_TIEBREAK", False)
 GATE_TIEBREAK_CONFIDENCE = _float_env("GATE_TIEBREAK_CONFIDENCE", 0.85)
+# SOT-2501 — whether a committed *numeric* answer must additionally survive the execution verifier
+# (計算台帳の独立再実行照合). Default OFF: the whole numeric-verification path is behavior-neutral (既存数値
+# MATCH / 関門2 は byte-identical) until real-LB / 関門2 で非劣化が確認できるまで — mirrors the
+# GATE_COMMIT_ON_TIEBREAK precedent (SOT-2483). When ON, a numeric commit whose independent re-execution
+# conflicts / cannot be replayed / cannot be decided is downgraded to 棄権 (Incorrect=−1 回避).
+GATE_EXEC_VERIFY = _bool_env("GATE_EXEC_VERIFY", False)
 
 _TIEBREAK_STATUSES = (STATUS_TIEBREAK_INVESTIGATOR, STATUS_TIEBREAK_VERIFIER)
 
@@ -130,11 +138,36 @@ def _abstain(question: str, resolution: Resolution, reason: str) -> GateDecision
     )
 
 
+# --------------------------------------------------------------------------- execution gate (SOT-2501)
+def apply_exec_gate(decision: GateDecision, exec_verdict: ExecVerdict | None, *,
+                    exec_verify: bool | None = None) -> GateDecision:
+    """Downgrade a committed **numeric** answer to 棄権 when its independent re-execution does not confirm it.
+
+    Numeric answers are the execution verifier's domain; non-numeric commits are left to the heterogeneous
+    verifier (SOT-2470) and pass through unchanged. Applies only when ``exec_verify`` is enabled (defaults
+    to :data:`GATE_EXEC_VERIFY`, which is OFF), the ``decision`` currently commits, and an ``exec_verdict``
+    is present. A verdict whose ``should_abstain`` is True (EVIDENCE_CONFLICT / 暗算 / 決着不能) turns the
+    commit into a precision-first abstention; a confirming (EXEC_MATCH) verdict leaves the commit intact.
+    """
+    exec_verify = GATE_EXEC_VERIFY if exec_verify is None else exec_verify
+    if not (exec_verify and decision.commit and exec_verdict is not None):
+        return decision
+    if not is_numeric_answer(decision.answer):
+        return decision
+    if not exec_verdict.should_abstain:
+        return decision
+    return _abstain(
+        decision.question, decision.resolution,
+        f"数値回答の実行検証で棄権({exec_verdict.category}): {exec_verdict.reason}")
+
+
 # --------------------------------------------------------------------------- pure gate core
 def apply_gate(resolution: Resolution, *,
                commit_confidence: float | None = None,
                commit_on_tiebreak: bool | None = None,
-               tiebreak_confidence: float | None = None) -> GateDecision:
+               tiebreak_confidence: float | None = None,
+               exec_verdict: ExecVerdict | None = None,
+               exec_verify: bool | None = None) -> GateDecision:
     """Apply the precision-first confidence gate to an adjudicated :class:`Resolution`.
 
     Commit rules (EV最適, Incorrect=−1 / Missing=0):
@@ -145,12 +178,28 @@ def apply_gate(resolution: Resolution, *,
     * tie-break で決着(``STATUS_TIEBREAK_*``) → 既定は棄権。``commit_on_tiebreak`` 有効時のみ、より厳しい
       ``tiebreak_confidence`` を超えた場合に commit。
 
+    On top of the confidence decision, a committed **numeric** answer is additionally routed through
+    :func:`apply_exec_gate` (SOT-2501): when ``exec_verify`` is enabled and an ``exec_verdict`` refutes the
+    number (独立再実行の入力集合/計算の相違), the commit is downgraded to 棄権. Default OFF, so the answer path
+    is unchanged unless an execution verdict is supplied and verification is turned on.
+
     Thresholds default to the module-level env-configured values; pass explicit overrides for tests.
     """
     commit_confidence = GATE_COMMIT_CONFIDENCE if commit_confidence is None else commit_confidence
     commit_on_tiebreak = GATE_COMMIT_ON_TIEBREAK if commit_on_tiebreak is None else commit_on_tiebreak
     tiebreak_confidence = GATE_TIEBREAK_CONFIDENCE if tiebreak_confidence is None else tiebreak_confidence
 
+    decision = _apply_confidence_gate(
+        resolution, commit_confidence=commit_confidence,
+        commit_on_tiebreak=commit_on_tiebreak, tiebreak_confidence=tiebreak_confidence)
+    return apply_exec_gate(decision, exec_verdict, exec_verify=exec_verify)
+
+
+def _apply_confidence_gate(resolution: Resolution, *,
+                           commit_confidence: float,
+                           commit_on_tiebreak: bool,
+                           tiebreak_confidence: float) -> GateDecision:
+    """The precision-first confidence decision (pre-execution-gate). See :func:`apply_gate`."""
     q = resolution.question
     conf = resolution.confidence
 
@@ -196,17 +245,41 @@ def gate_question(question: str, *,
                   commit_confidence: float | None = None,
                   commit_on_tiebreak: bool | None = None,
                   tiebreak_confidence: float | None = None,
+                  committed_calc_record: dict[str, Any] | None = None,
+                  exec_verify: bool | None = None,
                   **resolve_kwargs: Any) -> GateDecision:
-    """Convenience live entry point: run the full 合議 then apply the confidence gate.
+    """Convenience live entry point: run the full 合議 then apply the confidence + execution gates.
 
     Wires :func:`~src.rag.agent.tiebreak.resolve_question` (investigator→verifier→tiebreak, all live
-    Gemini) and gates the resulting :class:`Resolution`.
+    Gemini) and gates the resulting :class:`Resolution`. When execution verification is enabled
+    (``exec_verify`` / :data:`GATE_EXEC_VERIFY`) and a committed **numeric** calc-ledger record is supplied,
+    an independent re-execution (:mod:`~src.rag.agent.exec_verifier`) is run and its verdict routed through
+    :func:`apply_exec_gate`. Fail-open: any error in the (best-effort, advisory) re-execution leaves the
+    confidence decision untouched.
     """
     resolution = resolve_question(
         question, investigator_model=investigator_model,
         verifier_model=verifier_model, judge_model=judge_model, **resolve_kwargs,
     )
+    exec_verdict = _live_exec_verdict(committed_calc_record, exec_verify=exec_verify)
     return apply_gate(
         resolution, commit_confidence=commit_confidence,
         commit_on_tiebreak=commit_on_tiebreak, tiebreak_confidence=tiebreak_confidence,
+        exec_verdict=exec_verdict, exec_verify=exec_verify,
     )
+
+
+def _live_exec_verdict(committed_calc_record: dict[str, Any] | None, *,
+                       exec_verify: bool | None) -> ExecVerdict | None:
+    """Best-effort live execution verdict for a committed numeric record (None when disabled/inapplicable)."""
+    enabled = GATE_EXEC_VERIFY if exec_verify is None else exec_verify
+    if not enabled or committed_calc_record is None:
+        return None
+    from src.rag.agent import exec_verifier
+
+    if not exec_verifier.is_numeric_record(committed_calc_record):
+        return None
+    try:
+        return exec_verifier.verify_question(committed_calc_record)
+    except Exception:  # noqa: BLE001 — advisory re-execution must never break the answer path
+        return None
