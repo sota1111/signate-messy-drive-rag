@@ -53,6 +53,7 @@ from src.rag.tools.file_grep import file_grep
 from src.rag.tools.chart_numcache import extract_chart_numcache
 from src.rag.tools.compute_sandbox import run as compute_run
 from src.rag.tools.emf_pivot import extract_pptx_pivots
+from src.rag.tools.highlight_extract import highlight_extract
 from src.rag.tools.pdf_faux_italic import emphasized_words
 from src.rag.tools.profile import CorpusProfile
 
@@ -148,8 +149,9 @@ SYSTEM_PROMPT = (
     "5. チャート/図の質問は、まず read_chart_values(Office埋め込みチャートの厳密値)を試し、PNG等で使えない"
     "場合のみ caption_image(vision)で読む。系列とカテゴリ(例: day 別)を対応付けて最小/最大の該当ラベルを"
     "特定する。\n"
-    "6. 書式(マーカー/強調/ハイライト)の質問は pdf_emphasis・pptx_pivot・read_office の書式情報や、対象語の"
-    "file_grep を組み合わせて該当語を特定する。\n"
+    "6. 書式(マーカー/強調/ハイライト)の質問は、まず highlight_extract(xlsx/pptx/docx/pdfのハイライト・"
+    "マーカー語/セルを文書順で列挙、colorで色指定可)を使う。補助として pdf_emphasis・pptx_pivot・"
+    "read_office の書式情報や対象語の file_grep も併用して該当語を特定する。\n"
     "7. 十分な根拠が得られたら、ツールを呼ばず最終回答テキストのみを簡潔に返す(余計な説明・前置きは不要、"
     "値/一覧のみ)。列挙は「、」区切り。金額は原文の表記(例: 3,850,000円)。\n"
     f"8. あらゆる手段を尽くしても根拠が得られない場合に限り「{ABSTAIN}」と答える。"
@@ -316,6 +318,14 @@ def build_tools(profile: CorpusProfile) -> list[AgentTool]:
             "pptxに埋め込まれたPivotTable(EMF)を復元し、表とハイライトされたセルを返す。",
             _obj({"file": _STR}, ["file"]),
             lambda file: extract_pptx_pivots(file),
+        ),
+        AgentTool(
+            "highlight_extract",
+            "xlsx/pptx/docx/pdfのハイライト・マーカー強調された語/セルを文書順で列挙する。"
+            "colorに色名(黄/オレンジ/赤/青など)を渡すとその色だけに絞れる。書式型(マーカー語抽出・"
+            "色付きセルの条件)の質問に使う。",
+            _obj({"file": _STR, "color": _STR}, ["file"]),
+            lambda file, color=None: highlight_extract(file, color=color, profile=profile),
         ),
     ]
 

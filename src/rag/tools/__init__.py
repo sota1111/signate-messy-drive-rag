@@ -8,6 +8,7 @@
   office/vision extraction.
 * :mod:`~src.rag.tools.file_grep` — NFC-aware cross-corpus full-text / cell grep (``file_grep``).
 * :mod:`~src.rag.tools.pdf_faux_italic` — detect faux-italic (matrix-shear) emphasis in a PDF.
+* :mod:`~src.rag.tools.highlight_extract` — enumerate highlighted/marker words & cells (xlsx/pptx/docx/pdf).
 * :mod:`~src.rag.tools.emf_pivot` — reconstruct an embedded EMF PivotTable image (text + highlights).
 * :mod:`~src.rag.tools.chart_numcache` — read exact xlsx/pptx chart plot values from ``numCache``.
 """
@@ -37,6 +38,7 @@ from src.rag.tools.chart_numcache import (
 )
 from src.rag.tools.file_grep import FileGrepError, file_grep
 from src.rag.tools.pdf_faux_italic import detect_faux_italic, emphasized_words
+from src.rag.tools.highlight_extract import highlight_extract, highlight_words
 from src.rag.tools.profile import CorpusProfile
 
 # ``run`` kept as the compute_sandbox entry point for backward compatibility.
@@ -63,6 +65,8 @@ __all__ = [
     "FileGrepError",
     "detect_faux_italic",
     "emphasized_words",
+    "highlight_extract",
+    "highlight_words",
     "extract_emf_pivot",
     "highlighted_cells",
     "emf_blobs_from_pptx",

@@ -93,6 +93,7 @@ def test_build_tools_exposes_expected_generic_tools():
     assert names == {
         "find_files", "file_grep", "read_office", "decrypt", "compute",
         "read_chart_values", "caption_image", "pdf_emphasis", "pptx_pivot",
+        "highlight_extract",
     }
 
 
