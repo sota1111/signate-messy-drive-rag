@@ -244,6 +244,17 @@ python -m scoring.gold_offline --answers <primary> --baseline-answers <baseline>
 一致率は手動実績（26/30ペース = 86.7%）を pass 閾値としてゲート表示（`baseline.meets`）。非一致のうち
 棄権に落ちた割合（`wrong_to_abstain.abstain_share`）で、誤答(−1)を棄権(0)へ落とす安全挙動を可視化する。
 
+**gold-100 レビュー表の自動生成（SOT-2491）**: `gold_offline` は `--run` / `--answers` 完了後、
+人間レビュー用の表 `artifacts/gold_100_review.md` / `.csv`（列: index, question, gold_v3,
+system_answer, status, archetype, difficulty, reason, confidence）を毎回再生成する（`--no-review`
+で抑止可）。`reason` / `confidence` は details.jsonl から補完。さらに `docs/gold_offline_history.jsonl`
+に per-run 要約（時刻・gen・n・一致/棄権/誤答・率・型別・`baseline.meets`）を**追記**し、run 間比較を残す。
+生成ロジックは `scoring/gold_review.py`（`scoring/test_gold_review.py` で回帰）。
+
+> ⚠️ **Private 厳守**: `gold_100_review.md` / `.csv` は**設問全文＋正答(v3) を含む**ため公開禁止。
+> 本 repo は Private のため `.gitignore` で明示的に追跡している（`/artifacts/*` + `!` negation）。
+> 一方 `gold_offline_history.jsonl` は**メトリクスのみ**（設問・正答・システム解答を含まない）で、比較用に安全。
+
 ## セットアップ
 
 ```bash

@@ -366,6 +366,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="print the full JSON report instead of the human summary")
     ap.add_argument("--out", type=Path, default=None,
                     help="also write the JSON report to this path")
+    ap.add_argument("--no-review", action="store_true",
+                    help="skip regenerating artifacts/gold_100_review.md/.csv + history (SOT-2491)")
     args = ap.parse_args(argv)
 
     if args.run:
@@ -386,6 +388,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # SOT-2491: 実行毎に gold-100 レビュー表 (md/csv) を再生成し、履歴 jsonl へ追記する。
+    # details.jsonl があれば reason/confidence を補完する。ベストエフォート（採点結果は既に確定）。
+    if not args.no_review:
+        try:
+            from scoring import gold_review
+            details = args.answers if args.answers.suffix.lower() == ".jsonl" else None
+            gen = args.gen if args.run else "answers"
+            entry = gold_review.generate(report, details=details, gen=gen)
+            print(f"[gold_review] wrote {gold_review.DEFAULT_MD} / {gold_review.DEFAULT_CSV}; "
+                  f"history += {entry['recordedAt']}")
+        except Exception as exc:  # pragma: no cover - レビュー生成失敗で採点を落とさない
+            print(f"[gold_review] skipped ({exc!r})")
+
     print(json.dumps(payload, ensure_ascii=False, indent=2) if args.as_json else report.render())
     return 0
 

@@ -15,7 +15,13 @@ service-account*.json
 application_default_credentials.json
 
 # ---- Build / run artifacts ----
-/artifacts/
+# Ignore artifacts/ contents by default, but keep the gold-100 review表 tracked (SOT-2491).
+# NOTE: using `/artifacts/*` (not `/artifacts/`) so specific files can be re-included below —
+# git cannot re-include a path whose parent directory itself is excluded.
+/artifacts/*
+# gold-100 レビュー表 — Private 限定（設問全文＋正答を含む。公開禁止）だが repo が Private なので追跡する。
+!/artifacts/gold_100_review.md
+!/artifacts/gold_100_review.csv
 /index_store/
 /.cache/
 *.log
