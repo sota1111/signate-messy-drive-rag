@@ -405,6 +405,18 @@ def resolve_pair(question: str) -> VersionPair | None:
     return None
 
 
+def _rendered_diff(pair: VersionPair) -> str | None:
+    """Render a resolved pair's substantive changes, or None to abstain (no / too-many changes)."""
+    changes = structural_diff(pair)
+    if not changes:
+        return None
+    modifies = [c for c in changes if c.kind == "modify"] or changes
+    # Too many changes ⇒ the versions realigned and the diff is not uniquely resolvable → abstain.
+    if len(modifies) > _MAX_CHANGES:
+        return None
+    return "、".join(c.render() for c in modifies)
+
+
 def answer_question(question: str) -> str | None:
     """Deterministic answer for a version-diff question, or None to let the caller abstain.
 
@@ -415,11 +427,47 @@ def answer_question(question: str) -> str | None:
     pair = resolve_pair(question)
     if pair is None:
         return None
-    changes = structural_diff(pair)
-    if not changes:
+    return _rendered_diff(pair)
+
+
+def _version_num(stem: str) -> int | None:
+    """The comparable numeric revision of a filename stem (提案書_v3 → 3), or None if unnumbered.
+
+    Only genuine ``rev/ver/v/r + N`` suffixes carry a number; token-only markers (final/old/新/確定)
+    return None because they are not on a single comparable numeric axis."""
+    pv = _parse_version(stem)
+    if pv is None:
         return None
-    modifies = [c for c in changes if c.kind == "modify"] or changes
-    # Too many changes ⇒ the versions realigned and the diff is not uniquely resolvable → abstain.
-    if len(modifies) > _MAX_CHANGES:
+    kind, num = pv[1]
+    return num if kind == 1 else None
+
+
+def _pair_is_adjacent(pair: VersionPair) -> bool:
+    """True iff the pair is a single reliable version step (safe to trust a lone diff row).
+
+    An ``old-folder`` pair (archived copy vs. the live sibling) is a single step. For numbered
+    revisions, endpoints more than one revision apart (e.g. v1→v3) skip intermediate states, so a
+    single surviving structural-diff row is not guaranteed to be the substantive edit between the
+    *named* endpoints — treat those as non-adjacent so the agent path abstains instead of guessing."""
+    if pair.basis == "old-folder":
+        return True
+    a, b = _version_num(pair.old.stem), _version_num(pair.new.stem)
+    if a is None or b is None:
+        return True
+    return abs(b - a) <= 1
+
+
+def answer_question_agent(question: str) -> str | None:
+    """Agent-path version-diff answer — like :func:`answer_question` but precision-first.
+
+    Wires the deterministic differ into the Gemini investigator tool loop (SOT-2485). Because a wrong
+    answer scores −1 vs. 0 for an abstention on this corpus, it additionally abstains when the resolved
+    pair spans more than one revision step (non-adjacent explicit endpoints), where the diff is not
+    reliably the minimal semantic edit. ``answer_question`` (the hold-out-validated generate path) is
+    left unchanged."""
+    if not is_diff_question(question):
         return None
-    return "、".join(c.render() for c in modifies)
+    pair = resolve_pair(question)
+    if pair is None or not _pair_is_adjacent(pair):
+        return None
+    return _rendered_diff(pair)

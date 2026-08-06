@@ -87,7 +87,7 @@ def test_build_tools_exposes_generic_tools_plus_submit_answer():
     assert names == {
         "find_files", "file_grep", "read_office", "decrypt", "compute",
         "read_chart_values", "caption_image", "pdf_emphasis", "pptx_pivot",
-        "highlight_extract",
+        "highlight_extract", "version_diff",
         SUBMIT_ANSWER,
     }
 
@@ -117,6 +117,76 @@ def test_dispatch_runs_real_compute_on_temp_csv(tmp_path: Path):
     out = dispatch(tools, "compute", {"file": str(csv), "expr": "df['b'].mean()"})
     assert out["value"] == 20
     assert out["method"]["engine"] == "pandas"
+
+
+def test_version_diff_tool_abstains_on_non_diff_question():
+    # a plain retrieval question is NOT a diff question → contract value None, applicable False,
+    # and the differ is never invoked (no guess).
+    tools = {t.name: t for t in build_tools(CorpusProfile())}
+    out = dispatch(tools, "version_diff", {"question": "契約金額はいくらですか。"})
+    assert out["value"] is None
+    assert out["method"]["engine"] == "diffpair"
+    assert out["evidence"]["applicable"] is False
+
+
+def test_version_diff_tool_wraps_solver_answer_in_contract(monkeypatch):
+    # a resolved diff question: the deterministic solver's rendered answer is surfaced verbatim as the
+    # contract value (the agent path must reproduce diffpair.answer_question, precision unchanged).
+    from src.rag import diffpair
+
+    monkeypatch.setattr(diffpair, "is_diff_question", lambda q: True)
+    monkeypatch.setattr(diffpair, "answer_question_agent", lambda q: "QAレビューア：池田 直哉 → 小林 直樹")
+    tools = {t.name: t for t in build_tools(CorpusProfile())}
+    out = dispatch(tools, "version_diff", {"question": "旧版と最新版を比較して変更点を教えて。"})
+    assert out["value"] == "QAレビューア：池田 直哉 → 小林 直樹"
+    assert out["evidence"] == {"applicable": True, "resolved": True}
+    assert out["method"]["engine"] == "diffpair"
+
+
+def test_version_diff_tool_returns_none_value_when_solver_abstains(monkeypatch):
+    # diff question but the solver can't resolve a unique pair → value None, resolved False (棄権のまま).
+    from src.rag import diffpair
+
+    monkeypatch.setattr(diffpair, "is_diff_question", lambda q: True)
+    monkeypatch.setattr(diffpair, "answer_question_agent", lambda q: None)
+    tools = {t.name: t for t in build_tools(CorpusProfile())}
+    out = dispatch(tools, "version_diff", {"question": "幻の資料の旧版と最新版を比較して変更点を。"})
+    assert out["value"] is None
+    assert out["evidence"] == {"applicable": True, "resolved": False}
+
+
+def test_version_diff_tool_reproduces_idx9_through_agent_path():
+    # end-to-end over the real corpus: the deterministic idx9 answer (青嶺 QAレビューア change) must be
+    # reachable through the agent tool-dispatch path, not only via diffpair directly.
+    from src.rag import corpus
+
+    if not corpus.walk():
+        pytest.skip("corpus not present")
+    tools = {t.name: t for t in build_tools(CorpusProfile())}
+    q = ("青嶺不動産アセットマネジメントの提案書について、oldフォルダ内の旧版と提案フォルダ直下の"
+         "最新版を比較し、変更された箇所を変更前と変更後で答えてください。")
+    out = dispatch(tools, "version_diff", {"question": q})
+    assert out["value"] and "池田 直哉" in out["value"] and "小林 直樹" in out["value"]
+    assert out["method"]["engine"] == "diffpair"
+
+
+def test_version_diff_tool_answers_adjacent_pair_but_abstains_on_gapped_pair():
+    # Precision-first: an adjacent step (提案書 v1→v2, clean personnel change) resolves; a non-adjacent
+    # explicit pair (v1→v3, skips v2) abstains rather than surface an unreliable single diff row (−1).
+    from src.rag import corpus
+
+    if not corpus.walk():
+        pytest.skip("corpus not present")
+    tools = {t.name: t for t in build_tools(CorpusProfile())}
+    q_v2 = ("青葉与信マネジメントの提案書_v1.pptxから提案書_v2.pptxに修正されたもののうち、"
+            "案件遂行に関連する変更を挙げてください。")
+    q_v3 = ("青葉与信マネジメントの提案書_v1.pptxから提案書_v3.pptxに修正されたもののうち、"
+            "案件遂行に関連する変更を挙げてください。")
+    out_v2 = dispatch(tools, "version_diff", {"question": q_v2})
+    out_v3 = dispatch(tools, "version_diff", {"question": q_v3})
+    assert out_v2["value"] and "藤田 彩" in out_v2["value"] and "井上 里奈" in out_v2["value"]
+    assert out_v3["value"] is None  # non-adjacent v1→v3 → abstain (precision 1.0 維持)
+    assert out_v3["evidence"] == {"applicable": True, "resolved": False}
 
 
 def test_dispatch_truncates_long_strings():

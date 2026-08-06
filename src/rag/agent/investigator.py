@@ -73,10 +73,13 @@ SYSTEM_PROMPT = (
     "棄権しない。\n"
     "4. 数値計算(平均・合計・件数など)は必ず compute ツールで行う。列名や絞り込み値が不明なときは、まず"
     "`df.columns.tolist()` や `df['列'].unique().tolist()` を compute で確認してから集計式を組む。\n"
-    "5. 十分な根拠が得られたら、最終回答は必ず submit_answer ツールを1回だけ呼んで返す(通常のテキストでは"
+    "5. 旧版(old版)と最新版の比較・変更点を問う質問は、grepで手作業比較せず version_diff ツールに質問文を"
+    "そのまま渡す。決定論の構造diffが『変更前 → 変更後』を返すので、その value をそのまま回答にする。value が"
+    "null のときのみ他手段(grep等)を検討する。\n"
+    "6. 十分な根拠が得られたら、最終回答は必ず submit_answer ツールを1回だけ呼んで返す(通常のテキストでは"
     "答えない)。submit_answer には次を渡す: answer=回答本文(値/一覧のみ、列挙は「、」区切り、金額は原文表記)、"
     "confidence=0.0〜1.0の自己確信度、evidence=根拠(参照ファイル・値・ツール結果)、method=導出手順の要約。\n"
-    f"6. あらゆる手段を尽くしても根拠が得られない場合に限り answer=「{ABSTAIN}」・confidence=0.0 で submit_answer"
+    f"7. あらゆる手段を尽くしても根拠が得られない場合に限り answer=「{ABSTAIN}」・confidence=0.0 で submit_answer"
     "する。"
 )
 
@@ -227,6 +230,38 @@ _BOOL = {"type": "boolean"}
 _NUM = {"type": "number"}
 
 
+def _version_diff(question: str) -> dict[str, Any]:
+    """Deterministic version-diff solver, wrapped in the {value, evidence, method} contract.
+
+    Wires the deterministic differ (:func:`src.rag.diffpair.answer_question_agent`, built on the
+    SOT-2408 hold-out-validated solver) into the agent's function-calling loop so a 版差分 question is
+    answered by an actual structural diff instead of the model guessing. Imported lazily so serve-time
+    import of this module stays lean.
+
+    ``value`` is the rendered "変更前 → 変更後" summary, or ``None`` when the differ abstains (not a
+    diff question / no unambiguous pair / non-adjacent versions / unreadable / too many realigned
+    changes). ``None`` is a
+    legitimate contract value meaning "resolved nothing" — the agent then abstains as before, never a
+    guess (precision 1.0 維持).
+    """
+    from src.rag import diffpair  # lazy: keeps serve-time import free of corpus/Office deps
+
+    if not diffpair.is_diff_question(question):
+        return _contract.make(
+            None, engine="diffpair", evidence={"applicable": False},
+            note="版差分質問ではない(旧版/old版/_r1_r2等の版参照+比較動詞が必要)")
+    # precision-first agent entry: abstains on non-adjacent / unreadable / ambiguous pairs so a
+    # wrong diff (−1) is never surfaced in place of an abstention (0).
+    answer = diffpair.answer_question_agent(question)
+    return _contract.make(
+        answer, engine="diffpair",
+        evidence={"applicable": True, "resolved": answer is not None},
+        scheme="structural-version-diff",
+        note=("隣接版(旧版→最新/vN→vN+1)の構造diff(セル/段落を整列し実質変更のみ)"
+              if answer is not None
+              else "版ペア不確定/非隣接/読取不能/大規模変更のため棄権(None)"))
+
+
 # The terminal tool: calling it ends the investigation with the structured answer schema. Its ``fn`` is
 # never dispatched (the loop intercepts the call), but a no-op keeps the tool uniform.
 SUBMIT_ANSWER_TOOL = AgentTool(
@@ -307,6 +342,16 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
             "色付きセルの条件)の質問に使う。",
             _obj({"file": _STR, "color": _STR}, ["file"]),
             lambda file, color=None: highlight_extract(file, color=color, profile=profile),
+        ),
+        AgentTool(
+            "version_diff",
+            "同一文書の旧版と最新版(または _r1/_r2・_v1/_v3 等の版)を構造diffし、変更点を"
+            "『(項目)：変更前 → 変更後』で決定論的に返す。旧版/old版/前の版と最新版の比較・変更箇所を"
+            "問う質問に使う。question に質問文をそのまま渡す(会社名・文書名・版指定を含めるほど特定精度が"
+            "上がる)。値は決定論・推測なし。版ペアが一意に定まらない/読取不能/変更が大規模すぎる場合は"
+            "value=null を返す(その場合は棄権のまま)。",
+            _obj({"question": _STR}, ["question"]),
+            lambda question: _version_diff(question),
         ),
     ]
 

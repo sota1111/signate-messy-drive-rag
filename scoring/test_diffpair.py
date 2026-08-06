@@ -110,6 +110,41 @@ def test_noisy_realigned_xlsx_diff_abstains():
     ) is None
 
 
+# ------------------------------- agent-path precision guard (SOT-2485) -------------------------
+def test_version_num_parses_numbered_revisions_only():
+    assert diffpair._version_num("提案書_v3") == 3
+    assert diffpair._version_num("スケジュール_r1") == 1
+    assert diffpair._version_num("提案書_final") is None   # token-only marker, not a numeric axis
+    assert diffpair._version_num("提案書") is None          # unversioned
+
+
+def test_pair_is_adjacent_by_revision_gap():
+    from pathlib import Path
+
+    from src.rag.corpus import FileRef
+
+    def ref(stem):
+        name = f"{stem}.pptx"
+        return FileRef(path=Path(f"d/{name}"), project="p", category="c",
+                       rel=f"d/{name}", name=name, ext="pptx")
+
+    old_folder = diffpair.VersionPair(ref("提案書"), ref("提案書"), "提案書", "old-folder")
+    v1_v2 = diffpair.VersionPair(ref("提案書_v1"), ref("提案書_v2"), "提案書", "explicit")
+    v1_v3 = diffpair.VersionPair(ref("提案書_v1"), ref("提案書_v3"), "提案書", "explicit")
+    assert diffpair._pair_is_adjacent(old_folder) is True   # archived copy vs live = single step
+    assert diffpair._pair_is_adjacent(v1_v2) is True
+    assert diffpair._pair_is_adjacent(v1_v3) is False        # skips v2 → not the minimal edit
+
+
+@_needs_corpus
+def test_answer_question_agent_abstains_on_gapped_pair_but_answer_question_does_not():
+    # answer_question (generate path) stays unchanged on v1→v3; the agent entry abstains for precision.
+    q_v3 = ("青葉与信マネジメントの提案書_v1.pptxから提案書_v3.pptxに修正されたもののうち、"
+            "案件遂行に関連する変更を挙げてください。")
+    assert diffpair.answer_question(q_v3) is not None        # legacy behavior preserved
+    assert diffpair.answer_question_agent(q_v3) is None      # precision-first abstain
+
+
 # ------------------------------- abstention on unresolvable ------------------------------------
 def test_unresolved_diff_question_returns_none():
     # a diff question naming no locatable company/document → no pair → None (caller abstains)
