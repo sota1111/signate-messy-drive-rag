@@ -36,6 +36,7 @@ from config import settings
 from src.rag.tools import contract as _contract
 from src.rag.tools.chart_numcache import extract_chart_numcache
 from src.rag.tools.compute_sandbox import run as compute_run
+from src.rag.tools.corpus_aggregate import corpus_aggregate
 from src.rag.tools.emf_pivot import extract_pptx_pivots
 from src.rag.tools.extract_tools import (
     caption_figure,
@@ -83,6 +84,14 @@ SYSTEM_PROMPT = (
     "6a. 内線番号/EXT/座席/『向かい・隣・同じ列』を問う質問は seating_lookup ツールを使う(座席表は画像1枚で"
     "grep/office抽出では読めない)。多段(案件→担当者→内線)では先に担当者の氏名を他ツールで特定し、その氏名を"
     "seating_lookup(name=…)に渡す。『Aさんの向かいの人のEXT』は seating_lookup(name='A', relation='向かい')。\n"
+    "6b. 『全体で/横断で/全案件で/最も〜な案件・人』のように複数案件をまたいで集計・比較する質問は"
+    "corpus_aggregate ツールを使う(単一案件の compute では同名ファイルが複数で解けない)。例: 『最も多く案件に"
+    "関わる人』=corpus_aggregate(metric='staff', op='count') の top、『着手金が最も高い案件』="
+    "corpus_aggregate(metric='deposit', op='max')、『固定金額契約で1行あたり契約金額が最も高い案件』="
+    "corpus_aggregate(metric='amount_per_row', op='max', fixed_only=true, round_up=true)、『契約期間が"
+    "2025-08-15〜09-07 に重なり40日超の案件を主略称で』=corpus_aggregate(metric='period_days', op='filter', "
+    "overlap_start='2025-08-15', overlap_end='2025-09-07', min_days=40)。案件特定後の多段(その案件の担当者→"
+    "内線 等)は返り値 staff(ES/PM…)の氏名を seating_lookup に渡して解決する。\n"
     "6. 十分な根拠が得られたら、最終回答は必ず submit_answer ツールを1回だけ呼んで返す(通常のテキストでは"
     "答えない)。submit_answer には次を渡す: answer=回答本文(値/一覧のみ、列挙は「、」区切り、金額は原文表記)、"
     "confidence=0.0〜1.0の自己確信度、evidence=根拠(参照ファイル・値・ツール結果)、method=導出手順の要約。\n"
@@ -235,6 +244,7 @@ def _obj(props: dict[str, dict[str, Any]], required: Sequence[str] = ()) -> dict
 _STR = {"type": "string"}
 _BOOL = {"type": "boolean"}
 _NUM = {"type": "number"}
+_INT = {"type": "integer"}
 
 
 def _version_diff(question: str) -> dict[str, Any]:
@@ -375,6 +385,27 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
             lambda name=None, ext=None, role=None, relation=None, pod=None: seating_lookup(
                 name=name, ext=ext, role=role, relation=relation,
                 pod=int(pod) if isinstance(pod, (int, float)) else None),
+        ),
+        AgentTool(
+            "corpus_aggregate",
+            "全プロジェクトを横断して契約情報を集約する決定論ツール。単一案件のcompute/read_officeでは"
+            "解けない『全体で/横断で/最も〜な案件・人』を扱う(train.xlsx/契約書は案件ごとに同名複数のため)。"
+            "metric: contract_amount(契約金額税込)/deposit(着手金税込)/train_rows(学習データ行数)/"
+            "amount_per_row(契約金額税込÷train行数)/period_days(契約期間日数)/staff(乙=データアステル担当者)。"
+            "op: max/min(数値metricの極値案件を主略称abbrev+valueで返す。staff情報も同梱するので『最大案件のES』は"
+            "その staff.ES を seating_lookup(name=…) に渡す)/count(staffの案件横断出現回数→最頻top=『最も多く"
+            "案件に関わる人』)/filter(契約期間フィルタ)/list。"
+            "固定金額契約に絞るときは fixed_only=true。円単位で切り上げるときは round_up=true。"
+            "契約期間フィルタは overlap_start/overlap_end(YYYY-MM-DD)で重なる案件、min_days でその日数超"
+            "(『40日を超える』→min_days=40)に絞り、主略称の配列を返す。値は決定論(推測なし)、"
+            "該当なしは value=null(棄権)。",
+            _obj({"metric": _STR, "op": _STR, "fixed_only": _BOOL, "round_up": _BOOL,
+                  "overlap_start": _STR, "overlap_end": _STR, "min_days": _INT}, ["metric"]),
+            lambda metric, op="max", fixed_only=False, round_up=False,
+            overlap_start=None, overlap_end=None, min_days=None: corpus_aggregate(
+                metric, op=op, fixed_only=bool(fixed_only), round_up=bool(round_up),
+                overlap_start=overlap_start, overlap_end=overlap_end,
+                min_days=int(min_days) if isinstance(min_days, (int, float)) else None),
         ),
     ]
 
