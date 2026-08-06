@@ -1,8 +1,9 @@
 """Gold-100 offline runner + match-rate report (SOT-2472).
 
-Establishes the offline regression baseline for the integrated Gemini answer chain
-(investigator → heterogeneous verifier → third-judge tie-break; ``src.rag.run`` with
-``gen='resolve'``). It runs — or reads — the 100 test answers, matches them against the gold
+Establishes the offline regression baseline for the Gemini answer path. ``--gen`` defaults to the
+production **investigator** single pass (SOT-2490); the heavier 合議 chain (investigator →
+heterogeneous verifier → third-judge tie-break; ``src.rag.run`` with ``gen='resolve'``) stays
+available as an opt-in. It runs — or reads — the 100 test answers, matches them against the gold
 answers (``artifacts/predictions_test_v3_final.csv``) with the SAME local CRAG judge the rest of
 the scoring stack uses, and reports the match rate, abstain rate, per-archetype breakdown,
 wrong / abstain lists and cost.
@@ -10,8 +11,11 @@ wrong / abstain lists and cost.
     # score an already-produced prediction set (a details.jsonl carries cost/method; a csv works too):
     python -m scoring.gold_offline --answers artifacts/predictions_test.details.jsonl
 
-    # run the integrated chain over the 100 test questions first, then score it:
-    python -m scoring.gold_offline --run --gen resolve --workers 8
+    # run the answer path over the 100 test questions first, then score it. ``--gen`` defaults to
+    # ``investigator`` (SOT-2490: the production single pass); pass ``--gen resolve`` for the heavier
+    # 合議 chain (investigator → verifier → tie-break) when higher precision is worth the cost:
+    python -m scoring.gold_offline --run --workers 8               # investigator (default)
+    python -m scoring.gold_offline --run --gen resolve --workers 8 # opt-in 合議
 
     # confirm the "wrong → abstain" behaviour by diffing a baseline set against the primary set:
     python -m scoring.gold_offline --answers artifacts/predictions_test.details.jsonl \
@@ -351,9 +355,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--baseline-answers", type=Path, default=None,
                     help="optional baseline set to diff against --answers (wrong->abstain check)")
     ap.add_argument("--run", action="store_true",
-                    help="run the integrated chain over test first, then score its output")
-    ap.add_argument("--gen", default="resolve",
-                    help="answer backend when --run (default: resolve = full agent chain)")
+                    help="run the answer path over test first, then score its output")
+    ap.add_argument("--gen", default="investigator",
+                    help="answer backend when --run (default: investigator = production single "
+                         "pass; use 'resolve' for the opt-in 合議 investigator→verifier→tie-break chain)")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--limit", type=int, default=None,
                     help="score only the first N gold indices (smoke)")
