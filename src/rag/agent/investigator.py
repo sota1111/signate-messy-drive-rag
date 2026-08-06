@@ -464,7 +464,8 @@ class Model(Protocol):
 def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 max_turns: int = DEFAULT_MAX_TURNS, timeout_s: float = DEFAULT_TIMEOUT_S,
                 clock: Callable[[], float] = time.monotonic,
-                ledger: "str | object | bool | None" = None) -> Investigation:
+                ledger: "str | object | bool | None" = None,
+                calc_ledger: "str | object | bool | None" = None) -> Investigation:
     """Drive ``model`` through tool-calling until it submits a structured answer.
 
     The loop ends on the first of: the model calls ``submit_answer`` (→ ``answered``); ``max_turns`` is
@@ -481,6 +482,12 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     the default path (``artifacts/abstain_ledger.jsonl``); a ``str``/``Path`` writes there instead. The
     default ``None`` is a pure no-op so the commit-vs-abstain decision and every existing caller are
     unchanged (受け入れ条件②).
+
+    ``calc_ledger`` (SOT-2495) is the commit-side twin: when enabled, derivation-tool contracts are
+    *observed* (never altered) during the loop, and if the final answer is a committed **numeric** answer
+    a typed :class:`~src.rag.agent.calc_ledger.CalcRecord` (raw_text / parsed_value / unit / source_range
+    / formula + per-compute証跡) is appended (``True`` → ``artifacts/calc_ledger.jsonl``; a ``str``/``Path``
+    redirects it). Same observer-only invariant: the answer path is byte-identical with it on or off.
     """
     record_enabled = ledger not in (None, False)
     if record_enabled:
@@ -489,6 +496,14 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     else:
         _abstain_ledger = None
         signals = None
+
+    calc_enabled = calc_ledger not in (None, False)
+    if calc_enabled:
+        from src.rag.agent import calc_ledger as _calc_ledger
+        calc_signals = _calc_ledger.CalcSignals(question=question)
+    else:
+        _calc_ledger = None
+        calc_signals = None
 
     by_name = {t.name: t for t in tools}
     usage = Usage()
@@ -537,6 +552,9 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
             if signals is not None:
                 # observe-only: fold the tool outcome into the abstain signals without touching `out`
                 signals.observe(call.name, out)
+            if calc_signals is not None:
+                # observe-only: capture derivation証跡 (compute/aggregate/chart) for the calc ledger
+                calc_signals.observe(call.name, out)
         if dispatched_tool:
             # count only genuine tool rounds; the terminal submit_answer turn is not a round
             iterations += 1
@@ -561,6 +579,14 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
             t for t in (answer.evidence, answer.method, answer.answer) if t).strip()
         _abstain_ledger.record_abstain(
             investigation, signals, path=(None if ledger is True else ledger))
+
+    # SOT-2495 — calc ledger: the commit-side twin, also purely post-decision. A committed numeric
+    # answer always gets a typed record (grounded when a compute step backs it, else flagged as 暗算), so
+    # a numeric answer without a ledger entry is impossible while the answer itself stays unchanged.
+    if calc_enabled and not is_abstain(investigation.answer.answer) \
+            and _calc_ledger.is_numeric_answer(investigation.answer.answer):
+        _calc_ledger.record_calc(
+            investigation, calc_signals, path=(None if calc_ledger is True else calc_ledger))
 
     return investigation
 
@@ -662,14 +688,17 @@ def answer_question(question: str, *, model: str | None = None,
                     profile: CorpusProfile | None = None,
                     max_turns: int = DEFAULT_MAX_TURNS,
                     timeout_s: float = DEFAULT_TIMEOUT_S,
-                    ledger: "str | object | bool | None" = True) -> Investigation:
+                    ledger: "str | object | bool | None" = True,
+                    calc_ledger: "str | object | bool | None" = True) -> Investigation:
     """Convenience live entry point: investigate one ``question`` with a real Gemini conversation.
 
     The abstain ledger (SOT-2492) is **on by default** here so the production answer path records a
-    coded diagnosis for every abstain (``artifacts/abstain_ledger.jsonl``). Pass ``ledger=False`` /
-    ``ledger=None`` to disable, or a path to redirect it.
+    coded diagnosis for every abstain (``artifacts/abstain_ledger.jsonl``). The calc ledger (SOT-2495)
+    is likewise **on by default** so every committed numeric answer records its typed calculation証跡
+    (``artifacts/calc_ledger.jsonl``). Pass ``ledger``/``calc_ledger`` ``=False``/``None`` to disable,
+    or a path to redirect either.
     """
     tools = build_tools(profile or CorpusProfile())
     model_obj = gemini_model_factory(question, tools, model=model)
     return investigate(model_obj, question, tools, max_turns=max_turns, timeout_s=timeout_s,
-                       ledger=ledger)
+                       ledger=ledger, calc_ledger=calc_ledger)

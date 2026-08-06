@@ -133,8 +133,13 @@ def _resolve(file: str | Path | FileRef, project: str | None = None) -> FileRef:
 
 
 # --------------------------------------------------------------------------- read
-def _coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
-    """Best-effort per-column numeric coercion (parity with ``pd.read_csv`` dtype inference)."""
+def _coerce_numeric(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Best-effort per-column numeric coercion (parity with ``pd.read_csv`` dtype inference).
+
+    Returns the coerced frame and the names of the columns that were converted, so the calculation
+    trace can record exactly which normalization rules were applied to reach the input rows.
+    """
+    coerced: list[str] = []
     for col in df.columns:
         if df[col].dtype == object:
             try:
@@ -142,7 +147,8 @@ def _coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
             except (ValueError, TypeError):
                 continue
             df[col] = converted
-    return df
+            coerced.append(str(col))
+    return df, coerced
 
 
 def _pick_sheet(wb, sheet: int | str | None):
@@ -164,7 +170,7 @@ def _pick_sheet(wb, sheet: int | str | None):
     return best or wb.active
 
 
-def _read_xlsx(path: Path, sheet: int | str | None) -> tuple[pd.DataFrame, str]:
+def _read_xlsx(path: Path, sheet: int | str | None) -> tuple[pd.DataFrame, str, dict[str, Any]]:
     wb = load_workbook(path, data_only=True, read_only=True)
     try:
         ws = _pick_sheet(wb, sheet)
@@ -173,24 +179,48 @@ def _read_xlsx(path: Path, sheet: int | str | None) -> tuple[pd.DataFrame, str]:
     finally:
         wb.close()
     # drop leading fully-empty rows (e.g. a title/blank line above the header)
+    dropped_leading = 0
     while rows and all(c is None for c in rows[0]):
         rows.pop(0)
+        dropped_leading += 1
     if not rows:
         raise ComputeError(f"sheet {title!r} in {path.name} has no data")
     header = rows[0]
     width = max((i + 1 for i, c in enumerate(header) if c is not None), default=len(header))
     columns = [nfc(str(c)) if c is not None else f"col_{i}" for i, c in enumerate(header[:width])]
     body = [(r[:width] + [None] * (width - len(r)))[:width] for r in rows[1:]]
-    df = _coerce_numeric(pd.DataFrame(body, columns=columns))
-    return df, title
+    df, coerced = _coerce_numeric(pd.DataFrame(body, columns=columns))
+    trace = _norm_trace(df, coerced, excluded_rows=dropped_leading,
+                        extra_rules=([f"dropped_leading_empty_rows: {dropped_leading}"]
+                                     if dropped_leading else []))
+    return df, title, trace
 
 
-def _read_frame(ref: FileRef, sheet: int | str | None) -> tuple[pd.DataFrame, str | None]:
+def _norm_trace(df: pd.DataFrame, coerced: list[str], *, excluded_rows: int,
+                extra_rules: list[str]) -> dict[str, Any]:
+    """The structured calculation trace embedded in ``method.trace`` (SOT-2495 計算証跡の構造化出力).
+
+    Records the rows the expression actually saw (``input_rows``), how many source rows were discarded
+    while normalizing (``excluded_rows``), and the normalization rules applied (numeric coercion per
+    column + any dropped rows) — the replayable input-shape证跡 the calc ledger stores per compute call.
+    """
+    rules = list(extra_rules)
+    if coerced:
+        rules.append("numeric_coercion: " + ", ".join(coerced))
+    return {
+        "input_rows": int(len(df)),
+        "excluded_rows": int(excluded_rows),
+        "normalization": rules,
+    }
+
+
+def _read_frame(ref: FileRef, sheet: int | str | None) -> tuple[pd.DataFrame, str | None, dict[str, Any]]:
     ext = ref.ext.lower()
     if ext not in _READABLE_EXT:
         raise ComputeError(f"unsupported file type .{ext} (only {sorted(_READABLE_EXT)})")
     if ext == "csv":
-        return pd.read_csv(ref.path), None
+        df = pd.read_csv(ref.path)
+        return df, None, _norm_trace(df, [], excluded_rows=0, extra_rules=[])
     return _read_xlsx(Path(ref.path), sheet)
 
 
@@ -294,7 +324,7 @@ def run(
         value recorded under ``method.intermediates`` so the working is traceable.
     """
     ref = _resolve(file, project)
-    df, sheet_used = _read_frame(ref, sheet)
+    df, sheet_used, trace = _read_frame(ref, sheet)
 
     tree = ast.parse(expr, mode="eval")  # (re-parsed inside _eval too; cheap and keeps _eval standalone)
     value = _to_py(_eval(expr, df))
@@ -319,5 +349,8 @@ def run(
         "code": expr,
         "allowed_api": sorted(_ALLOWED_NAMES | set(_SAFE_BUILTINS)),
         "intermediates": computed_intermediates,
+        # SOT-2495: structured calculation trace (input rows / excluded rows / normalization rules) so a
+        # numeric answer's derivation is replayable from the calc ledger. Additive — value is unchanged.
+        "trace": trace,
     }
     return {"value": value, "evidence": evidence, "method": method}
