@@ -256,12 +256,15 @@ class AbstainRecord:
     # SOT-2502 — the local re-search rounds this abstain went through (empty when research was off).
     research: tuple[dict[str, Any], ...] = ()
     research_terminal: str = ""
+    # SOT-2498 — the routing contract this question was classified as (empty when routing was off).
+    contract: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "recorded_at": self.recorded_at,
             "question": self.question,
             "state_code": self.state_code,
+            "contract": self.contract,
             "evidence_obligation": self.evidence_obligation,
             "missing": [dict(m) for m in self.missing],
             "explored_paths": list(self.explored_paths),
@@ -332,6 +335,8 @@ def record_from_investigation(investigation: Any, signals: AbstainSignals, *,
         recorded_at=(now or _utcnow)(),
         research=tuple(signals.research_trace),
         research_terminal=signals.research_terminal,
+        # SOT-2498 — duck-typed: the routing contract label recorded on the investigation (or "").
+        contract=(getattr(investigation, "contract", None) or ""),
     )
 
 

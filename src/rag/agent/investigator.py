@@ -211,6 +211,7 @@ class Investigation:
     elapsed_s: float
     stop_reason: str            # "answered" | "max_turns" | "timeout" | "model_error"
     error: str | None = None
+    contract: str | None = None  # SOT-2498 — routing contract this question was classified as (or None)
 
     @property
     def confidence(self) -> float:
@@ -220,6 +221,7 @@ class Investigation:
         return {
             "question": self.question,
             **self.answer.to_dict(),
+            "contract": self.contract,
             "iterations": self.iterations,
             "tool_calls": list(self.tool_calls),
             "input_tokens": self.usage.input_tokens,
@@ -490,7 +492,8 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 ledger: "str | object | bool | None" = None,
                 calc_ledger: "str | object | bool | None" = None,
                 research: "bool | Mapping[str, Any] | object | None" = None,
-                enumeration: "bool | Mapping[str, Any] | object | None" = None) -> Investigation:
+                enumeration: "bool | Mapping[str, Any] | object | None" = None,
+                contract: "str | None" = None) -> Investigation:
     """Drive ``model`` through tool-calling until it submits a structured answer.
 
     The loop ends on the first of: the model calls ``submit_answer`` (→ ``answered``); ``max_turns`` is
@@ -535,6 +538,12 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     closure-proven answer or a still-coded abstain — the commit threshold is never touched. Off by default
     so the answer path stays byte-identical; it composes with ``research`` (the enum procedure is tried
     first, the generic re-search after).
+
+    ``contract`` (SOT-2498) is a pure *label* recorded onto the returned :class:`Investigation` (and, on
+    an abstain, into the ledger) so the routing contract the question was classified as is captured
+    per-question alongside the tools actually used. It never influences the loop — the routing *hint*
+    itself is injected into the model's system prompt at construction (see :func:`answer_question`), not
+    here — so passing it leaves the answer path byte-identical (default ``None``).
     """
     record_enabled = ledger not in (None, False)
     if record_enabled:
@@ -664,7 +673,7 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     investigation = Investigation(
         question=question, answer=answer, iterations=iterations, tool_calls=tool_calls,
         usage=usage, model=model_name, elapsed_s=max(0.0, clock() - start),
-        stop_reason=stop_reason, error=error,
+        stop_reason=stop_reason, error=error, contract=contract,
     )
 
     # SOT-2492 — abstain ledger: purely post-decision. The answer above is already final; here we only
@@ -781,9 +790,15 @@ def to_genai_tools(tools: Sequence[AgentTool]) -> Any:
 
 
 def gemini_model_factory(question: str, tools: Sequence[AgentTool], *,
-                         model: str | None = None) -> GeminiModel:
-    """Fresh live conversation for one question (each question gets an isolated context)."""
-    return GeminiModel(question, to_genai_tools(tools), model=model)
+                         model: str | None = None,
+                         system: str | None = None) -> GeminiModel:
+    """Fresh live conversation for one question (each question gets an isolated context).
+
+    ``system`` overrides the default :data:`SYSTEM_PROMPT` — used by :func:`answer_question` to inject
+    the SOT-2498 contract routing hint for this question (default keeps the base prompt).
+    """
+    return GeminiModel(question, to_genai_tools(tools), model=model,
+                       system=system if system is not None else SYSTEM_PROMPT)
 
 
 def answer_question(question: str, *, model: str | None = None,
@@ -793,7 +808,9 @@ def answer_question(question: str, *, model: str | None = None,
                     ledger: "str | object | bool | None" = True,
                     calc_ledger: "str | object | bool | None" = True,
                     research: "bool | Mapping[str, Any] | object | None" = True,
-                    enumeration: "bool | Mapping[str, Any] | object | None" = True) -> Investigation:
+                    enumeration: "bool | Mapping[str, Any] | object | None" = True,
+                    routing: "bool | object | None" = True,
+                    contract_flash: "Callable[[str], str | None] | None" = None) -> Investigation:
     """Convenience live entry point: investigate one ``question`` with a real Gemini conversation.
 
     The abstain ledger (SOT-2492) is **on by default** here so the production answer path records a
@@ -805,9 +822,27 @@ def answer_question(question: str, *, model: str | None = None,
     ``full_enumeration`` question proves its completeness (権威的母集団の特定 + 閉包条件) before it may
     abstain. Pass ``ledger``/``calc_ledger``/``research``/``enumeration`` ``=False``/``None`` to disable,
     or a path (ledgers) / budget mapping (research) to configure.
+
+    Contract routing (SOT-2498) is **on by default** here: the question is classified into its
+    :class:`~src.rag.agent.question_contract.QuestionContract` and a corpus-fact-free *routing hint*
+    (推奨初手ツール優先順 + 完了条件) is appended to the system prompt so the agent's first move is
+    steered toward the tool most likely to reach the evidence — data/横断集計/数値 →
+    ``canonical_route``/``compute``/``corpus_aggregate`` first, 書式/グラフ/空間/版差分 → the specialised
+    tool first, 単純検索 → the fast retrieval path (Adaptive-RAG). The hint is *advisory only* (final tool
+    choice stays with the model) and the classified contract is recorded on the returned
+    :class:`Investigation`. Pass ``routing=False``/``None`` to answer with the base prompt (no hint, no
+    contract label); ``contract_flash`` injects a live flash arbiter for genuinely ambiguous questions
+    (default: deterministic classification only, so this path stays reproducible).
     """
     tools = build_tools(profile or CorpusProfile())
-    model_obj = gemini_model_factory(question, tools, model=model)
+    system: str | None = None
+    contract: str | None = None
+    if routing not in (None, False):
+        from src.rag.agent import routing as _routing  # lazy: keeps import free of the classifier deps
+        qc = _routing.classify_for_routing(question, flash=contract_flash)
+        system = _routing.routed_system_prompt(SYSTEM_PROMPT, qc, question)
+        contract = qc.contract
+    model_obj = gemini_model_factory(question, tools, model=model, system=system)
     return investigate(model_obj, question, tools, max_turns=max_turns, timeout_s=timeout_s,
                        ledger=ledger, calc_ledger=calc_ledger, research=research,
-                       enumeration=enumeration)
+                       enumeration=enumeration, contract=contract)
