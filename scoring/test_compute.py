@@ -186,3 +186,73 @@ def test_compute_sandbox_resolves_nfc_reference_by_name():
     by_ref = compute_sandbox.run(ref, "len(df)")
     by_rel = compute_sandbox.run(ref.rel, "len(df)")
     assert by_ref["value"] == by_rel["value"]
+
+
+# --------------------------------------------------------------------------- SOT-2487: project scope
+def _ambiguous_bare_name() -> tuple[str, list] | None:
+    """A bare filename (e.g. ``train.xlsx``) shared by ≥2 projects, with its FileRefs."""
+    from collections import Counter
+
+    refs = [r for r in walk() if r.project]
+    counts = Counter(r.name for r in refs)
+    for name in ("train.xlsx", "train.csv"):
+        if counts.get(name, 0) >= 2:
+            return name, [r for r in refs if r.name == name]
+    return None
+
+
+def test_compute_project_scope_disambiguates_shared_filename():
+    """SOT-2487: a project= hint narrows an otherwise-ambiguous shared table to one file."""
+    picked = _ambiguous_bare_name()
+    if picked is None:
+        pytest.skip("no shared bare table name across projects")
+    name, refs = picked
+    target = refs[0]
+    # Bare name alone is ambiguous and must NOT silently pick a file (precision guard).
+    with pytest.raises(compute_sandbox.ComputeError) as exc:
+        compute_sandbox._resolve(name)
+    # the error steers the caller to the project= filter and lists candidate projects
+    assert "存在プロジェクト" in str(exc.value)
+    # a project hint (even a partial company name) resolves to that project's own table
+    resolved = compute_sandbox._resolve(name, target.project)
+    assert resolved.rel == target.rel
+    assert resolved.project == target.project
+
+
+def test_compute_project_scope_partial_name_matches():
+    """A loose project hint (substring of the full legal name) still resolves."""
+    picked = _ambiguous_bare_name()
+    if picked is None:
+        pytest.skip("no shared bare table name across projects")
+    name, refs = picked
+    target = refs[0]
+    # drop a common legal-form prefix to simulate how a question names the project loosely
+    partial = target.project.replace("株式会社", "").replace("医療法人社団", "").strip()
+    if not partial or partial == target.project:
+        partial = target.project[-4:]
+    resolved = compute_sandbox._resolve(name, partial)
+    assert resolved.project == target.project
+    # and compute runs end-to-end against the scoped frame
+    out = compute_sandbox.run(name, "df.shape[0]", project=partial)
+    assert isinstance(out["value"], int) and out["value"] >= 0
+    assert out["evidence"]["project"] == target.project
+
+
+def test_compute_project_scope_no_match_raises_not_guesses():
+    """A non-matching project errors (→ abstain) rather than falling back to a wrong file."""
+    picked = _ambiguous_bare_name()
+    if picked is None:
+        pytest.skip("no shared bare table name across projects")
+    name, _ = picked
+    with pytest.raises(compute_sandbox.ComputeError):
+        compute_sandbox._resolve(name, "存在しない架空の案件名XYZ")
+
+
+def test_compute_project_scope_is_backward_compatible():
+    """Unscoped resolution of a fully-qualified rel is byte-identical with/without project=None."""
+    ref = _canonical_train_csv()
+    if ref is None:
+        pytest.skip("no canonical train.csv in corpus")
+    a = compute_sandbox.run(ref.rel, "len(df)")
+    b = compute_sandbox.run(ref.rel, "len(df)", project=None)
+    assert a == b
