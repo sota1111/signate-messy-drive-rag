@@ -463,7 +463,8 @@ class Model(Protocol):
 
 def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 max_turns: int = DEFAULT_MAX_TURNS, timeout_s: float = DEFAULT_TIMEOUT_S,
-                clock: Callable[[], float] = time.monotonic) -> Investigation:
+                clock: Callable[[], float] = time.monotonic,
+                ledger: "str | object | bool | None" = None) -> Investigation:
     """Drive ``model`` through tool-calling until it submits a structured answer.
 
     The loop ends on the first of: the model calls ``submit_answer`` (→ ``answered``); ``max_turns`` is
@@ -473,7 +474,22 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
 
     ``iterations`` counts tool rounds (turns that requested ≥1 tool call). Token usage is summed across
     every turn so the caller can price the question.
+
+    ``ledger`` (SOT-2492) enables the abstain ledger: when it is not ``None``/``False``, per-tool
+    outcome signals are *observed* (never altered) during the loop, and if the final answer is an
+    abstain a coded :class:`~src.rag.agent.abstain_ledger.AbstainRecord` is appended. ``True`` writes to
+    the default path (``artifacts/abstain_ledger.jsonl``); a ``str``/``Path`` writes there instead. The
+    default ``None`` is a pure no-op so the commit-vs-abstain decision and every existing caller are
+    unchanged (受け入れ条件②).
     """
+    record_enabled = ledger not in (None, False)
+    if record_enabled:
+        from src.rag.agent import abstain_ledger as _abstain_ledger
+        signals = _abstain_ledger.AbstainSignals()
+    else:
+        _abstain_ledger = None
+        signals = None
+
     by_name = {t.name: t for t in tools}
     usage = Usage()
     tool_calls: list[str] = []
@@ -518,6 +534,9 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
             out = dispatch(by_name, call.name, call.args)
             responses.append(ToolResponse(call.name, out))
             dispatched_tool = True
+            if signals is not None:
+                # observe-only: fold the tool outcome into the abstain signals without touching `out`
+                signals.observe(call.name, out)
         if dispatched_tool:
             # count only genuine tool rounds; the terminal submit_answer turn is not a round
             iterations += 1
@@ -527,11 +546,23 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
         error = error or f"max_turns={max_turns} reached without a final answer"
 
     model_name = getattr(model, "model_name", settings.GEN_MODEL_HARD)
-    return Investigation(
+    investigation = Investigation(
         question=question, answer=answer, iterations=iterations, tool_calls=tool_calls,
         usage=usage, model=model_name, elapsed_s=max(0.0, clock() - start),
         stop_reason=stop_reason, error=error,
     )
+
+    # SOT-2492 — abstain ledger: purely post-decision. The answer above is already final; here we only
+    # *record* it. Every abstain path (self-abstain / max_turns / timeout / model_error) flows through
+    # `record_abstain`, which always assigns a state code, so a code-less abstain is impossible.
+    if record_enabled and is_abstain(investigation.answer.answer):
+        signals.stop_reason = stop_reason
+        signals.evidence_text = " ".join(
+            t for t in (answer.evidence, answer.method, answer.answer) if t).strip()
+        _abstain_ledger.record_abstain(
+            investigation, signals, path=(None if ledger is True else ledger))
+
+    return investigation
 
 
 def investigate_batch(model_factory: Callable[[str, Sequence[AgentTool]], Model],
@@ -630,8 +661,15 @@ def gemini_model_factory(question: str, tools: Sequence[AgentTool], *,
 def answer_question(question: str, *, model: str | None = None,
                     profile: CorpusProfile | None = None,
                     max_turns: int = DEFAULT_MAX_TURNS,
-                    timeout_s: float = DEFAULT_TIMEOUT_S) -> Investigation:
-    """Convenience live entry point: investigate one ``question`` with a real Gemini conversation."""
+                    timeout_s: float = DEFAULT_TIMEOUT_S,
+                    ledger: "str | object | bool | None" = True) -> Investigation:
+    """Convenience live entry point: investigate one ``question`` with a real Gemini conversation.
+
+    The abstain ledger (SOT-2492) is **on by default** here so the production answer path records a
+    coded diagnosis for every abstain (``artifacts/abstain_ledger.jsonl``). Pass ``ledger=False`` /
+    ``ledger=None`` to disable, or a path to redirect it.
+    """
     tools = build_tools(profile or CorpusProfile())
     model_obj = gemini_model_factory(question, tools, model=model)
-    return investigate(model_obj, question, tools, max_turns=max_turns, timeout_s=timeout_s)
+    return investigate(model_obj, question, tools, max_turns=max_turns, timeout_s=timeout_s,
+                       ledger=ledger)
