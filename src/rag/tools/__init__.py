@@ -14,6 +14,8 @@
 * :mod:`~src.rag.tools.emf_pivot` — reconstruct an embedded EMF PivotTable image (text + highlights).
 * :mod:`~src.rag.tools.chart_numcache` — read exact xlsx/pptx chart plot values from ``numCache``.
 * :mod:`~src.rag.tools.seating_chart` — 座席表画像 → 氏名⇄内線(EXT)⇄座席 directory + 空間ルックアップ.
+* :mod:`~src.rag.tools.canonical_route` — data/計算系質問を案件の canonical データファイル (train.xlsx/
+  分析コード/notebook/leaderboard) へ直行させ、chunk 検索を迂回する決定論ルート (``canonical_route``).
 """
 from src.rag.tools.compute_sandbox import ComputeError
 from src.rag.tools.compute_sandbox import run as compute_run
@@ -43,6 +45,13 @@ from src.rag.tools.chart_numcache import (
     chart_xml_members,
     extract_chart_numcache,
     series_values,
+)
+from src.rag.tools.canonical_route import (
+    CanonicalRouteError,
+    canonical_route,
+    discover as canonical_discover,
+    infer_kinds as canonical_infer_kinds,
+    resolve_project as canonical_resolve_project,
 )
 from src.rag.tools.file_grep import FileGrepError, file_grep
 from src.rag.tools.pdf_faux_italic import detect_faux_italic, emphasized_words
@@ -93,6 +102,11 @@ __all__ = [
     "chart_series",
     "chart_xml_members",
     "series_values",
+    "canonical_route",
+    "CanonicalRouteError",
+    "canonical_discover",
+    "canonical_infer_kinds",
+    "canonical_resolve_project",
     "seating_lookup",
     "build_directory",
     "extract_seating_image",

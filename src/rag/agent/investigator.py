@@ -34,6 +34,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from config import settings
 from src.rag.tools import contract as _contract
+from src.rag.tools.canonical_route import canonical_route
 from src.rag.tools.chart_numcache import extract_chart_numcache
 from src.rag.tools.compute_sandbox import run as compute_run
 from src.rag.tools.corpus_aggregate import corpus_aggregate
@@ -78,6 +79,12 @@ SYSTEM_PROMPT = (
     "特定する。曖昧エラーが返ったら、そのエラーが挙げる『存在プロジェクト』から該当案件を選んで project を"
     "付けて再試行する(棄権しない)。列名や絞り込み値が不明なときは、まず `df.columns.tolist()` や"
     "`df['列'].unique().tolist()` を compute で確認してから集計式を組む。\n"
+    "4b. 案件名+データ資産(train.xlsx/train.csv・分析コード/modeling.py・notebook/EDA・leaderboard・"
+    "スケジュール等)を指すデータ/計算系の質問で、grep/検索で根拠ファイルが見つからないときは canonical_route "
+    "ツールに質問文をそのまま渡す。用語集で案件を特定し canonical ファイルを直行解決して返すので(chunk検索を"
+    "迂回)、返った先頭 rel を compute/read_office/read_chart_values に渡すか、canonical_route(question, "
+    "expr='…') で計算値まで得る。例: 『京橋信用ソリューションズの分析コードの n_estimators』は"
+    "canonical_route(question=…, kind='code') で modeling.py を得て read_office で読む。\n"
     "5. 旧版(old版)と最新版の比較・変更点を問う質問は、grepで手作業比較せず version_diff ツールに質問文を"
     "そのまま渡す。決定論の構造diffが『変更前 → 変更後』を返すので、その value をそのまま回答にする。value が"
     "null のときのみ他手段(grep等)を検討する。\n"
@@ -330,6 +337,22 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
             _obj({"file": _STR, "expr": _STR, "sheet": _STR, "project": _STR}, ["file", "expr"]),
             lambda file, expr, sheet=None, project=None: compute_run(
                 file, expr, sheet=sheet, project=project),
+        ),
+        AgentTool(
+            "canonical_route",
+            "データ/計算系の質問を、案件(project)の canonical データファイル(train.xlsx/train.csv・"
+            "分析コード modeling.py・notebook 01_eda.ipynb・leaderboard.csv 等)へ直行解決するツール。"
+            "chunk検索で根拠が top-k に上がらない(索引で拾えない)データ質問の迂回ルート。question に質問文を"
+            "そのまま渡すと、用語集で案件を特定し、質問の種別(train/code/notebook/leaderboard/schedule/"
+            "contract)に対応する canonical ファイルを決定論で発見して {rel, project, category, ext, kind} の"
+            "一覧(canonical本命が先頭)を返す。project(会社名の一部)/kind を明示して絞ることも可。返った先頭 rel を"
+            "compute/read_office/read_chart_values に渡す。expr(単一pandas式)を渡すと先頭の表ファイルに対して"
+            "その場で compute を実行し計算値まで返す。『京橋の分析コードの n_estimators』『〜のtrain.xlsxの…』の"
+            "ように案件名+データ資産を指す質問に使う。該当なしは value=[](棄権のまま)。",
+            _obj({"question": _STR, "project": _STR, "kind": _STR, "expr": _STR, "sheet": _STR},
+                 ["question"]),
+            lambda question, project=None, kind=None, expr=None, sheet=None: canonical_route(
+                question, project=project, kind=kind, expr=expr, sheet=sheet),
         ),
         AgentTool(
             "read_chart_values",
