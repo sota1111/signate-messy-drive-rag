@@ -43,6 +43,21 @@ def test_pending_rows_are_skipped_by_calibration(tmp_path):
     assert len(calibrate.load_ledger(path, scored_only=False)) == 3  # full ledger
 
 
+def test_diagnostic_rows_are_excluded_from_calibration_but_retained_in_full_load(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    rows = [
+        {"submission": "#1", "local_score": 0.0, "real_public_score": -0.2,
+         "archetype_committed": {"unknown": 10}},
+        {"submission": "#2", "local_score": 0.3, "real_public_score": 0.0,
+         "archetype_committed": {"unknown": 8}},
+        {"submission": "probe-summary", "commit": "diagnostic",
+         "real_public_score": 0.8, "notes": "aggregate probe result"},
+    ]
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    assert [r["submission"] for r in calibrate.load_ledger(path)] == ["#1", "#2"]
+    assert len(calibrate.load_ledger(path, scored_only=False)) == 3
+
+
 def test_real_ledger_is_complete_and_loo_mae_not_worse():
     """Every real submission in the committed ledger has predicted/actual/error, and the
     calibration leave-one-out MAE is no worse than the pre-completion n=4 baseline (0.0848)."""
