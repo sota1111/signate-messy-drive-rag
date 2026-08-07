@@ -88,6 +88,28 @@ def test_route_hint_for_numeric_prefers_canonical_route():
     assert "一律" in hint or "chunk" in hint
 
 
+def test_negative_correlation_hint_excludes_target_by_name_before_argmin():
+    q = "顧客データにおいて、目的変数と最も強い負の相関を持つカラムは何ですか。"
+    contract = qc.classify(q)
+    assert contract.contract == qc.NUMERIC
+    hint = routing.route_hint(contract, q)
+    assert "目的変数自身を候補から列名で明示的に除外" in hint
+    assert "昇順に並べた先頭（最小値）" in hint
+    assert "無条件に2番目の最小値" in hint
+
+
+def test_requested_name_surface_is_preserved_without_expansion_or_honorific():
+    abbreviation_q = "条件に合う案件を、主略称ですべて挙げてください。"
+    abbreviation_hint = routing.route_hint(qc.classify(abbreviation_q), abbreviation_q)
+    assert "主略称をそのまま列挙" in abbreviation_hint
+    assert "正式社名や案件名へ展開" in abbreviation_hint
+
+    fullname_q = "甲側の主担当者をフルネームで教えてください。"
+    fullname_hint = routing.route_hint(qc.classify(fullname_q), fullname_q)
+    assert "人名のフルネームのみ" in fullname_hint
+    assert "敬称（様/氏）" in fullname_hint
+
+
 def test_data_asset_simple_lookup_leads_with_canonical_route():
     # idx61-style: a config-hyperparam lookup that lives inside modeling.py (a data asset) is a
     # simple_lookup contract, but its evidence is a needle the chunk index misses → canonical_route first.

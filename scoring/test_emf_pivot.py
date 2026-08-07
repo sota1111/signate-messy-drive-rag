@@ -208,3 +208,11 @@ def test_real_corpus_emf_pivot_smoke():
     # 基礎分析.pptx page: 黄色ハイライト = hr=8 (row label) × weekday=2 (col header) → 0.78.
     assert any(c["value"] == "0.78" and c["row_label"] == "8" and c["col_header"] == "2"
                for c in yellow)
+    semantics = results[0]["value"]["semantics"]
+    assert semantics is not None
+    assert semantics["row_field"] == "hr" and semantics["column_field"] == "weekday"
+    assert semantics["target_column"] == "temp"
+    assert semantics["aggregation"] == "max" and semantics["match_rate"] == 1.0
+    assert any(c["filters"] == {"hr": 8, "weekday": 2}
+               and c["semantic_summary"] == "hr=8、weekday=2で抽出されたデータに対する最大 / temp"
+               for c in yellow)

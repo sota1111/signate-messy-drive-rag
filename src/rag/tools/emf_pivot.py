@@ -29,10 +29,13 @@ rather than emit a fabricated table.
 """
 from __future__ import annotations
 
+import math
 import struct
 import zipfile
 from pathlib import Path
 from typing import Any, Callable, Iterable
+
+import pandas as pd
 
 from src.rag.corpus import FileRef, nfc
 from src.rag.tools import contract
@@ -264,6 +267,202 @@ def _map_highlights(fills: list[_Fill], spans: list[_Span], table: list[list[str
     return out
 
 
+# --------------------------------------------------------------------------- reconstructed grid → source-data semantics
+# A pasted PivotTable contains display labels and values but often omits the Excel field buttons.  Raw
+# ``row_label=8 / col_header=2`` is not a meaningful extraction condition until those labels are mapped
+# back to source columns.  We resolve that mapping deterministically: candidate source columns must cover
+# the visible row/column label domains, then each supported aggregation is replayed and compared against
+# every visible pivot cell.  Only a unique, near-exact semantic signature is accepted (otherwise fail
+# closed with ``None``); no project-specific field name or answer is embedded here.
+_AGGREGATIONS: tuple[tuple[str, str], ...] = (
+    ("max", "最大"), ("mean", "平均"), ("min", "最小"), ("sum", "合計"),
+    ("count", "個数"), ("median", "中央値"),
+)
+
+
+def _cell_scalar(text: Any) -> Any:
+    s = nfc(str(text or "")).strip()
+    if not s:
+        return None
+    try:
+        value = float(s.replace(",", ""))
+        return int(value) if value.is_integer() else value
+    except ValueError:
+        return s
+
+
+def _scalar_key(value: Any) -> tuple[str, Any]:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return ("null", None)
+    if isinstance(value, bool):
+        return ("text", str(value).lower())
+    try:
+        number = float(value)
+        if math.isfinite(number):
+            return ("number", round(number, 12))
+    except (TypeError, ValueError):
+        pass
+    return ("text", nfc(str(value)).strip())
+
+
+def _json_scalar(value: Any) -> Any:
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+        try:
+            value = value.item()
+        except (ValueError, AttributeError):
+            pass
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+def _candidate_fields(df: pd.DataFrame, labels: list[Any]) -> list[str]:
+    wanted = {_scalar_key(v) for v in labels if v is not None}
+    out: list[str] = []
+    for col in df.columns:
+        values = {_scalar_key(v) for v in df[col].dropna().unique()}
+        # Limit accidental high-cardinality candidates while allowing a partially visible pivot (e.g.
+        # visible hours 0..15 from a source domain 0..23).
+        if wanted and wanted <= values and len(values) <= max(64, len(wanted) * 4):
+            out.append(str(col))
+    return out
+
+
+def _display_tolerance(text: str) -> float:
+    clean = str(text).strip().replace(",", "")
+    decimals = len(clean.rsplit(".", 1)[1]) if "." in clean else 0
+    return max(1e-9, 0.5 * (10 ** -decimals))
+
+
+def resolve_pivot_semantics(
+    table: list[list[str]], data_sources: Iterable[tuple[str, pd.DataFrame]],
+) -> dict[str, Any] | None:
+    """Resolve ``table`` to ``row field × column field → aggregation(value field)``.
+
+    ``data_sources`` is an iterable of ``(source label, DataFrame)``.  A result is returned only when
+    one semantic signature explains at least four cells and ≥98% of all numeric visible cells, and no
+    different signature ties it.  Duplicate copies of the same source table collapse to one signature.
+    """
+    if len(table) < 2 or not table[0] or len(table[0]) < 2:
+        return None
+    column_labels = [_cell_scalar(x) for x in table[0][1:]]
+    row_labels = [_cell_scalar(row[0]) for row in table[1:] if row]
+    if not row_labels or not column_labels:
+        return None
+
+    candidates: list[dict[str, Any]] = []
+    for source, frame in data_sources:
+        if frame.empty:
+            continue
+        df = frame.copy()
+        df.columns = [nfc(str(c)) for c in df.columns]
+        row_fields = _candidate_fields(df, row_labels)
+        column_fields = _candidate_fields(df, column_labels)
+        numeric_fields = [str(c) for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        for row_field in row_fields:
+            for column_field in column_fields:
+                if row_field == column_field:
+                    continue
+                row_lookup = {_scalar_key(v): v for v in df[row_field].dropna().unique()}
+                col_lookup = {_scalar_key(v): v for v in df[column_field].dropna().unique()}
+                for target in numeric_fields:
+                    if target in (row_field, column_field):
+                        continue
+                    for aggregation, aggregation_label in _AGGREGATIONS:
+                        try:
+                            pivot = pd.pivot_table(
+                                df, index=row_field, columns=column_field, values=target,
+                                aggfunc=aggregation, observed=False)
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                        compared = matched = 0
+                        for rpos, row in enumerate(table[1:]):
+                            if not row or rpos >= len(row_labels):
+                                continue
+                            rvalue = row_lookup.get(_scalar_key(row_labels[rpos]))
+                            if rvalue is None or rvalue not in pivot.index:
+                                continue
+                            for cpos, raw in enumerate(row[1:]):
+                                expected = _cell_scalar(raw)
+                                if not isinstance(expected, (int, float)) or cpos >= len(column_labels):
+                                    continue
+                                cvalue = col_lookup.get(_scalar_key(column_labels[cpos]))
+                                if cvalue is None or cvalue not in pivot.columns:
+                                    continue
+                                actual = pivot.loc[rvalue, cvalue]
+                                if pd.isna(actual):
+                                    continue
+                                compared += 1
+                                if abs(float(actual) - float(expected)) <= _display_tolerance(raw):
+                                    matched += 1
+                        if compared >= 4:
+                            candidates.append({
+                                "source_file": source,
+                                "row_field": row_field,
+                                "column_field": column_field,
+                                "target_column": target,
+                                "aggregation": aggregation,
+                                "aggregation_label": aggregation_label,
+                                "matched_cells": matched,
+                                "compared_cells": compared,
+                                "match_rate": matched / compared,
+                            })
+
+    viable = [c for c in candidates if c["match_rate"] >= 0.98]
+    if not viable:
+        return None
+    viable.sort(key=lambda c: (c["match_rate"], c["matched_cells"], -len(c["source_file"])),
+                reverse=True)
+    best = viable[0]
+    signature = lambda c: (c["row_field"], c["column_field"], c["target_column"], c["aggregation"])
+    tied_signatures = {
+        signature(c) for c in viable
+        if c["match_rate"] == best["match_rate"] and c["matched_cells"] == best["matched_cells"]
+    }
+    if len(tied_signatures) != 1:
+        return None
+    best = dict(best)
+    best["match_rate"] = round(float(best["match_rate"]), 6)
+    return best
+
+
+def _pptx_data_sources(pptx: str | Path | FileRef) -> list[tuple[str, pd.DataFrame]]:
+    """Load likely tabular sources from the PPTX's project, preferring canonical ``03.データ`` files."""
+    from src.rag.corpus import walk
+    from src.rag.tools.compute_sandbox import _read_frame
+    from src.rag.tools.extract_tools import resolve_ref
+
+    if isinstance(pptx, FileRef):
+        pptx_ref = pptx
+    else:
+        path = Path(pptx)
+        if path.exists():
+            normalized = nfc(str(path.resolve()))
+            pptx_ref = next(
+                (r for r in walk() if nfc(str(r.path.resolve())) == normalized), None)
+            if pptx_ref is None:
+                return []
+        else:
+            pptx_ref = resolve_ref(pptx)
+    if not pptx_ref.project:
+        return []
+    refs = [r for r in walk() if r.project == pptx_ref.project
+            and r.ext in {"csv", "tsv", "xlsx", "xlsm"}]
+    refs.sort(key=lambda r: (
+        r.category != "data", not r.stem.lower().startswith("train"), len(r.rel), r.rel))
+    out: list[tuple[str, pd.DataFrame]] = []
+    for ref in refs:
+        try:
+            if ref.ext == "tsv":
+                df = pd.read_csv(ref.path, sep="\t")
+            else:
+                df, _sheet, _trace = _read_frame(ref, None)
+        except Exception:  # noqa: BLE001 — one malformed candidate must not hide other source tables
+            continue
+        out.append((ref.rel, df))
+    return out
+
+
 # --------------------------------------------------------------------------- source loading
 def _read_source(file: str | Path | FileRef | bytes | bytearray) -> tuple[bytes, str, Path | None]:
     """Load EMF bytes from raw bytes / a FileRef / an ``.emf`` path, returning ``(data, label, path)``."""
@@ -412,6 +611,7 @@ def extract_pptx_pivots(pptx: str | Path | FileRef, **kwargs: Any) -> list[dict[
     so the caller can tell which picture a table/highlight came from. ``kwargs`` are forwarded.
     """
     label = pptx.rel if isinstance(pptx, FileRef) else str(pptx)
+    data_sources: list[tuple[str, pd.DataFrame]] | None = None
     results: list[dict[str, Any]] = []
     for name, blob in emf_blobs_from_pptx(pptx):
         try:
@@ -420,5 +620,32 @@ def extract_pptx_pivots(pptx: str | Path | FileRef, **kwargs: Any) -> list[dict[
             continue
         result["evidence"]["pptx"] = label
         result["evidence"]["member"] = name
+        # Semantic replay is intentionally limited to highlighted tables.  The investigator exposes
+        # this tool for highlighted-pivot questions; running a project-wide DataFrame search for every
+        # decorative/non-pivot EMF in an Office deck adds substantial CPU/memory without producing a
+        # cell the caller can answer from.
+        if not result["method"].get("fallback") and result["value"]["highlights"]:
+            if data_sources is None:
+                data_sources = _pptx_data_sources(pptx)
+            semantics = resolve_pivot_semantics(result["value"]["table"], data_sources)
+            result["value"]["semantics"] = semantics
+            result["method"]["semantic_resolution"] = bool(semantics)
+            if semantics:
+                result["evidence"]["semantic_source"] = semantics["source_file"]
+                for highlight in result["value"]["highlights"]:
+                    for cell in highlight["cells"]:
+                        row_value = _json_scalar(_cell_scalar(cell.get("row_label")))
+                        column_value = _json_scalar(_cell_scalar(cell.get("col_header")))
+                        cell["filters"] = {
+                            semantics["row_field"]: row_value,
+                            semantics["column_field"]: column_value,
+                        }
+                        cell["target_column"] = semantics["target_column"]
+                        cell["aggregation"] = semantics["aggregation"]
+                        cell["aggregation_label"] = semantics["aggregation_label"]
+                        cell["semantic_summary"] = (
+                            f"{semantics['row_field']}={row_value}、"
+                            f"{semantics['column_field']}={column_value}で抽出されたデータに対する"
+                            f"{semantics['aggregation_label']} / {semantics['target_column']}")
         results.append(result)
     return results

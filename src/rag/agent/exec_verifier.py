@@ -46,6 +46,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from config import settings
 from src.rag.agent.calc_ledger import is_grounded, is_numeric_answer
+from src.rag.agent.question_contract import validate_numeric_answer
 from src.rag.agent.investigator import (
     DEFAULT_MAX_TURNS,
     DEFAULT_TIMEOUT_S,
@@ -187,6 +188,20 @@ def compare_execution(committed: Mapping[str, Any], rederived: Mapping[str, Any]
             "台帳に compute 証跡が無い暗算数値 — 独立再実行で照合できず確認不能",
         )
 
+    # SOT-2508 — verify the *requested quantity* before comparing two numeric values.  Two executions
+    # can agree while both divide by the wrong population; the deterministic question contract catches
+    # that correlated error from ``XのうちYの割合`` wording, and also enforces the requested unit/rounding.
+    committed_contract = validate_numeric_answer(
+        str(committed.get("question", "")), _answer_of(committed), _compute_steps(committed))
+    if not committed_contract.passed:
+        conflicts = tuple(committed_contract.issues)
+        return ExecComparison(
+            EXEC_CONFLICT, False,
+            "計算台帳が質問の量の定義/単位/丸め契約に違反(EVIDENCE_CONFLICT) — "
+            + " / ".join(conflicts),
+            conflicts=conflicts,
+        )
+
     # 2) 決着不能: the independent re-execution could not produce a comparable number.
     if rederived is None or is_abstain(_answer_of(rederived)) or not is_grounded(rederived):
         detail = "再実行が得られず" if rederived is None else (
@@ -194,6 +209,17 @@ def compare_execution(committed: Mapping[str, Any], rederived: Mapping[str, Any]
         return ExecComparison(
             EXEC_UNDECIDABLE, False,
             f"独立再実行が値を再導出できず({detail}) — 決着不能",
+        )
+
+    rederived_contract = validate_numeric_answer(
+        str(committed.get("question", "")), _answer_of(rederived), _compute_steps(rederived))
+    if not rederived_contract.passed:
+        conflicts = tuple("再実行: " + issue for issue in rederived_contract.issues)
+        return ExecComparison(
+            EXEC_CONFLICT, False,
+            "独立再実行が質問の量の定義/単位/丸め契約に違反(EVIDENCE_CONFLICT) — "
+            + " / ".join(conflicts),
+            conflicts=conflicts,
         )
 
     conflicts: list[str] = []

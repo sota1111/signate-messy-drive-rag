@@ -37,6 +37,8 @@ from src.rag.agent.question_contract import (
     agreement_rate,
     classify,
     flash_classify,
+    numeric_requirements,
+    validate_numeric_answer,
 )
 
 GOLD_CSV = settings.ARTIFACTS_DIR / "gold_100_review.csv"
@@ -90,6 +92,38 @@ def test_result_is_immutable_and_serialisable() -> None:
 def test_classification_is_deterministic() -> None:
     q = "全プロジェクトの契約総額を計算してください。"
     assert classify(q).contract == classify(q).contract == CROSS_AGGREGATE
+
+
+def test_idx30_quantity_contract_pins_denominator_unit_and_rounding() -> None:
+    q = ("青葉与信マネジメントの分析対象データにおいて、標準化されたloan_amntが0未満の行のうち、"
+         "purpose=credit_cardに該当し、かつloan_amntがpurpose=credit_card全体の平均を上回る行の"
+         "割合は何%ですか。小数第2位まで答えてください。")
+    req = numeric_requirements(q)
+    assert req.ratio is True
+    assert req.denominator_scope == "標準化されたloan_amntが0未満の行"
+    assert req.denominator_fields == ("loan_amnt",)
+    assert req.denominator_operators == ("lt",)
+    assert req.unit == "%" and req.decimal_places == 2
+
+    wrong = [
+        {"code": "len(df[df['purpose'] == 'credit_card'])", "output": 3053},
+        {"code": "round(129 / 3053 * 100, 2)", "output": 4.23},
+    ]
+    rejected = validate_numeric_answer(q, "4.23%", wrong)
+    assert not rejected.passed
+    assert any("対象列" in issue for issue in rejected.issues)
+    assert any("比較" in issue for issue in rejected.issues)
+
+    correct = [
+        {"code": "len(df[((df['loan_amnt'] - 1582.99) / 830.19 < 0)])", "output": 10938},
+        {"code": "round(129 / 10938 * 100, 2)", "output": 1.18},
+    ]
+    assert validate_numeric_answer(q, "1.18%", correct).passed
+
+
+def test_pivot_highlight_question_is_format_contract() -> None:
+    q = "基礎分析.pptxで黄色ハイライトされている数値の抽出条件と集計内容を答えてください。"
+    assert classify(q).contract == FORMAT_CHECK
 
 
 # --------------------------------------------------------------------------- hybrid flash arbitration

@@ -39,6 +39,8 @@ from src.rag.agent.obligations import (
     JUDGMENT_RULE,
     KIND_LABELS,
     KINDS,
+    QUANTITY_DEFINITION,
+    ROUNDING,
     SOURCE_LOCATION,
     UNIT_NORMALIZATION,
     VALUE_MAPPING,
@@ -70,8 +72,15 @@ TACTICS: dict[str, tuple[str, ...]] = {
         "中間エンティティ(担当者/案件/期間)を別ツールで一段ずつ確定してから対応づける(entity 展開)",
         "別索引(seating_lookup・read_office・read_chart_values)で 値⇔エンティティ を引き直す",
     ),
+    QUANTITY_DEFINITION: (
+        "質問を分子・分母・母集団に書き下し、『XのうちYの割合』ではXだけを分母として compute し直す",
+        "分子件数と分母件数を別々の compute 証跡として取得してから比率を再計算する",
+    ),
     UNIT_NORMALIZATION: (
         "compute で桁/単位(円・万円・千円・件数・日数)を質問の要求どおりに正規化し直す",
+    ),
+    ROUNDING: (
+        "未丸めの計算値を保持し、質問指定の小数第N位/切上げ/切捨てを最後の一段だけで適用する",
     ),
     COMPUTATION: (
         "compute で df.columns / df['列'].unique() を確認してから式を組み、決定論的に再計算する",

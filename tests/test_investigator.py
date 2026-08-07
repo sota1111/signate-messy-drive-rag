@@ -284,6 +284,46 @@ def test_submit_answer_terminates_before_other_calls_in_same_step():
     assert sink == []  # trailing compute never ran
 
 
+def test_numeric_contract_rejects_wrong_denominator_before_commit(tmp_path: Path):
+    q = ("標準化されたloan_amntが0未満の行のうち、purpose=credit_cardでloan_amntが平均を"
+         "上回る行の割合は何%ですか。小数第2位まで答えてください。")
+    outputs = {
+        "len(df[df['purpose'] == 'credit_card'])": 3053,
+        "round(129 / 3053 * 100, 2)": 4.23,
+        "len(df[df['loan_amnt'] < 1582.99])": 10938,
+        "round(129 / 10938 * 100, 2)": 1.18,
+    }
+
+    def compute(expr):
+        return {
+            "value": outputs[expr],
+            "evidence": {"file": "train.csv", "columns_used": ["loan_amnt", "purpose"],
+                         "rows": 17500},
+            "method": {"code": expr, "trace": {"input_rows": 17500}},
+        }
+
+    tool = AgentTool(
+        "compute", "d",
+        {"type": "object", "properties": {"expr": {"type": "string"}}, "required": ["expr"]},
+        compute,
+    )
+    model = ScriptedModel([
+        Step(function_calls=(Call("compute", {"expr": "len(df[df['purpose'] == 'credit_card'])"}),)),
+        Step(function_calls=(Call("compute", {"expr": "round(129 / 3053 * 100, 2)"}),)),
+        _submit("4.23%"),  # internally consistent arithmetic, wrong denominator population
+        Step(function_calls=(Call("compute", {"expr": "len(df[df['loan_amnt'] < 1582.99])"}),)),
+        Step(function_calls=(Call("compute", {"expr": "round(129 / 10938 * 100, 2)"}),)),
+        _submit("1.18%"),
+    ])
+    result = investigate(
+        model, q, [tool, inv.SUBMIT_ANSWER_TOOL], max_turns=8,
+        calc_ledger=tmp_path / "calc.jsonl", contract="numeric")
+    assert result.answer.answer == "1.18%"
+    delivered = [response for turn in model.calls_seen if turn for response in turn]
+    assert any(response.name == SUBMIT_ANSWER
+               and response.response.get("answer_rejected") is True for response in delivered)
+
+
 # --------------------------------------------------------------------------- batch loop (acceptance)
 def _factory_for(answers: dict[str, str]):
     """A model factory that answers each question in one turn via submit_answer."""

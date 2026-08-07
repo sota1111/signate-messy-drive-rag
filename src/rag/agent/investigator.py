@@ -377,7 +377,10 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
         ),
         AgentTool(
             "pptx_pivot",
-            "pptxに埋め込まれたPivotTable(EMF)を復元し、表とハイライトされたセルを返す。",
+            "pptxに埋め込まれたPivotTable(EMF)を復元し、表とハイライトされたセルを返す。"
+            "同一案件の元データと全表示セルを照合して semantics(行フィールド/列フィールド/対象列/集計方法)を"
+            "意味解決し、各セルに filters・target_column・aggregation_label・semantic_summary を付ける。"
+            "ピボット回答は生ラベルや値だけでなく semantic_summary の抽出条件+対象列+集計方法を必ず含める。",
             _obj({"file": _STR}, ["file"]),
             lambda file: extract_pptx_pivots(file),
         ),
@@ -615,6 +618,33 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
             tool_calls.append(call.name)
             if call.name == SUBMIT_ANSWER:
                 candidate = _answer_from_args(call.args)
+                # SOT-2508 — a numeric answer is not complete merely because a number was computed.
+                # Enforce the question's quantity definition / unit / rounding contract against the
+                # observed compute trail *before* accepting the terminal answer.  This catches the
+                # classic ``XのうちYの割合`` denominator swap (e.g. using Y as the denominator) even
+                # when the arithmetic itself is internally consistent and high-confidence.  The check
+                # is active on the production path where the calc ledger is enabled; callers that
+                # deliberately disable calc observation retain the historical byte-identical loop.
+                if (contract == "numeric" and calc_signals is not None
+                        and not is_abstain(candidate.answer)):
+                    from src.rag.agent import question_contract as _question_contract
+
+                    numeric_check = _question_contract.validate_numeric_answer(
+                        question, candidate.answer, calc_signals.steps)
+                    if not numeric_check.passed:
+                        responses.append(ToolResponse(SUBMIT_ANSWER, {
+                            "answer_rejected": True,
+                            "reason": "量の定義・単位・丸めの証拠義務が未充足です。",
+                            "issues": list(numeric_check.issues),
+                            "directive": (
+                                "回答を確定せず、質問が要求する量を分子・分母・母集団へ書き下してください。"
+                                "『XのうちYの割合』ではXだけを分母として別computeで件数を取得し、"
+                                "分子件数/分母件数/未丸め値/指定単位/最後の丸めをmethodに明記して再計算すること。"
+                                "再計算できなければ推測せず棄権してください。"
+                            ),
+                        }))
+                        dispatched_tool = True
+                        break
                 # SOT-2500 — full-enumeration closure protocol: for a full_enumeration contract, a
                 # deliberate abstain is intercepted once and the closure *procedure* (権威的母集団の特定 →
                 # 閉包条件ゲート → 列挙順序) is fed back so completeness is proven before an abstain is
@@ -843,10 +873,18 @@ def answer_question(question: str, *, model: str | None = None,
     system: str | None = None
     contract: str | None = None
     if routing not in (None, False):
+        from src.rag.agent import question_contract as _question_contract
         from src.rag.agent import routing as _routing  # lazy: keeps import free of the classifier deps
         qc = _routing.classify_for_routing(question, flash=contract_flash)
         system = _routing.routed_system_prompt(SYSTEM_PROMPT, qc, question)
         contract = qc.contract
+        # Ratio contracts need separate numerator/denominator computations plus final unit/rounding
+        # validation.  Preserve the global cap for all other questions, but allow four bounded extra
+        # turns when the caller kept the default so a correct re-computation can finish after one
+        # rejected contract-violating submission (SOT-2508 focused cycle 1 root cause).
+        if (contract == "numeric" and max_turns == DEFAULT_MAX_TURNS
+                and _question_contract.numeric_requirements(question).ratio):
+            max_turns += 4
     model_obj = gemini_model_factory(question, tools, model=model, system=system)
     return investigate(model_obj, question, tools, max_turns=max_turns, timeout_s=timeout_s,
                        ledger=ledger, calc_ledger=calc_ledger, research=research,

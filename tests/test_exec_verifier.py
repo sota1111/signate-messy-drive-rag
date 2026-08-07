@@ -152,6 +152,33 @@ def test_same_number_different_unit_is_conflict():
     assert cmp.category == EXEC_CONFLICT and any("単位の相違" in c for c in cmp.conflicts)
 
 
+def test_idx30_wrong_denominator_is_quantity_definition_conflict():
+    q = ("青葉与信マネジメントの分析対象データにおいて、標準化されたloan_amntが0未満の行のうち、"
+         "purpose=credit_cardに該当し、かつloan_amntがpurpose=credit_card全体の平均を上回る行の"
+         "割合は何%ですか。小数第2位まで答えてください。")
+    committed = _record(
+        "4.23%", question=q, columns=("loan_amnt", "purpose"), input_rows=17500,
+        code=("len(df[(df['loan_amnt'] < 1582.99) & (df['purpose'] == 'credit_card') & "
+              "(df['loan_amnt'] > 1540.84)]) / len(df[df['purpose'] == 'credit_card']) * 100"))
+    rederived = _record(
+        "1.18%", question=q, columns=("loan_amnt", "purpose"), input_rows=17500,
+        code=("len(df[(df['loan_amnt'] < 1582.99) & (df['purpose'] == 'credit_card') & "
+              "(df['loan_amnt'] > 1540.84)]) / len(df[df['loan_amnt'] < 1582.99]) * 100"))
+    cmp = compare_execution(committed, rederived)
+    assert cmp.category == EXEC_CONFLICT and cmp.should_abstain
+    assert any("量の定義" in issue for issue in cmp.conflicts)
+
+
+def test_question_unit_and_rounding_are_mandatory_axes():
+    q = "対象行の割合は何%ですか。小数第2位まで答えてください。"
+    committed = _record("1.2", question=q, code="12 / 1000 * 100")
+    rederived = _record("1.20%", question=q, code="12 / 1000 * 100")
+    cmp = compare_execution(committed, rederived)
+    assert cmp.category == EXEC_CONFLICT
+    assert any("単位" in issue for issue in cmp.conflicts)
+    assert any("丸め" in issue for issue in cmp.conflicts)
+
+
 # --------------------------------------------------------------------------- 暗算 / 決着不能
 def test_ungrounded_committed_cannot_be_confirmed():
     committed = _record("42", grounded=False)          # 暗算: no compute証跡

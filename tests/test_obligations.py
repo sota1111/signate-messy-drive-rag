@@ -25,6 +25,8 @@ from src.rag.agent.obligations import (
     CONSISTENCY,
     ENUMERATION,
     JUDGMENT_RULE,
+    QUANTITY_DEFINITION,
+    ROUNDING,
     SOURCE_LOCATION,
     UNIT_NORMALIZATION,
     VALUE_MAPPING,
@@ -128,12 +130,16 @@ def test_satisfaction_via_explicit_evidence_kinds() -> None:
 def test_satisfaction_via_text_cue_fallback() -> None:
     oset = decompose("着手金と検収金の差額はいくらですか。")  # numeric: source/value/computation/unit
     # Free-text investigator evidence, no explicit kinds — cues must discharge the matching kinds.
-    evidence = "提案書.pptx のスライド5から着手金=40万円・検収金=60万円を取得し、差額=20万円と計算した"
+    evidence = ("提案書.pptx のスライド5から着手金=40万円・検収金=60万円を取得し、"
+                "量の定義は検収金を分子・着手金を差し引く対象として差額=20万円と計算した。"
+                "小数指定なしのため丸めなし。")
     checked = oset.check(evidence)
     by_kind = {o.kind: o.status for o in checked.obligations}
     assert by_kind[SOURCE_LOCATION] == MET      # ".pptx"/スライド cue
     assert by_kind[COMPUTATION] == MET          # 差額/計算 cue
     assert by_kind[UNIT_NORMALIZATION] == MET   # 万円 cue
+    assert by_kind[QUANTITY_DEFINITION] == MET  # 分子 cue
+    assert by_kind[ROUNDING] == MET              # 丸め cue
     assert by_kind[VALUE_MAPPING] == MET        # "=" cue
     assert checked.all_met
 
