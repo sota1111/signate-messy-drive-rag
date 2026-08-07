@@ -103,7 +103,8 @@ CONTRACT_OBLIGATIONS: dict[str, tuple[tuple[str, str], ...]] = {
     ),
     qc.CHART_READ: (
         (SOURCE_LOCATION, "対象グラフ(図番号/シート/系列)を一意に特定する"),
-        (VALUE_MAPPING, "軸・系列・座標から値を読み取る"),
+        (VALUE_MAPPING, "numCacheまたは対応する元データ列から値を厳密に対応づける"),
+        (COMPUTATION, "numCacheが無い場合は元データからグラフ集計を決定論的に再導出する"),
         (UNIT_NORMALIZATION, "読取値の桁数/単位を質問の要求に合わせる"),
     ),
     qc.SPATIAL: (

@@ -88,6 +88,16 @@ def test_route_hint_for_numeric_prefers_canonical_route():
     assert "一律" in hint or "chunk" in hint
 
 
+def test_chart_route_forbids_vision_numeric_evidence():
+    q = "AG_ratioのヒストグラムで最も多いカウント数はいくつですか。"
+    contract = qc.classify(q)
+    assert contract.contract == qc.CHART_READ
+    assert routing.first_tools_for(contract, q) == ("read_chart_values",)
+    hint = routing.route_hint(contract, q)
+    assert "operation='histogram_max_count'" in hint
+    assert "画像から読んだ数値では回答を確定しない" in hint
+
+
 def test_negative_correlation_hint_excludes_target_by_name_before_argmin():
     q = "顧客データにおいて、目的変数と最も強い負の相関を持つカラムは何ですか。"
     contract = qc.classify(q)

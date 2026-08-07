@@ -43,7 +43,7 @@ CONTRACT_FIRST_TOOLS: dict[str, tuple[str, ...]] = {
     _qc.CROSS_AGGREGATE: ("corpus_aggregate", "canonical_route"),
     _qc.FULL_ENUMERATION: ("file_grep", "find_files", "corpus_aggregate"),
     _qc.FORMAT_CHECK: ("highlight_extract", "pdf_emphasis", "read_office"),
-    _qc.CHART_READ: ("read_chart_values", "caption_image"),
+    _qc.CHART_READ: ("read_chart_values",),
     _qc.SPATIAL: ("seating_lookup",),
     _qc.VERSION_DIFF: ("version_diff",),
     _qc.NUMERIC: ("canonical_route", "compute"),
@@ -178,6 +178,12 @@ def route_hint(contract: QuestionContract, question: str) -> str:
         lines.append(
             "回答表面の必須形式は人名のフルネームのみ。根拠説明、所属、役割、敬称（様/氏）を"
             "回答欄へ足さず、抽出した氏名を原文表記のまま返す。")
+    if contract.contract == _qc.CHART_READ:
+        lines.append(
+            "グラフ数値はread_chart_valuesのnumCacheまたは元データ再集計だけを根拠にする。"
+            "ヒストグラム最多件数は対象列をcolumn、operation='histogram_max_count'として呼ぶ。"
+            "caption_image/visionは所在・軸ラベル確認専用で、画像から読んだ数値では回答を確定しない。"
+            "厳密経路が無ければ棄権する。")
     if contract.completion_conditions:
         checklist = "".join(f"\n  - {c}" for c in contract.completion_conditions)
         lines.append("回答を確定してよい完了条件(満たすまで棄権しない):" + checklist)

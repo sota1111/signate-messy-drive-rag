@@ -119,6 +119,44 @@ def test_dispatch_runs_real_compute_on_temp_csv(tmp_path: Path):
     assert out["method"]["engine"] == "pandas"
 
 
+def test_chart_contract_rejects_numeric_submit_without_strict_chart_evidence():
+    model = ScriptedModel([
+        _submit("1473", evidence="caption_image", method="vision"),
+        _submit(ABSTAIN, confidence=0.0),
+    ])
+    res = investigate(
+        model, "AG_ratioのヒストグラムで最も多いカウントは。",
+        [inv.SUBMIT_ANSWER_TOOL], max_turns=3, contract="chart_read")
+    assert res.answer.answer == ABSTAIN
+    assert model.calls_seen[1][0].response["answer_rejected"] is True
+    assert "厳密証拠" in model.calls_seen[1][0].response["reason"]
+
+
+def test_chart_contract_accepts_numcache_or_source_compute_evidence():
+    strict = AgentTool(
+        "read_chart_values", "strict", {"type": "object", "properties": {}},
+        lambda **_kw: {
+            "value": {"result": 958}, "evidence": {"source_range": "train!K2:K3501"},
+            "method": {"engine": "chart_source_compute", "numeric_authority": True,
+                       "vision_used": False},
+        })
+    model = ScriptedModel([
+        Step(function_calls=(Call("read_chart_values", {}),)),
+        _submit("958", evidence="train!K2:K3501", method="chart_source_compute"),
+    ])
+    res = investigate(
+        model, "AG_ratioのヒストグラムで最も多いカウントは。",
+        [strict, inv.SUBMIT_ANSWER_TOOL], max_turns=3, contract="chart_read")
+    assert res.answer.answer == "958"
+
+
+def test_chart_contract_free_text_without_strict_evidence_abstains():
+    model = ScriptedModel([Step(function_calls=(), final_text="958")])
+    res = investigate(model, "グラフの値は。", [inv.SUBMIT_ANSWER_TOOL],
+                      max_turns=1, contract="chart_read")
+    assert res.answer.answer == ABSTAIN
+
+
 def test_version_diff_tool_abstains_on_non_diff_question():
     # a plain retrieval question is NOT a diff question → contract value None, applicable False,
     # and the differ is never invoked (no guess).

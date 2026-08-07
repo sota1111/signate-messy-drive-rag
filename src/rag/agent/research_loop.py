@@ -102,7 +102,8 @@ _TOOL_KINDS: dict[str, frozenset[str]] = {
     "read_office": frozenset({VALUE_MAPPING, SOURCE_LOCATION}),
     "decrypt": frozenset({SOURCE_LOCATION}),
     "read_chart_values": frozenset({VALUE_MAPPING, UNIT_NORMALIZATION}),
-    "caption_image": frozenset({VALUE_MAPPING}),
+    # vision may locate a chart / confirm an axis label, but never discharges numeric value mapping.
+    "caption_image": frozenset({SOURCE_LOCATION}),
     "pdf_emphasis": frozenset({JUDGMENT_RULE}),
     "pptx_pivot": frozenset({VALUE_MAPPING, ENUMERATION}),
     "highlight_extract": frozenset({JUDGMENT_RULE, ENUMERATION}),

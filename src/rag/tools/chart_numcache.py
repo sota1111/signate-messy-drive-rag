@@ -27,11 +27,18 @@ corpus-relative reference), and resolves NFD-on-disk names NFC-aware like the re
 """
 from __future__ import annotations
 
+import hashlib
+import io
+import math
 import re
+import statistics
 import zipfile
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
+
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 from src.rag.corpus import FileRef, nfc
 from src.rag.tools import contract
@@ -314,3 +321,243 @@ def series_values(file: str | Path | FileRef | bytes | bytearray, *,
         if want is None or (s.get("name") and nfc(str(s["name"])) == want):
             return s.get("values", [])
     return []
+
+
+# --------------------------------------------------------------------------- raster-chart source fallback
+# Excel's automatic histogram bin width follows Scott's normal reference rule.  The source workbooks
+# persist the displayed interval width to three decimal places; using the unrounded NumPy ``bins=10``
+# default is a different chart and was the direct cause of SOT-2507 (1473 instead of the plotted 958).
+_ID_HEADERS = frozenset({"id", "index", "row_id", "record_id"})
+
+
+def _image_anchor(image: Any) -> tuple[int, int]:
+    """Return an embedded image's zero-based ``(row, column)`` anchor, fail-closed when unavailable."""
+    anchor = getattr(image, "anchor", None)
+    marker = getattr(anchor, "_from", None)
+    if marker is None:
+        raise ContractError("embedded chart image has no worksheet anchor")
+    return int(marker.row), int(marker.col)
+
+
+def _header_row(ws: Any) -> tuple[int, list[Any]] | None:
+    """Find a table header near the top of a worksheet.
+
+    A source table must have at least two non-empty string headers.  Ranking by header coverage and
+    data-row count makes the real ``train`` sheet win over auxiliary pivot/output sheets without using
+    a corpus-specific sheet name.
+    """
+    best: tuple[int, int, list[Any]] | None = None
+    for row_idx in range(1, min(int(ws.max_row), 20) + 1):
+        values = [ws.cell(row_idx, c).value for c in range(1, int(ws.max_column) + 1)]
+        strings = sum(isinstance(v, str) and bool(v.strip()) for v in values)
+        nonempty = sum(v is not None and bool(str(v).strip()) for v in values)
+        if strings < 2:
+            continue
+        score = nonempty * 10_000 + min(max(int(ws.max_row) - row_idx, 0), 9_999)
+        if best is None or score > best[0]:
+            best = (score, row_idx, values)
+    return (best[1], best[2]) if best is not None else None
+
+
+def _source_columns(ws: Any, header_row: int, headers: list[Any]) -> list[tuple[int, str]]:
+    """Numeric columns represented by a histogram grid, preserving source-table order.
+
+    Chart sheets commonly include a numeric target (for example a binary 0/1 outcome) but omit text
+    features, so target-name heuristics are unsafe.  Inspecting the cells makes the mapping portable.
+    """
+    out: list[tuple[int, str]] = []
+    for col_idx, raw in enumerate(headers, 1):
+        if raw is None or not str(raw).strip():
+            continue
+        name = nfc(str(raw).strip())
+        folded = name.casefold()
+        if folded in _ID_HEADERS:
+            continue
+        sample = [ws.cell(row, col_idx).value
+                  for row in range(header_row + 1, min(int(ws.max_row), header_row + 200) + 1)]
+        present = [v for v in sample if v is not None and str(v).strip()]
+        numeric = [v for v in present
+                   if isinstance(v, (int, float)) and not isinstance(v, bool)
+                   and math.isfinite(float(v))]
+        if not present or len(numeric) / len(present) < 0.8:
+            continue
+        out.append((col_idx, name))
+    return out
+
+
+def embedded_chart_sources(file: str | Path | FileRef | bytes | bytearray) -> list[dict[str, Any]]:
+    """Map raster charts in an xlsx chart sheet to their authoritative source-table columns.
+
+    Some workbooks flatten every histogram to PNG, leaving no ``c:numCache`` at all.  Their chart grid
+    and source table retain the same feature order.  This function resolves that relationship only when
+    it is unambiguous: one ordered image per non-ID numeric source column.  A mismatch raises instead
+    of guessing.  Each mapping includes the image's decoded-byte SHA-256 so the chart artifact is pinned
+    and auditable, but pixel text is never used as numeric evidence.
+    """
+    data, label, is_office = _read_source(file)
+    if not is_office:
+        raise ContractError("raster chart source mapping requires an xlsx Office package")
+
+    try:
+        wb = load_workbook(io.BytesIO(data), data_only=True, read_only=False)
+    except Exception as exc:  # noqa: BLE001 - normalize parser failures to the tool contract
+        raise ContractError(f"{label}: cannot open workbook for chart source mapping: {exc}") from None
+
+    images: list[tuple[int, int, str, str, str]] = []
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        media_by_hash = {
+            hashlib.sha256(zf.read(member)).hexdigest(): member
+            for member in zf.namelist() if member.startswith("xl/media/")
+        }
+    for ws in wb.worksheets:
+        for image in getattr(ws, "_images", ()):
+            row, col = _image_anchor(image)
+            blob = image._data()  # openpyxl exposes the original embedded bytes; no OCR/vision involved
+            digest = hashlib.sha256(blob).hexdigest()
+            images.append((row, col, ws.title, media_by_hash.get(digest, "<embedded-image>"), digest))
+    if not images:
+        raise ContractError(f"{label}: no embedded chart images found")
+    images.sort(key=lambda item: (item[0], item[1]))
+
+    candidates: list[tuple[int, Any, int, list[Any]]] = []
+    image_sheets = {item[2] for item in images}
+    for ws in wb.worksheets:
+        if ws.title in image_sheets:
+            continue
+        header = _header_row(ws)
+        if header is None:
+            continue
+        row_idx, headers = header
+        score = len(_source_columns(ws, row_idx, headers)) * 10_000 + min(int(ws.max_row), 9_999)
+        candidates.append((score, ws, row_idx, headers))
+    if not candidates:
+        raise ContractError(f"{label}: no source data table found for embedded charts")
+    _score, source_ws, header_row, headers = max(candidates, key=lambda item: item[0])
+    columns = _source_columns(source_ws, header_row, headers)
+    if len(columns) != len(images):
+        raise ContractError(
+            f"{label}: ambiguous image/source mapping ({len(images)} images, {len(columns)} feature columns)")
+
+    last_row = int(source_ws.max_row)
+    out: list[dict[str, Any]] = []
+    for (row, col, chart_sheet, member, digest), (source_col, column) in zip(images, columns):
+        letter = get_column_letter(source_col)
+        out.append({
+            "member": member,
+            "pixel_sha256": digest,
+            "chart_sheet": nfc(chart_sheet),
+            "anchor": {"row": row, "column": col},
+            "source_sheet": nfc(source_ws.title),
+            "source_column": column,
+            "source_range": f"{nfc(source_ws.title)}!${letter}${header_row + 1}:${letter}${last_row}",
+            "source_column_index": source_col,
+        })
+    return out
+
+
+def _scott_histogram(values: list[float]) -> tuple[list[int], list[str], float]:
+    """Recompute an Excel-style automatic histogram from source values (Scott width, no pixels)."""
+    clean = [float(v) for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)
+             and math.isfinite(float(v))]
+    if len(clean) < 2 or min(clean) == max(clean):
+        raise ContractError("histogram source column needs at least two distinct numeric values")
+    raw_width = 3.5 * statistics.pstdev(clean) * (len(clean) ** (-1.0 / 3.0))
+    # The workbook chart generator stores automatic widths at three decimal places.  If a very small
+    # scale would round to zero, retain three significant digits instead of manufacturing an invalid bin.
+    width = round(raw_width, 3)
+    if width <= 0:
+        width = float(f"{raw_width:.3g}")
+    start = min(clean)
+    n_bins = max(1, math.ceil((max(clean) - start) / width))
+    counts = [0] * n_bins
+    for value in clean:
+        idx = min(int((value - start) / width), n_bins - 1)
+        counts[idx] += 1
+    categories = []
+    for idx in range(n_bins):
+        left = start + idx * width
+        right = left + width
+        categories.append(f"{'[' if idx == 0 else '('}{left:.12g}, {right:.12g}]")
+    return counts, categories, width
+
+
+def read_chart_values(file: str | Path | FileRef | bytes | bytearray, *,
+                      column: str | None = None,
+                      operation: str | None = None) -> dict[str, Any]:
+    """Strict numeric chart path: numCache first, otherwise source-table recomputation.
+
+    ``vision`` is intentionally absent.  Raster charts are numeric-authoritative only when their image
+    maps unambiguously to a source column and the requested statistic can be recomputed from those cells.
+    ``operation='histogram_max_count'`` returns the maximum bin count as ``value.result`` while retaining
+    the full bin ledger.  Unsupported/ambiguous cases raise so callers abstain rather than commit pixels.
+    """
+    try:
+        exact = extract_chart_numcache(file)
+    except ContractError:
+        exact = None
+    if exact is not None:
+        exact["method"]["numeric_authority"] = True
+        exact["method"]["vision_used"] = False
+        return exact
+
+    if not column:
+        raise ContractError("embedded-image chart requires source column for deterministic recomputation")
+    op = operation or "histogram"
+    if op not in {"histogram", "histogram_max_count"}:
+        raise ContractError(f"unsupported raster chart operation: {op}")
+    mappings = embedded_chart_sources(file)
+    want = nfc(column).casefold()
+    matches = [m for m in mappings if m["source_column"].casefold() == want]
+    if len(matches) != 1:
+        raise ContractError(f"source column not uniquely mapped to an embedded chart: {column}")
+    mapping = matches[0]
+
+    data, label, _is_office = _read_source(file)
+    wb = load_workbook(io.BytesIO(data), data_only=True, read_only=False)
+    ws = wb[mapping["source_sheet"]]
+    source_col = int(mapping["source_column_index"])
+    values = [ws.cell(row, source_col).value for row in range(2, int(ws.max_row) + 1)]
+    counts, categories, width = _scott_histogram(values)
+    series = {
+        "name": mapping["source_column"],
+        "categories": categories,
+        "values": counts,
+        "x_values": [], "y_values": [], "bubble_sizes": [],
+        "value_formula": mapping["source_range"],
+        "cat_formula": None,
+        "format_code": "count",
+        "source_sheet": mapping["source_sheet"],
+        "source_range": mapping["source_range"],
+        "bin_width": width,
+        "derivation": "Scott normal reference rule over source cells",
+    }
+    result = max(counts) if op == "histogram_max_count" else counts
+    value = {
+        "charts": [{
+            "member": mapping["member"],
+            "chart_types": ["imageHistogram"],
+            "pixel_sha256": mapping["pixel_sha256"],
+            "series": [series],
+        }],
+        "n_charts": 1,
+        "n_series": 1,
+        "operation": op,
+        "result": result,
+    }
+    return contract.make(
+        value,
+        engine="chart_source_compute",
+        evidence={
+            "file": label,
+            "member": mapping["member"],
+            "pixel_sha256": mapping["pixel_sha256"],
+            "source_sheet": mapping["source_sheet"],
+            "source_column": mapping["source_column"],
+            "source_range": mapping["source_range"],
+            "n_rows": sum(counts),
+            "bin_width": width,
+        },
+        nfc=True,
+        numeric_authority=True,
+        vision_used=False,
+    )
