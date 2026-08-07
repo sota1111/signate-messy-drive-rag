@@ -16,9 +16,12 @@ Gemini Vision 構造抽出へ送る。xlsx はフェーズ等のグルーピン�
 | 2 | 通信上の棄権 | `監視ダッシュボード構築（別契約）` の原文へ到達 | T27 正答 | 解決済み版差分の棄権禁止、Vision の役割限定を強化 |
 | 3 | 差分解決後の再送 error | 対象原文へ到達（隣接項目を含む） | T27 正答 | 版差分を直接確定、Vision を最小候補の構造出力へ変更 |
 
-上限3 cycleで探索を終了した。最終決定論出力は idx0 が
+上限3 cycleで探索を終了した。生成済み回答の正式 focused 採点は cycle 1 が
+match 0 / abstain 1 / wrong 2、cycle 2・3 がそれぞれ match 1 / abstain 1 / wrong 1 であり、
+3問同時 match の受け入れ条件は未達だった。cycle 3 後の最終決定論出力は idx0 が
 `スライド6 追加：4.1 データ理解・品質確認〜4.5 ガバナンス・監査対応 の各フェーズの作業内容を追加`
-となり、idx89 は実 xlsx の phase 6 最終開始タスク `最終報告・成果物提出・検収会` を返す。
+となり、idx89 は実 xlsx の phase 6 最終開始タスク `最終報告・成果物提出・検収会` を返すが、
+上限を超える cycle 4 は実行していない。
 
 ## Changed Files
 
@@ -31,6 +34,8 @@ Gemini Vision 構造抽出へ送る。xlsx はフェーズ等のグルーピン�
 ## Verification
 
 - Focused contract/regression tests: 134 passed.
+- Formal focused scoring: cycle 1 = 0/1/2、cycle 2 = 1/1/1、cycle 3 = 1/1/1
+  （match / abstain / wrong、受け入れ条件未達）。
 - Full pytest: 748 passed, 7 non-fatal openpyxl WMF warnings.
 - Python compile check (`src`, `scoring`, `tests`): PASS.
 - `git diff --check`: PASS.
@@ -43,18 +48,20 @@ Gemini Vision 構造抽出へ送る。xlsx はフェーズ等のグルーピン�
 - [x] 版差分質問は回答確定前に全スライド/全シートの決定論比較を実行し、解決値をそのまま確定する。
 - [x] 「明記」は条件語と候補が同一箇所に literal 共起しない候補を拒否する。
 - [x] xlsx の結合/空欄グループ列を前方補完し、通常列の空欄から値を捏造しない。
-- [x] idx0/52/89 の誤選択原因を一般則で修正し、特定回答を production code にハードコードしていない。
+- [x] idx0/52/89 の誤選択原因へ一般則を実装し、特定回答を production code にハードコードしていない。
 - [x] Gemini-only investigator 経路を維持した。
 - [x] Gold-100 品質閾値と既存 match 非誤答化を満たした。
+- [ ] idx0/52/89 が同一 focused cycle で全件 match（3 cycle以内）。
 
 ## Remaining Issues
 
 Gold-100 の idx52 は全件並列時に broad search が timeout して安全棄権した。最終変更では literal 質問を
-`find_files → caption_image` 優先へ変更し、誤答 commit は literal gate で防止する。追加の Gold-100 は
-「一度だけ」の制約に従い実行していない。
+`find_files → caption_image` 優先へ変更したが、focused 上限到達後のため再生成・再採点していない。
+PR #73 は受け入れ未達のためマージせずクローズし、ブランチを保持する。次へ進むには、追加 focused cycle を
+許可するか、全体 Gold 閾値通過をもって受け入れるかの人判断が必要。
 
 ## Linear Report: POSTED
 
-## Acceptance: PASS
+## Acceptance: FAIL
 
-## Next Action: READY_FOR_REVIEW
+## Next Action: NEEDS_USER_INPUT
