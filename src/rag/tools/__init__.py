@@ -44,7 +44,9 @@ from src.rag.tools.emf_pivot import (
 from src.rag.tools.chart_numcache import (
     chart_series,
     chart_xml_members,
+    embedded_chart_sources,
     extract_chart_numcache,
+    read_chart_values,
     series_values,
 )
 from src.rag.tools.canonical_route import (
@@ -102,6 +104,8 @@ __all__ = [
     "extract_chart_numcache",
     "chart_series",
     "chart_xml_members",
+    "embedded_chart_sources",
+    "read_chart_values",
     "series_values",
     "canonical_route",
     "CanonicalRouteError",

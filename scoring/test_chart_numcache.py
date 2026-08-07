@@ -24,8 +24,10 @@ from src.rag.tools import (
     ContractError,
     chart_series,
     chart_xml_members,
+    embedded_chart_sources,
     extract_chart_numcache,
     is_contract,
+    read_chart_values,
     series_values,
 )
 
@@ -209,6 +211,64 @@ def test_chart_xml_members_finds_chart_in_xlsx():
     assert members and all(name.endswith(".xml") and "chart" in name for name, _ in members)
 
 
+# --------------------------------------------------------------------------- raster chart -> source-table fallback (SOT-2507)
+def _xlsx_with_raster_histograms() -> bytes:
+    """A chart sheet whose PNG order mirrors numeric source columns (text columns are not charted)."""
+    from PIL import Image as PILImage
+    from openpyxl.drawing.image import Image as XLImage
+
+    wb = openpyxl.Workbook()
+    charts = wb.active
+    charts.title = "Charts"
+    source = wb.create_sheet("source")
+    source.append(["id", "text_feature", "metric", "target"])
+    for idx, value in enumerate([0.1, 0.2, 0.21, 0.22, 0.4, 0.41], 1):
+        source.append([idx, f"row-{idx}", value, idx % 2])
+    # Numeric source order excluding id is metric -> target; anchor order is A1 -> H1.
+    streams = []
+    for color, anchor in [((20, 40, 60), "A1"), ((80, 100, 120), "H1")]:
+        stream = io.BytesIO()
+        PILImage.new("RGB", (24, 16), color).save(stream, format="PNG")
+        stream.seek(0)
+        streams.append(stream)  # keep alive until the workbook is serialized
+        charts.add_image(XLImage(stream), anchor)
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def test_embedded_chart_sources_maps_anchor_order_to_numeric_columns():
+    xlsx = _xlsx_with_raster_histograms()
+    mapped = embedded_chart_sources(xlsx)
+    assert [m["source_column"] for m in mapped] == ["metric", "target"]
+    assert mapped[0]["source_range"] == "source!$C$2:$C$7"
+    assert mapped[0]["pixel_sha256"] != mapped[1]["pixel_sha256"]
+
+
+def test_raster_histogram_is_recomputed_from_source_without_vision():
+    out = read_chart_values(
+        _xlsx_with_raster_histograms(), column="metric", operation="histogram_max_count")
+    assert is_contract(out)
+    assert out["method"] == {
+        "engine": "chart_source_compute", "nfc": True,
+        "numeric_authority": True, "vision_used": False,
+    }
+    assert out["value"]["result"] == max(out["value"]["charts"][0]["series"][0]["values"])
+    assert out["evidence"]["source_column"] == "metric"
+
+
+def test_raster_chart_without_column_fails_closed():
+    with pytest.raises(ContractError, match="requires source column"):
+        read_chart_values(_xlsx_with_raster_histograms())
+
+
+def test_unified_reader_keeps_numcache_as_first_authority(bar_xml: bytes):
+    out = read_chart_values(bar_xml)
+    assert out["method"]["engine"] == "chart_numcache"
+    assert out["method"]["numeric_authority"] is True
+    assert out["method"]["vision_used"] is False
+
+
 # --------------------------------------------------------------------------- input guards
 def test_non_chart_bytes_raise():
     with pytest.raises(ContractError):
@@ -237,6 +297,19 @@ def test_real_corpus_chart_numcache_smoke():
     # at least one series exposes a numeric plot value.
     assert any(isinstance(v, (int, float))
                for c in out["value"]["charts"] for s in c["series"] for v in s["values"])
+
+
+def test_real_corpus_idx10_raster_histogram_recomputes_958():
+    """Gold idx10: source-cell Scott bins reproduce the plotted maximum, not NumPy bins=10 (1473)."""
+    from src.rag.corpus import walk
+    ref = next((r for r in walk() if r.ext == "xlsx" and r.path.name == "train.xlsx"
+                and "かえで総合病院" in r.rel), None)
+    if ref is None:
+        pytest.skip("idx10 corpus workbook not present")
+    out = read_chart_values(ref, column="AG_ratio", operation="histogram_max_count")
+    assert out["value"]["result"] == 958
+    assert out["evidence"]["source_range"] == "train!$K$2:$K$3501"
+    assert out["method"]["vision_used"] is False
 
 
 def chart_xml_members_safe(ref) -> bool:

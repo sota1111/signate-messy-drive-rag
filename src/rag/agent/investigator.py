@@ -35,7 +35,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 from config import settings
 from src.rag.tools import contract as _contract
 from src.rag.tools.canonical_route import canonical_route
-from src.rag.tools.chart_numcache import extract_chart_numcache
+from src.rag.tools.chart_numcache import read_chart_values
 from src.rag.tools.compute_sandbox import run as compute_run
 from src.rag.tools.corpus_aggregate import corpus_aggregate
 from src.rag.tools.emf_pivot import extract_pptx_pivots
@@ -99,6 +99,10 @@ SYSTEM_PROMPT = (
     "2025-08-15〜09-07 に重なり40日超の案件を主略称で』=corpus_aggregate(metric='period_days', op='filter', "
     "overlap_start='2025-08-15', overlap_end='2025-09-07', min_days=40)。案件特定後の多段(その案件の担当者→"
     "内線 等)は返り値 staff(ES/PM…)の氏名を seating_lookup に渡して解決する。\n"
+    "6c. グラフの数値を問う場合は read_chart_values を必ず使う。系列/列名を column に、ヒストグラムの"
+    "最多カウントなら operation='histogram_max_count' を渡す。numCacheが無い画像グラフも元データ列から"
+    "決定論的に再集計される。caption_image はグラフの所在・軸ラベル確認にだけ使い、その画像説明中の数値を"
+    "answer/evidence/methodへ採用してはならない。read_chart_values が値を返せなければ推測せず棄権する。\n"
     "6. 十分な根拠が得られたら、最終回答は必ず submit_answer ツールを1回だけ呼んで返す(通常のテキストでは"
     "答えない)。submit_answer には次を渡す: answer=回答本文(値/一覧のみ、列挙は「、」区切り、金額は原文表記)、"
     "confidence=0.0〜1.0の自己確信度、evidence=根拠(参照ファイル・値・ツール結果)、method=導出手順の要約。\n"
@@ -359,13 +363,17 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
         ),
         AgentTool(
             "read_chart_values",
-            "xlsx/pptx埋め込みチャートのnumCacheから系列名・カテゴリ・プロット値を厳密に読む(推測なし)。",
-            _obj({"file": _STR}, ["file"]),
-            lambda file: extract_chart_numcache(file),
+            "xlsx/pptx埋め込みチャートの数値を厳密に読む。numCacheを最優先し、画像化されたxlsxヒストグラムは"
+            "columnで指定した元データ列から再集計する。最多カウントはoperation='histogram_max_count'。"
+            "vision数値は使用せず、厳密経路が無ければエラー=棄権。",
+            _obj({"file": _STR, "column": _STR, "operation": _STR}, ["file"]),
+            lambda file, column=None, operation=None: read_chart_values(
+                file, column=column, operation=operation),
         ),
         AgentTool(
             "caption_image",
-            "図表PNG画像をvisionモデルで説明する(numCacheが無い画像チャート向け)。",
+            "図表PNG画像をvisionモデルで説明する。チャートでは所在・系列名・軸ラベル確認専用で、"
+            "説明中の数値を回答根拠に使用してはならない。数値はread_chart_valuesで取得する。",
             _obj({"file": _STR}, ["file"]),
             lambda file: caption_figure(file),
         ),
@@ -588,6 +596,8 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     answer = Answer(answer=ABSTAIN, confidence=0.0)
     stop_reason = "max_turns"
     error: str | None = None
+    strict_chart_evidence = False
+    chart_guidance_sent = False
     start = clock()
 
     for _turn in range(max_turns):
@@ -607,6 +617,24 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
             # The model answered in free text without the terminal tool: accept it, but we have no
             # self-reported confidence, so record 0.0 and note the shortcut in ``method``.
             text = (step.final_text or "").strip() or ABSTAIN
+            if contract == "chart_read" and not strict_chart_evidence and not chart_guidance_sent:
+                # A first-turn prose answer/abstain is not evidence that the strict path is unavailable.
+                # Feed one bounded mandatory-tool directive back; if the model still cannot obtain strict
+                # evidence, its next abstain is accepted (never loop indefinitely).
+                responses = [ToolResponse(SUBMIT_ANSWER, {
+                    "answer_rejected": True,
+                    "reason": "グラフ数値はread_chart_valuesの厳密経路を試す前に確定・棄権できません。",
+                    "directive": (
+                        "対象xlsxをfind_files/canonical_routeで特定し、read_chart_values(file=..., "
+                        "column=..., operation='histogram_max_count')を実行してください。"
+                        "失敗した場合のみ棄権してください。"
+                    ),
+                })]
+                chart_guidance_sent = True
+                iterations += 1
+                continue
+            if contract == "chart_read" and not strict_chart_evidence and not is_abstain(text):
+                text = ABSTAIN
             answer = Answer(answer=text, confidence=0.0, method="(submit_answer未使用: 最終テキストを採用)")
             stop_reason = "answered"
             break
@@ -618,6 +646,21 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
             tool_calls.append(call.name)
             if call.name == SUBMIT_ANSWER:
                 candidate = _answer_from_args(call.args)
+                # SOT-2507 — chart pixels are never numeric authority.  A non-abstain chart answer may
+                # commit only after read_chart_values returned numCache or source-cell recomputation.
+                if (contract == "chart_read" and not is_abstain(candidate.answer)
+                        and not strict_chart_evidence):
+                    responses.append(ToolResponse(SUBMIT_ANSWER, {
+                        "answer_rejected": True,
+                        "reason": "グラフ数値の厳密証拠がありません。vision値では回答を確定できません。",
+                        "directive": (
+                            "read_chart_values(file=..., column=..., operation=...) を実行し、"
+                            "numCacheまたは元データ再集計のresultだけを採用してください。"
+                            "厳密経路が失敗した場合は棄権してください。"
+                        ),
+                    }))
+                    dispatched_tool = True
+                    break
                 # SOT-2508 — a numeric answer is not complete merely because a number was computed.
                 # Enforce the question's quantity definition / unit / rounding contract against the
                 # observed compute trail *before* accepting the terminal answer.  This catches the
@@ -682,6 +725,14 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 submitted = True
                 break
             out = dispatch(by_name, call.name, call.args)
+            if call.name == "read_chart_values" and _contract.is_contract(out):
+                method = out.get("method") or {}
+                strict_chart_evidence = (
+                    method.get("engine") in {"chart_numcache", "chart_source_compute"}
+                    and method.get("numeric_authority") is True
+                    and method.get("vision_used") is False
+                    and out.get("value") not in (None, "", [], {})
+                )
             responses.append(ToolResponse(call.name, out))
             dispatched_tool = True
             if signals is not None:
