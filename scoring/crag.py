@@ -97,6 +97,96 @@ def _norm(value: str) -> str:
     return unicodedata.normalize("NFKC", str(value)).strip().lower()
 
 
+_IDENTIFIER = r"[a-z_][a-z0-9_]*"
+_NUMBER = r"-?\d[\d,]*(?:\.\d+)?"
+
+
+def _number_token(value: str) -> str:
+    return value.replace(",", "")
+
+
+def _structured_facts(value: str) -> dict[str, set[str]]:
+    """Extract conservative key/value facts from compact factual answers.
+
+    The gold set uses both configuration syntax (``learning_rate=0.1``) and natural
+    Japanese (``learning_rateは0.1``), plus ranked shorthand such as ``1位=500``.
+    Keeping this extractor deliberately narrow means prose claims still go to the LLM.
+    """
+    normalized = _norm(value)
+    facts: dict[str, set[str]] = {}
+
+    patterns = (
+        rf"(?P<key>{_IDENTIFIER})\s*(?:=|は)\s*(?P<value>{_NUMBER})",
+        rf"(?P<rank>\d+)\s*位(?:\s*の\s*モデル)?\s*(?:=|は)\s*(?P<value>{_NUMBER})",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, normalized):
+            key = (match.groupdict().get("key")
+                   or f"{match.group('rank')}位")
+            facts.setdefault(key, set()).add(_number_token(match.group("value")))
+    return facts
+
+
+def _canonical_structured_text(value: str) -> str:
+    """Normalize notation-only differences without paraphrasing arbitrary prose."""
+    normalized = _norm(value)
+    normalized = re.sub(
+        rf"(?P<key>{_IDENTIFIER})\s*(?:は|=)\s*(?P<value>{_NUMBER})",
+        lambda m: f"{m.group('key')}={_number_token(m.group('value'))}",
+        normalized,
+    )
+    normalized = re.sub(
+        rf"(?P<rank>\d+)\s*位(?:\s*の\s*モデル)?\s*(?:は|=)\s*(?P<value>{_NUMBER})",
+        lambda m: f"{m.group('rank')}位={_number_token(m.group('value'))}",
+        normalized,
+    )
+    # Copula / punctuation differences after a structured value carry no semantics.
+    normalized = re.sub(r"(?<=\d)(?:です|である)(?=[。.!?！？]|$)", "", normalized)
+    return re.sub(r"[\s、,。．.!！?？;；:：()（）「」『』]", "", normalized)
+
+
+def deterministic_equivalence(pred: str, truth: str) -> str | None:
+    """Resolve notation equivalence and safe structured-gold containment.
+
+    ``Perfect`` is reserved for equality after notation/coplanar punctuation
+    normalization. ``Acceptable`` is used when every structured gold fact is present in
+    the answer with no contradictory value or extra number. The latter is intentionally
+    conservative: it requires key/value facts in the gold, all gold identifiers, and
+    matching negation polarity. Free prose and partial facts remain unresolved for LLM
+    review instead of being guessed from token overlap.
+    """
+    canonical_pred = _canonical_structured_text(pred)
+    canonical_truth = _canonical_structured_text(truth)
+    pred_facts = _structured_facts(pred)
+    truth_facts = _structured_facts(truth)
+    if not truth_facts:
+        return None
+    if canonical_pred == canonical_truth:
+        return "Perfect"
+    if any(not values.issubset(pred_facts.get(key, set()))
+           for key, values in truth_facts.items()):
+        return None
+    # A second value for the same key is an explicit contradiction, not harmless detail.
+    if any(pred_facts.get(key, set()) - values for key, values in truth_facts.items()):
+        return None
+
+    pred_norm, truth_norm = _norm(pred), _norm(truth)
+    truth_identifiers = set(re.findall(_IDENTIFIER, truth_norm))
+    pred_identifiers = set(re.findall(_IDENTIFIER, pred_norm))
+    if not truth_identifiers.issubset(pred_identifiers):
+        return None
+
+    pred_numbers = {_number_token(v) for v in re.findall(_NUMBER, pred_norm)}
+    truth_numbers = {_number_token(v) for v in re.findall(_NUMBER, truth_norm)}
+    if pred_numbers != truth_numbers:
+        return None
+
+    negation = re.compile(r"(?:ない|なく|なし|ません|不存在)")
+    if bool(negation.search(pred_norm)) != bool(negation.search(truth_norm)):
+        return None
+    return "Acceptable"
+
+
 def _numeric_shape(value: str) -> tuple[str, str] | None:
     normalized = _norm(value).replace(",", "")
     matches = list(re.finditer(r"-?\d+(?:\.\d+)?", normalized))
@@ -116,6 +206,9 @@ def deterministic_judge(pred: str, truth: str) -> str | None:
     p, t = _norm(pred), _norm(truth)
     if p == t:
         return "Perfect"
+    equivalent = deterministic_equivalence(pred, truth)
+    if equivalent is not None:
+        return equivalent
     pn, tn = _numeric_shape(pred), _numeric_shape(truth)
     if pn and tn:
         pc, tc = pn[1], tn[1]
@@ -187,7 +280,7 @@ def _judge_openai(pred: str, truth: str, strict: bool = True) -> str:
 
 
 def judge(pred: str, truth: str, votes: int = 3, strict: bool | None = None,
-          backend: str | None = None) -> str:
+          backend: str | None = None, majority: bool = False) -> str:
     """Hybrid judge: deterministic first, then LLM. Strict mode (default, JUDGE_STRICT)
     aggregates the votes by worst case rather than majority and applies a deterministic
     verbosity/format downgrade, narrowing the Gemini proxy's ~0.2 leniency gap.
@@ -205,11 +298,15 @@ def judge(pred: str, truth: str, votes: int = 3, strict: bool | None = None,
 
         # No fallback: a codex failure (usage limit / timeout) propagates and stops the
         # scoring run — Gemini must never silently replace the judge (SOT-2457 directive).
-        verdict = codex_judge.judge_one(pred, truth, _system_prompt(strict), strict)
+        verdict = codex_judge.judge_one(
+            pred, truth, _system_prompt(strict),
+            strict=False if majority else strict,
+            n_votes=votes if majority else None,
+        )
         return strict_downgrade(pred, truth, verdict) if strict else verdict
     base = _judge_openai if backend == "openai" else _judge_gemini
     one = (lambda p, t: base(p, t, strict))
-    verdict = _aggregate(one, pred, truth, votes, strict)
+    verdict = _aggregate(one, pred, truth, votes, strict and not majority)
     return strict_downgrade(pred, truth, verdict) if strict else verdict
 
 
@@ -230,19 +327,22 @@ def _majority(one, pred: str, truth: str, votes: int) -> str:
     return _aggregate(one, pred, truth, votes, strict=False)
 
 
-def score_pairs(pairs: list[tuple[str, str]]) -> tuple[float, list[dict]]:
+def score_pairs(pairs: list[tuple[str, str]], *, votes: int | None = None,
+                majority: bool = False) -> tuple[float, list[dict]]:
     """pairs = [(prediction, ground_truth), ...] -> (mean_score, per_item results).
 
     codex backend judges in BATCHES (one `codex exec` per chunk of pairs) — a per-pair
     call would pay CLI startup per question. A codex failure raises: per the SOT-2457
-    directive scoring never silently reroutes to Gemini."""
+    directive scoring never silently reroutes to Gemini. ``majority=True`` changes only
+    vote aggregation; the strict prompt and post-verdict downgrade remain enabled."""
     backend = resolve_backend()
     if backend == "codex":
-        return _score_pairs_codex(pairs)
-    return _score_pairs_threaded(pairs, backend)
+        return _score_pairs_codex(pairs, votes=votes, majority=majority)
+    return _score_pairs_threaded(pairs, backend, votes=votes, majority=majority)
 
 
-def _score_pairs_codex(pairs: list[tuple[str, str]]) -> tuple[float, list[dict]]:
+def _score_pairs_codex(pairs: list[tuple[str, str]], *, votes: int | None = None,
+                       majority: bool = False) -> tuple[float, list[dict]]:
     """Deterministic pre-pass, then ONE batched codex judgement for the rest."""
     from scoring import codex_judge
 
@@ -251,7 +351,9 @@ def _score_pairs_codex(pairs: list[tuple[str, str]]) -> tuple[float, list[dict]]
     todo = [i for i, v in enumerate(verdicts) if v is None]
     if todo:
         judged = codex_judge.judge_batch([pairs[i] for i in todo],
-                                         _system_prompt(strict), strict)
+                                         _system_prompt(strict),
+                                         strict=False if majority else strict,
+                                         n_votes=votes)
         for i, v in zip(todo, judged):
             verdicts[i] = strict_downgrade(pairs[i][0], pairs[i][1], v) if strict else v
     results = [{"pred": p, "truth": t, "judged": v, "points": _POINTS.get(v, 0.0),
@@ -260,14 +362,16 @@ def _score_pairs_codex(pairs: list[tuple[str, str]]) -> tuple[float, list[dict]]
     return (total / len(results) if results else 0.0), results
 
 
-def _score_pairs_threaded(pairs: list[tuple[str, str]],
-                          backend: str) -> tuple[float, list[dict]]:
+def _score_pairs_threaded(pairs: list[tuple[str, str]], backend: str, *,
+                          votes: int | None = None,
+                          majority: bool = False) -> tuple[float, list[dict]]:
     from concurrent.futures import ThreadPoolExecutor
 
     def one(p):
         pred, truth = p
         try:
-            verdict = judge(pred, truth, votes=3, backend=backend)
+            verdict = judge(pred, truth, votes=votes or 3, backend=backend,
+                            majority=majority)
         except Exception as e:  # noqa: BLE001
             verdict = f"ERROR:{e}"
         return {"pred": pred, "truth": truth, "judged": verdict,
