@@ -134,6 +134,14 @@ def test_plain_simple_lookup_keeps_fast_retrieval_path():
     assert first == routing.CONTRACT_FIRST_TOOLS[qc.SIMPLE_LOOKUP]
 
 
+def test_literal_request_locates_file_then_reads_image_before_broad_grep():
+    q = "運用資料で、委託者側の役割として『別契約』と明記されたものを抽出してください。"
+    contract = qc.classify(q)
+    first = routing.first_tools_for(contract, q)
+    assert first[:2] == ("find_files", "caption_image")
+    assert first.index("file_grep") > first.index("caption_image")
+
+
 def test_route_hint_injects_no_corpus_fact():
     # the hint must name only tools + generic conditions — never a concrete corpus secret / 略称
     q = "契約金額はいくらですか。"

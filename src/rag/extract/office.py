@@ -8,6 +8,8 @@ Encrypted files are transparently decrypted via extract.passwords.
 from __future__ import annotations
 
 import io
+import re
+from dataclasses import dataclass
 
 import docx
 import openpyxl
@@ -146,6 +148,68 @@ def _xlsx_from(ref: FileRef, data: bytes | None):
     return openpyxl.load_workbook(src, data_only=True)
 
 
+# Only columns whose headers describe a row group are forward-filled.  Applying pandas-style ``ffill``
+# to every column would invent owners/dates/statuses in intentionally blank cells, while leaving all
+# blanks untouched loses the row→phase relation used by range operations (e.g. max start date in P6).
+_GROUPING_HEADER_RE = re.compile(
+    r"^(?:フェーズ(?:no\.?|番号|名)|phase(?:\s*(?:no\.?|number|name))?|"
+    r"グループ(?:no\.?|番号|名)?|区分|カテゴリ|カテゴリー|セクション)$", re.I)
+
+
+def is_grouping_header(value: object) -> bool:
+    """Whether an xlsx column header denotes a vertically grouped row attribute."""
+    return bool(value is not None and _GROUPING_HEADER_RE.match(nfc(str(value)).strip()))
+
+
+@dataclass(frozen=True)
+class NormalizedXlsxRow:
+    """One worksheet row after conservative grouping-column forward fill."""
+
+    row: int
+    values: tuple[object | None, ...]
+    filled_columns: tuple[int, ...] = ()  # one-based column indices filled from the previous group row
+
+
+def normalized_xlsx_rows(ws, *, max_rows: int = 400) -> list[NormalizedXlsxRow]:
+    """Return worksheet rows with blank grouping cells forward-filled after the table header.
+
+    The densest row in the first 30 rows is treated as the table header.  This covers ordinary WBS/
+    schedule sheets while failing closed on free-form sheets.  A completely empty row terminates the
+    current group, so values never bleed into a later table on the same worksheet.
+    """
+    maxr = min(ws.max_row or 0, max_rows)
+    maxc = ws.max_column or 0
+    raw = [tuple(ws.cell(r, c).value for c in range(1, maxc + 1)) for r in range(1, maxr + 1)]
+    if not raw:
+        return []
+    header_idx = max(range(min(len(raw), 30)),
+                     key=lambda i: sum(bool(v is not None and str(v).strip()) for v in raw[i]))
+    group_cols = {
+        ci for ci, value in enumerate(raw[header_idx])
+        if is_grouping_header(value)
+    }
+    carried: dict[int, object] = {}
+    out: list[NormalizedXlsxRow] = []
+    for ri, source in enumerate(raw, 1):
+        values = list(source)
+        filled: list[int] = []
+        if ri <= header_idx + 1:
+            if ri == header_idx + 1:
+                carried.clear()
+        elif not any(v is not None and str(v).strip() for v in source):
+            carried.clear()
+        else:
+            for ci in group_cols:
+                value = source[ci]
+                if value is not None and str(value).strip():
+                    carried[ci] = value
+                elif ci in carried:
+                    values[ci] = carried[ci]
+                    filled.append(ci + 1)
+        out.append(NormalizedXlsxRow(ri, tuple(values), tuple(filled)))
+    return out
+
+
 def extract_xlsx(ref: FileRef, data: bytes | None) -> str:
     wb = _xlsx_from(ref, data)
     out: list[str] = []
@@ -153,15 +217,16 @@ def extract_xlsx(ref: FileRef, data: bytes | None) -> str:
         out.append(f"[シート: {ws.title}]  範囲 {ws.dimensions}")
         highlights: list[str] = []
         rows_repr: list[str] = []
-        maxr = min(ws.max_row or 0, 400)
-        for row in ws.iter_rows(max_row=maxr):
+        normalized = normalized_xlsx_rows(ws, max_rows=400)
+        filled_headers: set[str] = set()
+        for norm_row in normalized:
             cells = []
-            for c in row:
-                v = c.value
+            for ci, v in enumerate(norm_row.values, 1):
                 if v is None:
                     continue
                 cells.append(str(v))
                 # highlight / fill
+                c = ws.cell(norm_row.row, ci)
                 fill = c.fill
                 if fill and fill.patternType:
                     color = None
@@ -170,8 +235,20 @@ def extract_xlsx(ref: FileRef, data: bytes | None) -> str:
                         color = _excel_color_name(fg)
                     if color:
                         highlights.append(f"{c.coordinate}({color}): {v}")
+                if ci in norm_row.filled_columns:
+                    header = normalized[0].values[ci - 1] if normalized else None
+                    # Header may not be row 1; recover it from the nearest preceding non-empty cell.
+                    for previous in reversed(normalized[:norm_row.row]):
+                        candidate = previous.values[ci - 1]
+                        if is_grouping_header(candidate):
+                            header = candidate
+                            break
+                    if header:
+                        filled_headers.add(str(header))
             if cells:
                 rows_repr.append(" | ".join(cells))
+        if filled_headers:
+            out.append("【グルーピング列を前方補完: " + "、".join(sorted(filled_headers)) + "】")
         out.extend(rows_repr[:400])
         if highlights:
             out.append("【ハイライトされたセル】")

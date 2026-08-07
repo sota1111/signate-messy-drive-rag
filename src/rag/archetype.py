@@ -73,6 +73,11 @@ def classify(question: str) -> str:
     # version-diff question is never a pivot-condition question, so this precedes the rule table.
     if pivotcond.is_pivot_condition_question(q):
         return "pivot_condition"
+    # Keep the classifier exactly aligned with the deterministic tool's accepted surface forms,
+    # including attached filenames such as ``提案書old.pptxから提案書.pptxへの更新``.
+    from src.rag import diffpair
+    if diffpair.is_diff_question(q):
+        return "version_diff"
     for name, pat in _RULES:
         if pat.search(q):
             return name

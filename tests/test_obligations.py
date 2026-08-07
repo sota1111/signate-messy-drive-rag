@@ -36,6 +36,8 @@ from src.rag.agent.obligations import (
     as_evidence,
     decompose,
     flash_decompose,
+    literal_terms,
+    validate_literal_evidence,
 )
 
 
@@ -161,6 +163,24 @@ def test_as_evidence_coerces_mixed_inputs() -> None:
                          EvidenceItem(text="c")])
     assert [e.text for e in mixed] == ["a", "b", "c"]
     assert mixed[1].ref == "r" and mixed[1].kinds == frozenset({"computation"})  # bogus kind dropped
+
+
+def test_literal_request_adds_obligation_and_requires_same_fragment() -> None:
+    q = "データアステル側の役割として「別契約」と明記されたものを抽出してください。"
+    assert literal_terms(q) == ("別契約",)
+    oset = decompose(q, contract=qc.SIMPLE_LOOKUP)
+    assert any(o.kind == JUDGMENT_RULE and "別契約" in o.obligation for o in oset.obligations)
+
+    evidence = [{"item": "データ移行支援", "condition": "本契約内"},
+                {"item": "監視ダッシュボード構築", "condition": "別契約"}]
+    assert not validate_literal_evidence(q, "データ移行支援", [evidence]).passed
+    assert validate_literal_evidence(q, "監視ダッシュボード構築", [evidence]).passed
+
+
+def test_ordinary_quoted_lookup_does_not_activate_literal_gate() -> None:
+    q = "項目「別契約」の意味を教えてください。"
+    assert literal_terms(q) == ()
+    assert validate_literal_evidence(q, "任意回答", []).passed
 
 
 def test_obligation_is_immutable() -> None:

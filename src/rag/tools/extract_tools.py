@@ -13,6 +13,7 @@ secrets go only into the runtime, gitignored ``corpus_profile.json`` via ``profi
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -219,16 +220,79 @@ def extract_office(file: str | Path | FileRef, *,
 
 
 # --------------------------------------------------------------------------- vision tool
-def caption_figure(file: str | Path | FileRef) -> dict[str, Any]:
-    """Caption a chart/figure PNG via the vision model, as a contract result.
+def caption_figure(file: str | Path | FileRef, question: str | None = None) -> dict[str, Any]:
+    """Read a PNG or an image-only PDF via the vision model, as a contract result.
 
-    ``value`` is the caption string; ``method`` records the vision model. (Network call — callers
-    that must stay offline should stub :func:`src.rag.extract.vision.caption_png`.)
+    PNGs retain the compact index-time caption path. For an image-only PDF, every page raster is
+    attached to Gemini in bounded batches and the original question is included so literal/exact
+    extraction can preserve the condition and candidate on the same output line. No source-specific
+    vocabulary is embedded here.
     """
     ref = resolve_ref(file)
-    caption = _vision.caption_png(ref)
     from src.rag import llm
+    if ref.ext == "pdf":
+        pages = _vision.pdf_page_images(ref.path)
+        if not pages:
+            raise ContractError(f"no full-page images found in {ref.rel or ref.path}")
+        query = question or "この文書の内容を、見出し・表の行列関係を保って転記してください。"
+        chunks: list[str] = []
+        matches: list[dict[str, Any]] = []
+        schema = {
+            "type": "object",
+            "properties": {
+                "matches": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "page": {"type": "integer"},
+                            "scope": {"type": "string"},
+                            "candidate": {"type": "string"},
+                            "condition": {"type": "string"},
+                            "source": {"type": "string"},
+                        },
+                        "required": ["page", "scope", "candidate", "condition", "source"],
+                    },
+                },
+            },
+            "required": ["matches"],
+        }
+        batch_size = 8
+        for start in range(0, len(pages), batch_size):
+            batch = pages[start:start + batch_size]
+            end = start + len(batch)
+            prompt = (
+                f"画像はPDFのページ{start + 1}〜{end}です。次の質問に答える根拠だけを画像から厳密に転記してください。\n"
+                f"質問: {query}\n\n"
+                "推測・要約・言い換えは禁止です。引用語や『明記』を求める質問では、その引用語を含む条件と"
+                "回答候補を同じ表セル・同じ文・同じ行で確認してください。質問が主語・所属・役割・表の欄を"
+                "限定している場合は、その限定と一致する行だけを採用し、引用語があっても別の節・表・役割の"
+                "候補は混ぜないでください。candidate は引用条件が直接修飾する最小の役務名だけにし、同じセルの"
+                "隣接項目を含めないでください。source もその条件と候補が共存する最小句だけを転記してください。"
+                "該当しない場合は matches=[] としてください。"
+            )
+            images = [llm.Image(data=data, mime_type=mime) for data, mime in batch]
+            raw = llm.generate(
+                prompt, images=images, model=llm.settings.VISION_MODEL,
+                max_output_tokens=1200, temperature=0.0, thinking_budget=0,
+                response_schema=schema,
+            )
+            try:
+                parsed = json.loads(raw)
+                matches.extend(item for item in parsed.get("matches", [])
+                               if isinstance(item, dict))
+            except (json.JSONDecodeError, AttributeError):
+                chunks.append(raw)
+        value: Any = matches if matches else chunks
+        evidence = {
+            "file": ref.rel or str(ref.path),
+            "ext": "pdf",
+            "pages_attached": len(pages),
+            "question_specific": bool(question),
+        }
+    else:
+        value = _vision.caption_png(ref)
+        evidence = {"file": ref.rel or str(ref.path), "ext": ref.ext}
     return contract.make(
-        caption, engine="vision",
-        evidence={"file": ref.rel or str(ref.path)},
+        value, engine="vision", evidence=evidence,
         model=getattr(llm.settings, "VISION_MODEL", None))

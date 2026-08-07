@@ -29,6 +29,7 @@ from __future__ import annotations
 import re
 from typing import Callable
 
+from src.rag.agent import obligations as _obligations
 from src.rag.agent import question_contract as _qc
 from src.rag.agent.question_contract import QuestionContract
 from src.rag.tools.canonical_route import infer_kinds as _infer_kinds
@@ -95,6 +96,11 @@ def first_tools_for(contract: QuestionContract, question: str) -> tuple[str, ...
     ``canonical_route`` (the retrieval_miss fix) instead of the fast chunk-search path.
     """
     base = CONTRACT_FIRST_TOOLS.get(contract.contract, ())
+    if _obligations.literal_terms(question):
+        # Exact/literal requests often target image-only documents. Locate the named file first and
+        # inspect it directly; a second broad BM25 pass can consume the whole question budget without
+        # ever exposing the page image.
+        return ("find_files", "caption_image", "read_office", "file_grep")
     if contract.contract == _qc.FORMAT_CHECK and (
             "ピボット" in question.lower() or (
                 ".pptx" in question.lower() and "ハイライト" in question
@@ -128,6 +134,17 @@ def route_hint(contract: QuestionContract, question: str) -> str:
             "この質問はデータ資産/横断集計が根拠で chunk 検索では上位に上がりにくい。まず "
             "canonical_route / compute / corpus_aggregate で canonical ファイルへ直行し、"
             "一律の高コスト検索を先に行わない。")
+    if contract.contract == _qc.VERSION_DIFF:
+        lines.append(
+            "この契約だけはツール順が必須である。回答確定前に version_diff(question=質問全文) を必ず実行し、"
+            "全スライド/全シートを網羅した決定論的 value を回答へそのまま採用する。grep や目視した一部箇所だけで"
+            "差分を確定してはならない。value=null の場合は別の変更を推測せず棄権する。")
+    literal = _obligations.literal_terms(question)
+    if literal:
+        lines.append(
+            "引用語/『明記』は文字どおりの同一箇所証拠が必須である。検索可能な原文が空の画像のみPDFは "
+            "caption_image(file=..., question=質問全文) で全ページを読み、条件語 "
+            f"({', '.join(literal)}) と回答候補が同じセル・文・行に共存する出力だけで確定する。")
     if contract.contract == _qc.NUMERIC:
         req = _qc.numeric_requirements(question)
         lines.append(
@@ -178,6 +195,11 @@ def route_hint(contract: QuestionContract, question: str) -> str:
         lines.append(
             "回答表面の必須形式は人名のフルネームのみ。根拠説明、所属、役割、敬称（様/氏）を"
             "回答欄へ足さず、抽出した氏名を原文表記のまま返す。")
+    if re.search(r"明記|そのまま|原文(?:どおり|通り|表記)|文字列(?:として)?", question):
+        lines.append(
+            "『明記』『そのまま』『原文』で指定された抽出は literal 一致が必須である。引用された条件語が"
+            "採用候補と同じセル/文に文字列として存在することをツール結果で確認し、共起を確認できない候補は"
+            "回答へ採用しない。")
     if contract.completion_conditions:
         checklist = "".join(f"\n  - {c}" for c in contract.completion_conditions)
         lines.append("回答を確定してよい完了条件(満たすまで棄権しない):" + checklist)
