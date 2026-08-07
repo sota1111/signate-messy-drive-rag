@@ -190,6 +190,18 @@ def test_route_expr_direct_compute(mini):
     assert r["evidence"]["canonical_route"]["primary"].endswith("03.データ/train.csv")
 
 
+def test_notebook_statistic_routes_expr_to_backing_train_data(mini):
+    """A prose-vs-output statistic can be recomputed even when the question names an .ipynb."""
+    question = "ACMEの01_eda.ipynbでvalueの平均を確認してください"
+    assert [k.name for k in cr.infer_kinds(question)] == ["notebook", "train"]
+    r = _route(mini, question, expr="df['value'].mean()")
+    assert r["value"] == 40.0
+    route = r["evidence"]["canonical_route"]
+    assert route["resolved_kinds"] == ["notebook", "train"]
+    assert route["primary"].endswith("03.データ/train.csv")
+    assert r["method"]["route"] == "canonical_route→compute"
+
+
 def test_route_expr_ignored_for_non_tabular_primary(mini):
     # A code primary (.py) is not tabular → expr is ignored, the file list is returned instead.
     r = _route(mini, "ACMEの分析コード", expr="len(df)")

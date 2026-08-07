@@ -122,6 +122,13 @@ def route_hint(contract: QuestionContract, question: str) -> str:
             "この質問はデータ資産/横断集計が根拠で chunk 検索では上位に上がりにくい。まず "
             "canonical_route / compute / corpus_aggregate で canonical ファイルへ直行し、"
             "一律の高コスト検索を先に行わない。")
+    if contract.contract == _qc.NUMERIC:
+        lines.append(
+            "証拠の優先順位は『computeによる生データ再計算・notebookの実行出力 > 文書中のmarkdown/"
+            "散文の主張』とする。相関・統計・集計で矛盾した散文を正解根拠にしてはならない。"
+            "canonical_routeで元の表データを特定し、computeで同じ統計を自力再計算した結果だけを採用する。"
+            "notebook質問で元データが必要なら canonical_route(question=..., kind='train', expr='...') を使う。"
+            "矛盾した散文は evidence から除外し、methodに再計算した式・対象列を記録する。")
     if contract.completion_conditions:
         checklist = "".join(f"\n  - {c}" for c in contract.completion_conditions)
         lines.append("回答を確定してよい完了条件(満たすまで棄権しない):" + checklist)

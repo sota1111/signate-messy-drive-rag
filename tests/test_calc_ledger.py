@@ -304,6 +304,26 @@ def test_no_record_for_abstain_or_non_numeric_commit(tmp_path):
     assert not p2.exists()
 
 
+def test_numeric_contract_records_computed_label_in_memory_and_jsonl(tmp_path):
+    """Correlation argmax outputs a label, but remains a replayable derived calculation."""
+    csv = tmp_path / "t.csv"
+    csv.write_text("target,age,bmi\n0,1,2\n1,2,4\n2,1,5\n", encoding="utf-8")
+    p = tmp_path / "derived.jsonl"
+    steps = [
+        _call(
+            "compute", file=str(csv),
+            expr="df.corr(numeric_only=True)['target'].drop('target').abs().idxmax()"),
+        _submit("bmi", confidence=0.9),
+    ]
+    inv = investigate(
+        ScriptedModel(steps), "目的変数と相関が最も高い列は?", build_tools(CorpusProfile()),
+        max_turns=5, calc_ledger=p, contract="numeric")
+    row = json.loads(p.read_text(encoding="utf-8").strip())
+    assert row["answer"] == "bmi" and row["contract"] == "numeric"
+    assert row["grounded"] is True and row["typed_value"]["parsed_value"] is None
+    assert inv.calc_record == row
+
+
 def test_calc_ledger_off_is_a_noop_and_default_is_off(tmp_path, monkeypatch):
     monkeypatch.setattr(cl, "default_path", lambda: tmp_path / "should_not_exist.jsonl")
     tools = build_tools(CorpusProfile())

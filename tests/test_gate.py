@@ -216,13 +216,14 @@ def _exec_verdict(category, *, should_abstain, answer="0.61"):
     )
 
 
-def test_exec_gate_default_off_leaves_numeric_commit_untouched():
-    """既定OFF: a conflicting execution verdict does NOT change the committed answer (既存数値 MATCH 非劣化)."""
+def test_exec_gate_default_scope_leaves_non_calculation_contract_untouched():
+    """Default ON is scoped: a non-calculation question ignores an unrelated execution verdict."""
     r = _resolution("0.61", "0.61", confidence=0.9)
     conflict = _exec_verdict(EXEC_CONFLICT, should_abstain=True)
-    d = apply_gate(r, commit_confidence=0.7, exec_verdict=conflict)  # exec_verify defaults OFF
+    d = apply_gate(r, commit_confidence=0.7, exec_verdict=conflict)
     assert d.commit and d.answer == "0.61"
-    assert gate.GATE_EXEC_VERIFY is False
+    assert gate.GATE_EXEC_VERIFY is True
+    assert gate.GATE_EXEC_VERIFY_CONTRACTS == frozenset({"numeric"})
 
 
 def test_exec_gate_downgrades_conflicting_numeric_commit_when_enabled():
@@ -249,6 +250,15 @@ def test_exec_gate_leaves_non_numeric_commit_to_the_text_verifier():
     assert d.commit and d.answer == "bmi"
 
 
+def test_exec_gate_applies_to_computed_label_in_numeric_contract():
+    r = _resolution_q("目的変数と相関が最も高い特徴量は?", "age", confidence=0.9)
+    conflict = _exec_verdict(EXEC_CONFLICT, should_abstain=True, answer="age")
+    d = apply_gate(
+        r, commit_confidence=0.7, exec_verdict=conflict, contract="numeric")
+    assert not d.commit and d.answer == settings.ABSTAIN
+    assert "計算回答の実行検証" in d.reason
+
+
 def test_exec_gate_does_not_resurrect_an_abstention():
     # a low-confidence agreement already abstains; a MATCH verdict must not turn it into a commit.
     r = _resolution("0.42", "0.42", confidence=0.3)
@@ -267,6 +277,28 @@ def test_gate_question_runs_live_exec_verification(monkeypatch):
     record = {"question": "Q?", "answer": "0.61", "typed_value": {},
               "compute_steps": [{"columns_used": ["age", "loan_amnt"], "input_rows": 44}]}
     d = gate.gate_question("Q?", commit_confidence=0.7, committed_calc_record=record, exec_verify=True)
+    assert not d.commit and d.answer == settings.ABSTAIN
+
+
+def test_gate_question_uses_in_memory_record_for_derived_label(monkeypatch):
+    """No shared-ledger lookup: the investigator's exact record flows with the resolution."""
+    from dataclasses import replace
+    from src.rag.agent import exec_verifier
+
+    record = {
+        "question": "目的変数と相関が最も高い特徴量は?",
+        "answer": "age",
+        "contract": "numeric",
+        "typed_value": {"raw_text": "age", "unit": None},
+        "compute_steps": [{"columns_used": ["charges", "age"], "input_rows": 1600}],
+    }
+    r = replace(
+        _resolution_q(record["question"], "age", confidence=0.9), calc_record=record)
+    monkeypatch.setattr(gate, "resolve_question", lambda q, **kw: r)
+    monkeypatch.setattr(
+        exec_verifier, "verify_question",
+        lambda rec, **kw: _exec_verdict(EXEC_CONFLICT, should_abstain=True, answer="age"))
+    d = gate.gate_question(record["question"], commit_confidence=0.7)
     assert not d.commit and d.answer == settings.ABSTAIN
 
 

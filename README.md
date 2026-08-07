@@ -156,6 +156,10 @@ data/share_drive (416 files, gitignored)
 - 各モジュールは **sealed hold-out で実証済みの archetype のみ直接コミット**し、未実証は advisory ヒントと
   して LLM+verify が判断（可視案件への過学習が未知案件で誤答コミットする事故を防止）。archetype 別
   trust map により測定済み低精度の型は LLM 呼び出し前に棄権。
+- 相関・統計などの `numeric`（derived-calculation）契約は、散文より notebook 実行出力／生データの
+  `canonical_route→compute` 再計算を優先し、`GATE_EXEC_VERIFY=1` かつ
+  `GATE_EXEC_VERIFY_CONTRACTS=numeric` の既定構成で独立再実行が一致した場合だけ commit する。関門2の
+  champion 比較では master flag を `0` にして同一コード上で非劣化を判定できる。
 - **根拠**: 差分・抽出条件・横断集計は生成では不安定。構造を直読して確定し、未実証型は棄権へ倒す。
 
 ### ⑪ Google Document AI / Document AI Layout Parser は使っているか

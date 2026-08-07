@@ -283,7 +283,12 @@ class CalcSignals:
 # --------------------------------------------------------------------------- record + schema
 @dataclass(frozen=True)
 class CalcRecord:
-    """One per-question numeric-answer calculation証跡 line (serialized to JSONL)."""
+    """One per-question calculation証跡 line (serialized to JSONL).
+
+    Most records contain a literal number.  A ``numeric`` question contract may instead return the
+    label selected by a calculation (for example correlation ``idxmax() -> \"bmi\"``); ``contract``
+    keeps that replayable derived answer distinguishable from an ordinary text lookup.
+    """
 
     question: str
     answer: str
@@ -297,6 +302,7 @@ class CalcRecord:
     cost_usd: float
     confidence: float
     recorded_at: str
+    contract: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -312,6 +318,7 @@ class CalcRecord:
             "elapsed_s": self.elapsed_s,
             "cost_usd": self.cost_usd,
             "confidence": self.confidence,
+            "contract": self.contract,
         }
 
 
@@ -383,6 +390,7 @@ def record_from_investigation(investigation: Any, signals: CalcSignals, *,
         cost_usd=round(investigation.usage.cost_usd(investigation.model), 6),
         confidence=answer.confidence,
         recorded_at=(now or _utcnow)(),
+        contract=getattr(investigation, "contract", None),
     )
 
 

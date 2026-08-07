@@ -31,7 +31,7 @@ abstract :class:`~src.rag.agent.investigator.Model` (scripted fakes in tests, no
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Sequence
 
 from config import settings
@@ -102,6 +102,7 @@ class Resolution:
     judge_reason: str = ""      # rationale of the third-judge vote (empty when no tie-break ran)
     evidence: str = ""          # 根拠 of the adopted answer
     method: str = ""            # derivation summary of the adopted answer
+    calc_record: dict[str, Any] | None = None  # investigator's in-memory calculation evidence
 
     @property
     def abstained(self) -> bool:
@@ -250,15 +251,17 @@ def resolve_answer(question: str, investigator: Investigation, *,
     )
 
     if verdict.agree:
-        return _resolve_from_answers(question, investigator.answer, _verdict_answer(verdict), verdict,
-                                     judge=None)
+        resolution = _resolve_from_answers(
+            question, investigator.answer, _verdict_answer(verdict), verdict, judge=None)
+        return replace(resolution, calc_record=investigator.calc_record)
 
     judge = _judge_investigation(
         question, model=judge_model, model_factory=judge_factory,
         profile_factory=judge_profile_factory, max_turns=max_turns, timeout_s=timeout_s,
     ).answer
-    return _resolve_from_answers(question, investigator.answer, _verdict_answer(verdict), verdict,
-                                 judge=judge)
+    resolution = _resolve_from_answers(
+        question, investigator.answer, _verdict_answer(verdict), verdict, judge=judge)
+    return replace(resolution, calc_record=investigator.calc_record)
 
 
 def _verdict_answer(verdict: Verdict) -> Answer:

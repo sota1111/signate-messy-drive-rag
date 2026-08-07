@@ -131,6 +131,16 @@ KINDS: tuple[Kind, ...] = (
 # boundary in Python's unicode ``\w``), so gate on "not an ascii alnum" instead.
 _EXT_HINT = re.compile(r"\.(xlsx|xlsm|csv|ipynb|py|docx)(?![a-z0-9])", re.IGNORECASE)
 
+# A notebook's markdown may describe a statistic incorrectly while its executed output (or backing
+# table) is authoritative.  These generic terms identify notebook questions whose claim is derived
+# from tabular data.  In that case :func:`infer_kinds` also exposes the project's ``train`` asset so
+# ``canonical_route(question, expr=...)`` can take the canonical_route→compute path directly.
+_DERIVED_COMPUTE_RE = re.compile(
+    r"相関|平均|合計|総和|最大|最小|中央値|標準偏差|分散|件数|比率|割合|統計|集計|"
+    r"correlation|corr\b|mean\b|sum\b|median\b|std\b|variance\b|idxmax\b|idxmin\b",
+    re.IGNORECASE,
+)
+
 
 class CanonicalRouteError(ValueError):
     """Raised only for a malformed *explicit* kind argument; question-driven resolution never raises."""
@@ -178,7 +188,15 @@ def infer_kinds(question: str) -> list[Kind]:
     """The canonical-file kinds a question is asking about, most-specific first (may be empty)."""
     q = nfc(question)
     ql = q.lower()
-    return [k for k in KINDS if any(_keyword_hit(kw, q, ql) for kw in k.keywords)]
+    kinds = [k for k in KINDS if any(_keyword_hit(kw, q, ql) for kw in k.keywords)]
+    # A derived notebook claim needs both the document and its canonical backing data.  Append rather
+    # than replace so ordinary discovery still returns the notebook first; an ``expr`` call below picks
+    # the first runnable table as its execution primary.
+    if any(k.name == "notebook" for k in kinds) and _DERIVED_COMPUTE_RE.search(q):
+        train = next(k for k in KINDS if k.name == "train")
+        if train not in kinds:
+            kinds.append(train)
+    return kinds
 
 
 # --------------------------------------------------------------------------- file discovery
@@ -292,6 +310,8 @@ def canonical_route(question: str | None = None, *, project: str | None = None,
     records: list[dict[str, Any]] = []
     primary: FileRef | None = None
     primary_kind: str | None = None
+    tabular_primary: FileRef | None = None
+    tabular_primary_kind: str | None = None
     if proj is not None:
         for k in kinds:
             for ref in discover(proj, k, ext_hint=ext_hint, corpus_dir=corpus_dir):
@@ -301,10 +321,18 @@ def canonical_route(question: str | None = None, *, project: str | None = None,
                 records.append(rec)
                 if primary is None:
                     primary, primary_kind = ref, k.name
+                if tabular_primary is None and ref.ext.lower() in {"csv", "xlsx", "xlsm"}:
+                    tabular_primary, tabular_primary_kind = ref, k.name
                 if len(records) >= limit:
                     break
             if len(records) >= limit:
                 break
+
+    # When an expression is requested, the execution primary must be a table.  This lets a question
+    # that explicitly names a notebook still re-run the notebook's statistic over its canonical train
+    # data instead of silently ignoring the expression because the first discovered file is .ipynb.
+    if expr and tabular_primary is not None:
+        primary, primary_kind = tabular_primary, tabular_primary_kind
 
     evidence = {
         "project": proj,
@@ -312,7 +340,7 @@ def canonical_route(question: str | None = None, *, project: str | None = None,
         "resolved_kinds": [k.name for k in kinds],
         "ext_hint": ext_hint,
         "n_files": len(records),
-        "primary": records[0]["rel"] if records else None,
+        "primary": primary.rel if primary is not None else None,
         "route": "canonical-direct (chunk検索を迂回)",
     }
     method_common = {"question": question, "kind_arg": kind}

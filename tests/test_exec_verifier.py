@@ -45,7 +45,7 @@ class _FakeAnswer:
 
 
 class _FakeInvestigation:
-    def __init__(self, answer, question="Q?"):
+    def __init__(self, answer, question="Q?", contract=None):
         self.question = question
         self.answer = _FakeAnswer(answer)
         self.iterations = 1
@@ -53,10 +53,11 @@ class _FakeInvestigation:
         self.usage = Usage(10, 5)
         self.model = "fake-model"
         self.elapsed_s = 1.0
+        self.contract = contract
 
 
 def _record(answer, *, columns=(), input_rows=None, code="df['x'].mean()", question="Q?",
-            grounded=True):
+            grounded=True, contract=None):
     """A valid SOT-2495 calc-ledger record dict built through the real ledger machinery."""
     sig = CalcSignals(question=question)
     if grounded:
@@ -66,7 +67,7 @@ def _record(answer, *, columns=(), input_rows=None, code="df['x'].mean()", quest
                          "columns_used": list(columns), "rows": input_rows},
             "method": {"code": code, "trace": {"input_rows": input_rows}},
         })
-    rec = record_from_investigation(_FakeInvestigation(answer, question), sig,
+    rec = record_from_investigation(_FakeInvestigation(answer, question, contract), sig,
                                     now=lambda: "2026-08-06T00:00:00+00:00").to_dict()
     validate(rec)  # every record we feed the verifier is a well-formed ledger line
     return rec
@@ -233,3 +234,20 @@ def test_is_numeric_record():
     assert is_numeric_record(_record("958", columns=("x",), input_rows=3)) is True
     assert is_numeric_record(_record("bmi", grounded=False)) is False   # column-name answer
     assert is_numeric_record(None) is False
+
+
+def test_derived_calculation_label_is_verifiable_record():
+    rec = _record("bmi", columns=("charges", "bmi"), input_rows=1600, contract="numeric")
+    assert is_numeric_record(rec) is True
+    assert rec["contract"] == "numeric"
+
+
+def test_derived_label_reexecution_compares_value_and_columns():
+    committed = _record(
+        "age", columns=("charges", "age"), input_rows=1600, contract="numeric")
+    rederived = _record(
+        "bmi", columns=("charges", "bmi"), input_rows=1600, contract="numeric")
+    cmp = compare_execution(committed, rederived)
+    assert cmp.category == EXEC_CONFLICT and cmp.should_abstain
+    assert any("対象列" in c for c in cmp.conflicts)
+    assert any("値の相違" in c for c in cmp.conflicts)
