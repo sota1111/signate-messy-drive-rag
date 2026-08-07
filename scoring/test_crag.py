@@ -1,4 +1,6 @@
 """Network-free regressions for the hybrid CRAG judge."""
+import pytest
+
 from scoring import crag
 from scoring import deterministic as D
 
@@ -13,6 +15,69 @@ def test_known_misjudgements_are_deterministic():
     assert crag.deterministic_judge("Recall", "Recall") == "Perfect"
     assert crag.deterministic_judge("100円（税込）", "100円（税抜）") == "Incorrect"
     assert crag.deterministic_judge("20", "20日") == "Perfect"
+
+
+def test_structured_notation_equivalence_is_perfect_without_llm():
+    # SOT-2505 idx61: Japanese copula and assignment notation are semantically identical.
+    assert crag.deterministic_judge(
+        "n_estimatorsは300、learning_rateは0.1、random_stateは42です。",
+        "n_estimators=300、learning_rate=0.1、random_state=42",
+    ) == "Perfect"
+
+
+def test_structured_gold_containment_is_acceptable_without_llm():
+    # SOT-2505 idx62: the answer contains every ranked fact and only adds explanation.
+    assert crag.deterministic_judge(
+        "上位2つのextra_treesモデルのスコア差を生んでいる設定差分は、n_estimators（決定木の数）です。"
+        "1位のモデルは500、2位のモデルは300に設定されています。",
+        "n_estimators（1位=500、2位=300）",
+    ) == "Acceptable"
+
+
+@pytest.mark.parametrize(("pred", "truth"), [
+    ("n_estimatorsは500です。", "n_estimators=300"),
+    ("1位のモデルは500です。", "n_estimators（1位=500、2位=300）"),
+    ("1位のモデルは500、2位のモデルは300、3位は200です。",
+     "n_estimators（1位=500、2位=300）"),
+])
+def test_structured_prepass_rejects_contradiction_omission_and_extra_number(pred, truth):
+    assert crag.deterministic_equivalence(pred, truth) is None
+
+
+@pytest.mark.parametrize(("pred", "truth"), [
+    ("費用見積が変更されています。契約金額(税込)が7,480,000円から8,250,000円に増額されました。",
+     "提案書スライド6に、4.1データ理解〜4.5ガバナンスの作業内容が追記された"),
+    ("age", "bmi"),
+    ("抽出条件は行ラベルが8、列が2です。集計値は0.78です。",
+     "hr=8、weekday=2で抽出されたデータに対する最大 / temp"),
+    ("1473", "958"),
+    ("4.23%", "1.18"),
+    ("池田", "鈴木、藤田"),
+    ("案件開始から第7週目と第8週目", "第6週目から第8週目"),
+    ("データ移行支援（実績データ、周辺データ）", "監視ダッシュボード構築"),
+    ("特別規定はなく、想定総工数170時間、時間単価25,000円で精算します。",
+     "ACTHが200時間を超えた場合の特別規定はなく、時間単価25,000円で月次精算する。"),
+    ("14人", "19"),
+    ("最終モデル確定・再評価", "最終報告・成果物提出・検収会"),
+])
+def test_structured_prepass_does_not_promote_other_known_wrong_answers(pred, truth):
+    assert crag.deterministic_judge(pred, truth) not in ("Perfect", "Acceptable")
+
+
+def test_majority_option_keeps_strict_prompt_and_downgrade(monkeypatch):
+    calls = iter(["Incorrect", "Perfect", "Perfect"])
+    seen = []
+
+    def fake_gemini(_pred, _truth, strict):
+        seen.append(strict)
+        return next(calls)
+
+    monkeypatch.setattr(crag, "_judge_gemini", fake_gemini)
+    verdict = crag.judge("主要な内容を自然文で説明しています。",
+                         "同じ意味を別の自然文で説明しています。",
+                         strict=True, majority=True)
+    assert verdict == "Perfect"
+    assert seen == [True, True, True]
 
 
 def test_enumeration_is_order_independent_and_complete():

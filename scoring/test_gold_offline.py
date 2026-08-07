@@ -21,6 +21,20 @@ def _preds(*rows):
     return {r["index"] if isinstance(r["index"], int) else int(r["index"]): r for r in rows}
 
 
+def test_default_judge_requests_three_vote_majority(monkeypatch):
+    from scoring import crag
+
+    seen = {}
+
+    def fake_score_pairs(pairs, **kwargs):
+        seen.update(kwargs)
+        return 1.0, [{"judged": "Perfect"} for _ in pairs]
+
+    monkeypatch.setattr(crag, "score_pairs", fake_score_pairs)
+    assert GO.default_judge([("answer", "gold")]) == ["Perfect"]
+    assert seen == {"votes": 3, "majority": True}
+
+
 def test_load_gold_headerless(tmp_path):
     p = tmp_path / "gold.csv"
     with p.open("w", encoding="utf-8", newline="") as fh:

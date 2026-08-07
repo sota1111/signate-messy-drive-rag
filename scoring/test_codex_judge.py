@@ -120,6 +120,21 @@ def test_crag_judge_routes_to_codex(monkeypatch):
     assert crag.judge(_PROSE_PRED, _PROSE_TRUTH) == "Acceptable"
 
 
+def test_crag_judge_codex_majority_keeps_strict_prompt(monkeypatch):
+    monkeypatch.setenv("JUDGE_BACKEND", "codex")
+    seen = {}
+
+    def fake_one(pred, truth, sys_prompt, strict, n_votes=None):
+        seen.update(sys_prompt=sys_prompt, strict=strict, n_votes=n_votes)
+        return "Acceptable"
+
+    monkeypatch.setattr(codex_judge, "judge_one", fake_one)
+    assert crag.judge(_PROSE_PRED, _PROSE_TRUTH,
+                      votes=3, majority=True) == "Acceptable"
+    assert crag.JUDGE_STRICT_ADDENDUM in seen["sys_prompt"]
+    assert seen["strict"] is False and seen["n_votes"] == 3
+
+
 def test_crag_judge_codex_applies_strict_downgrade(monkeypatch):
     # Verbose free-text "Perfect" from the LLM must still be knocked down deterministically.
     truth = "未連絡"
@@ -164,6 +179,22 @@ def test_score_pairs_codex_batches_only_nondeterministic(monkeypatch):
     assert [r["judged"] for r in results] == ["Perfect", "Acceptable"]
     assert score == pytest.approx((1.0 + 0.5) / 2)
     assert all(r["backend"] == "codex" for r in results)
+
+
+def test_gold_style_score_pairs_uses_three_vote_majority(monkeypatch):
+    monkeypatch.setenv("JUDGE_BACKEND", "codex")
+    seen = {}
+
+    def fake_batch(pairs, sys_prompt, strict, n_votes=None):
+        seen.update(pairs=pairs, strict=strict, n_votes=n_votes)
+        return ["Acceptable"] * len(pairs)
+
+    monkeypatch.setattr(codex_judge, "judge_batch", fake_batch)
+    _score, results = crag.score_pairs(
+        [(_PROSE_PRED, _PROSE_TRUTH)], votes=3, majority=True)
+    assert seen == {"pairs": [(_PROSE_PRED, _PROSE_TRUTH)],
+                    "strict": False, "n_votes": 3}
+    assert results[0]["judged"] == "Acceptable"
 
 
 def test_score_pairs_codex_error_propagates_no_gemini_fallback(monkeypatch):

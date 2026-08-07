@@ -61,10 +61,10 @@ Judge = Callable[[list[tuple[str, str]]], list[str]]
 
 
 def default_judge(pairs: list[tuple[str, str]]) -> list[str]:
-    """Judge pairs with the shared CRAG stack (deterministic pre-pass + codex batch)."""
+    """Judge pairs with the deterministic pre-pass, then a stable 3-vote majority."""
     from scoring import crag
 
-    _mean, results = crag.score_pairs(pairs)
+    _mean, results = crag.score_pairs(pairs, votes=3, majority=True)
     return [r["judged"] for r in results]
 
 

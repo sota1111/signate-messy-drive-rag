@@ -185,7 +185,8 @@ data/share_drive (416 files, gitignored)
 `JUDGE_BACKEND` の明示指定時のみ。審査はバッチ実行（既定30問=valid30を1回の `codex exec` で採点）。
 チューニングは環境変数
 `CODEX_JUDGE_MODEL` / `CODEX_JUDGE_BATCH` / `CODEX_JUDGE_VOTES` / `CODEX_JUDGE_TIMEOUT`
-（`scoring/codex_judge.py`）。注意: ローカル採点は依然 proxy であり、採用ゲートは実LB確認のみ。
+（`scoring/codex_judge.py`）。gold-100 は決定論的な同義判定を先行し、未解決項目だけを3票多数決で
+採点する。注意: ローカル採点は依然 proxy であり、採用ゲートは実LB確認のみ。
 
 **回答生成の Opus バックエンド**（SOT-2457）: `--gen opus` で回答生成を Vertex Gemini でなく
 **Claude Opus**（`claude -p --model opus`, `src/rag/opus_gen.py`）が担当する。検索・決定論
