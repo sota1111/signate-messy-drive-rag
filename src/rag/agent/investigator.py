@@ -212,6 +212,7 @@ class Investigation:
     stop_reason: str            # "answered" | "max_turns" | "timeout" | "model_error"
     error: str | None = None
     contract: str | None = None  # SOT-2498 — routing contract this question was classified as (or None)
+    calc_record: dict[str, Any] | None = None  # SOT-2506 — in-memory record for the execution gate
 
     @property
     def confidence(self) -> float:
@@ -511,11 +512,12 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     default ``None`` is a pure no-op so the commit-vs-abstain decision and every existing caller are
     unchanged (受け入れ条件②).
 
-    ``calc_ledger`` (SOT-2495) is the commit-side twin: when enabled, derivation-tool contracts are
-    *observed* (never altered) during the loop, and if the final answer is a committed **numeric** answer
-    a typed :class:`~src.rag.agent.calc_ledger.CalcRecord` (raw_text / parsed_value / unit / source_range
-    / formula + per-compute証跡) is appended (``True`` → ``artifacts/calc_ledger.jsonl``; a ``str``/``Path``
-    redirects it). Same observer-only invariant: the answer path is byte-identical with it on or off.
+    ``calc_ledger`` (SOT-2495/SOT-2506) is the commit-side twin: when enabled, derivation-tool contracts
+    are *observed* (never altered) during the loop, and if the final answer is numeric—or is a label
+    selected by a ``numeric`` contract—a typed :class:`~src.rag.agent.calc_ledger.CalcRecord` (raw_text /
+    parsed_value / unit / source_range / formula + per-compute証跡) is appended (``True`` →
+    ``artifacts/calc_ledger.jsonl``; a ``str``/``Path`` redirects it). Same observer-only invariant: the
+    answer path is byte-identical with it on or off.
 
     ``research`` (SOT-2502) enables the obligation-driven local re-search loop: when it is not
     ``None``/``False``, a deliberate ``submit_answer`` abstain is not accepted immediately — the
@@ -691,13 +693,16 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
         _abstain_ledger.record_abstain(
             investigation, signals, path=(None if ledger is True else ledger))
 
-    # SOT-2495 — calc ledger: the commit-side twin, also purely post-decision. A committed numeric
-    # answer always gets a typed record (grounded when a compute step backs it, else flagged as 暗算), so
-    # a numeric answer without a ledger entry is impossible while the answer itself stays unchanged.
-    if calc_enabled and not is_abstain(investigation.answer.answer) \
-            and _calc_ledger.is_numeric_answer(investigation.answer.answer):
-        _calc_ledger.record_calc(
+    # SOT-2495/SOT-2506 — calc ledger: record literal numbers AND answers (e.g. a column label such as
+    # ``bmi``) produced under the numeric/derived-calculation contract.  The latter matters for argmax
+    # statistics: the served answer is text, but it is still the output of a replayable computation.
+    # Keep the record on the Investigation as well as persisting it, avoiding racy question lookups in
+    # the shared JSONL when gate_question runs concurrently over gold-100.
+    if calc_enabled and not is_abstain(investigation.answer.answer) and (
+            _calc_ledger.is_numeric_answer(investigation.answer.answer) or contract == "numeric"):
+        record = _calc_ledger.record_calc(
             investigation, calc_signals, path=(None if calc_ledger is True else calc_ledger))
+        investigation.calc_record = record.to_dict()
 
     return investigation
 

@@ -75,12 +75,13 @@ GATE_COMMIT_CONFIDENCE = _float_env("GATE_COMMIT_CONFIDENCE", 0.7)
 # confirmation (see scoring/abstain_breakdown.py, artifacts/gold_abstain_breakdown.md).
 GATE_COMMIT_ON_TIEBREAK = _bool_env("GATE_COMMIT_ON_TIEBREAK", False)
 GATE_TIEBREAK_CONFIDENCE = _float_env("GATE_TIEBREAK_CONFIDENCE", 0.85)
-# SOT-2501 — whether a committed *numeric* answer must additionally survive the execution verifier
-# (計算台帳の独立再実行照合). Default OFF: the whole numeric-verification path is behavior-neutral (既存数値
-# MATCH / 関門2 は byte-identical) until real-LB / 関門2 で非劣化が確認できるまで — mirrors the
-# GATE_COMMIT_ON_TIEBREAK precedent (SOT-2483). When ON, a numeric commit whose independent re-execution
-# conflicts / cannot be replayed / cannot be decided is downgraded to 棄権 (Incorrect=−1 回避).
-GATE_EXEC_VERIFY = _bool_env("GATE_EXEC_VERIFY", False)
+# SOT-2501/SOT-2506 — execution verification is now adopted for the derived-calculation slice.  The
+# question-contract classifier calls that slice ``numeric`` even when the computed output is a label
+# (e.g. correlation idxmax -> ``bmi``).  Keep two environment knobs so 関門2 can compare candidate and
+# champion without code changes: the master switch and a comma-separated allow-list of contracts.
+GATE_EXEC_VERIFY = _bool_env("GATE_EXEC_VERIFY", True)
+GATE_EXEC_VERIFY_CONTRACTS = frozenset(
+    c.strip() for c in os.getenv("GATE_EXEC_VERIFY_CONTRACTS", "numeric").split(",") if c.strip())
 # SOT-2503 — whether the 合議一致 commit threshold is calibrated **per question-contract slice** rather
 # than by the single global GATE_COMMIT_CONFIDENCE. Default OFF: the whole slice-calibration path is
 # behavior-neutral (既定は現行同等・byte-identical) until 関門2 非劣化 / 実LB で緩和が確認できるまで — mirrors
@@ -215,26 +216,35 @@ def _abstain(question: str, resolution: Resolution, reason: str) -> GateDecision
 
 
 # --------------------------------------------------------------------------- execution gate (SOT-2501)
-def apply_exec_gate(decision: GateDecision, exec_verdict: ExecVerdict | None, *,
-                    exec_verify: bool | None = None) -> GateDecision:
-    """Downgrade a committed **numeric** answer to 棄権 when its independent re-execution does not confirm it.
+def _exec_enabled(exec_verify: bool | None, contract: str | None, question: str) -> bool:
+    """Resolve the master switch + contract allow-list; an explicit argument is a force override."""
+    if exec_verify is not None:
+        return bool(exec_verify)
+    contract = contract or _classify_contract(question)
+    return GATE_EXEC_VERIFY and contract in GATE_EXEC_VERIFY_CONTRACTS
 
-    Numeric answers are the execution verifier's domain; non-numeric commits are left to the heterogeneous
-    verifier (SOT-2470) and pass through unchanged. Applies only when ``exec_verify`` is enabled (defaults
-    to :data:`GATE_EXEC_VERIFY`, which is OFF), the ``decision`` currently commits, and an ``exec_verdict``
-    is present. A verdict whose ``should_abstain`` is True (EVIDENCE_CONFLICT / 暗算 / 決着不能) turns the
-    commit into a precision-first abstention; a confirming (EXEC_MATCH) verdict leaves the commit intact.
+
+def apply_exec_gate(decision: GateDecision, exec_verdict: ExecVerdict | None, *,
+                    exec_verify: bool | None = None,
+                    contract: str | None = None) -> GateDecision:
+    """Downgrade a committed derived-calculation answer when re-execution does not confirm it.
+
+    Literal numeric answers and the ``numeric`` question-contract slice are in scope; unrelated text
+    lookups remain with the heterogeneous verifier. With no explicit ``exec_verify`` override, both the
+    master flag and :data:`GATE_EXEC_VERIFY_CONTRACTS` must opt the contract in. A conflicting,
+    ungrounded or undecidable verdict turns the commit into a precision-first abstention.
     """
-    exec_verify = GATE_EXEC_VERIFY if exec_verify is None else exec_verify
-    if not (exec_verify and decision.commit and exec_verdict is not None):
+    enabled = _exec_enabled(exec_verify, contract, decision.question)
+    if not (enabled and decision.commit and exec_verdict is not None):
         return decision
-    if not is_numeric_answer(decision.answer):
+    effective_contract = contract or _classify_contract(decision.question)
+    if not (is_numeric_answer(decision.answer) or effective_contract == "numeric"):
         return decision
     if not exec_verdict.should_abstain:
         return decision
     return _abstain(
         decision.question, decision.resolution,
-        f"数値回答の実行検証で棄権({exec_verdict.category}): {exec_verdict.reason}")
+        f"計算回答の実行検証で棄権({exec_verdict.category}): {exec_verdict.reason}")
 
 
 # --------------------------------------------------------------------------- pure gate core
@@ -264,10 +274,10 @@ def apply_gate(resolution: Resolution, *,
     one-directional and applies only to slices proven EV>0 / WRONG-safe by
     :mod:`scoring.slice_calibration`; default OFF ⇒ byte-identical to a plain global run.
 
-    On top of the confidence decision, a committed **numeric** answer is additionally routed through
-    :func:`apply_exec_gate` (SOT-2501): when ``exec_verify`` is enabled and an ``exec_verdict`` refutes the
-    number (独立再実行の入力集合/計算の相違), the commit is downgraded to 棄権. Default OFF, so the answer path
-    is unchanged unless an execution verdict is supplied and verification is turned on.
+    On top of the confidence decision, a committed derived-calculation answer is additionally routed
+    through :func:`apply_exec_gate` (SOT-2501/SOT-2506): the default contract allow-list enables this for
+    ``numeric`` questions, and a refuting ``exec_verdict`` downgrades the commit to 棄権.  Other contracts
+    remain unchanged; the master flag or explicit override can disable the execution gate.
 
     Thresholds default to the module-level env-configured values; pass explicit overrides for tests.
     """
@@ -282,7 +292,8 @@ def apply_gate(resolution: Resolution, *,
     decision = _apply_confidence_gate(
         resolution, commit_confidence=effective_commit,
         commit_on_tiebreak=commit_on_tiebreak, tiebreak_confidence=tiebreak_confidence)
-    return apply_exec_gate(decision, exec_verdict, exec_verify=exec_verify)
+    return apply_exec_gate(
+        decision, exec_verdict, exec_verify=exec_verify, contract=contract)
 
 
 def _apply_confidence_gate(resolution: Resolution, *,
@@ -337,6 +348,7 @@ def gate_question(question: str, *,
                   tiebreak_confidence: float | None = None,
                   committed_calc_record: dict[str, Any] | None = None,
                   exec_verify: bool | None = None,
+                  contract: str | None = None,
                   slice_thresholds: dict[str, float] | None = None,
                   slice_calibrate: bool | None = None,
                   **resolve_kwargs: Any) -> GateDecision:
@@ -357,26 +369,33 @@ def gate_question(question: str, *,
         question, investigator_model=investigator_model,
         verifier_model=verifier_model, judge_model=judge_model, **resolve_kwargs,
     )
-    exec_verdict = _live_exec_verdict(committed_calc_record, exec_verify=exec_verify)
+    committed_calc_record = committed_calc_record or resolution.calc_record
+    contract = contract or (
+        str(committed_calc_record.get("contract"))
+        if committed_calc_record and committed_calc_record.get("contract") else None)
+    contract = contract or _classify_contract(question)
+    exec_verdict = _live_exec_verdict(
+        committed_calc_record, exec_verify=exec_verify, contract=contract, question=question)
     if slice_thresholds is None:
         slice_thresholds = load_slice_thresholds()
     return apply_gate(
         resolution, commit_confidence=commit_confidence,
         commit_on_tiebreak=commit_on_tiebreak, tiebreak_confidence=tiebreak_confidence,
         exec_verdict=exec_verdict, exec_verify=exec_verify,
-        slice_thresholds=slice_thresholds, slice_calibrate=slice_calibrate,
+        slice_thresholds=slice_thresholds, contract=contract, slice_calibrate=slice_calibrate,
     )
 
 
 def _live_exec_verdict(committed_calc_record: dict[str, Any] | None, *,
-                       exec_verify: bool | None) -> ExecVerdict | None:
-    """Best-effort live execution verdict for a committed numeric record (None when disabled/inapplicable)."""
-    enabled = GATE_EXEC_VERIFY if exec_verify is None else exec_verify
+                       exec_verify: bool | None, contract: str | None = None,
+                       question: str = "") -> ExecVerdict | None:
+    """Best-effort live verdict for an opted-in calculation record (None when inapplicable)."""
+    enabled = _exec_enabled(exec_verify, contract, question)
     if not enabled or committed_calc_record is None:
         return None
     from src.rag.agent import exec_verifier
 
-    if not exec_verifier.is_numeric_record(committed_calc_record):
+    if not exec_verifier.is_verifiable_record(committed_calc_record):
         return None
     try:
         return exec_verifier.verify_question(committed_calc_record)

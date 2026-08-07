@@ -82,6 +82,8 @@ def test_route_hint_for_numeric_prefers_canonical_route():
     assert contract.contract == qc.NUMERIC
     hint = routing.route_hint(contract, q)
     assert "canonical_route" in hint
+    assert "生データ再計算・notebookの実行出力 > 文書中のmarkdown/散文" in hint
+    assert "kind='train'" in hint
     # the Adaptive-RAG note tells it not to run a uniform high-cost search first
     assert "一律" in hint or "chunk" in hint
 

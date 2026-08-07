@@ -65,7 +65,7 @@ ABSTAIN = settings.ABSTAIN
 DEFAULT_EXEC_MODEL = settings.GEN_MODEL_HARD  # gemini-2.5-pro (fresh profile ⇒ still uncorrelated)
 
 EXEC_VERIFIER_SYSTEM_PROMPT = (
-    "あなたは数値回答の独立実行検証エージェントです。別の調査エージェントが数値の答えを出していますが、"
+    "あなたは計算回答の独立実行検証エージェントです。別の調査エージェントが計算由来の答えを出していますが、"
     "その回答・その計算過程は一切与えられません。あなたは質問だけを手掛かりに、**入力集合(対象ファイル・"
     "対象列・対象行の絞り込み)を一から自力で再特定**し、計算を**再実行**して数値を再導出します。目的は、"
     "値そのものだけでなく『どの集合をどの列で数えた/計算したか』を独立に確かめ、相関ペアの取り違えや"
@@ -77,9 +77,13 @@ EXEC_VERIFIER_SYSTEM_PROMPT = (
     "3. 数値計算(平均・合計・件数・相関など)は必ず compute ツールで行い、列名や絞り込み値が不明なときは"
     "`df.columns.tolist()` や `df['列'].unique().tolist()` で先に確認し、**質問が指す対象列を取り違えない**"
     "よう厳密に対応付けてから式を組む。\n"
-    "4. 十分な根拠が得られたら、最終回答は必ず submit_answer ツールを1回だけ呼んで返す。answer=回答本文"
-    "(値のみ、金額は原文表記)、confidence=0.0〜1.0、evidence=根拠、method=導出手順(使った列・行数を明記)。\n"
-    f"5. あらゆる手段を尽くしても根拠が該当しない/再導出できない場合に限り answer=「{ABSTAIN}」・"
+    "4. 証拠の優先順位は『computeによる生データ再計算・notebookの実行出力 > markdown/散文の主張』とする。"
+    "矛盾時は canonical_route で元データへ直行し、compute の再計算値だけを採用する。notebook質問では"
+    " canonical_route(question=..., kind='train', expr='...') を使い、矛盾した散文を evidence に含めない。\n"
+    "5. 十分な根拠が得られたら、最終回答は必ず submit_answer ツールを1回だけ呼んで返す。answer=回答本文"
+    "(計算値または計算で選ばれた列名、金額は原文表記)、confidence=0.0〜1.0、evidence=根拠、"
+    "method=導出手順(使った列・行数を明記)。\n"
+    f"6. あらゆる手段を尽くしても根拠が該当しない/再導出できない場合に限り answer=「{ABSTAIN}」・"
     "confidence=0.0 で submit_answer する(存在しない値を捏造しない)。"
 )
 
@@ -299,8 +303,9 @@ def verify_execution(committed: Mapping[str, Any], *,
 
 # --------------------------------------------------------------------------- live re-execution
 def _record_shell(question: str, answer: str) -> dict[str, Any]:
-    """A minimal ledger-shaped dict for a re-execution that produced no numeric calc record (棄権/暗算)."""
-    return {"question": question, "answer": answer, "typed_value": {}, "compute_steps": []}
+    """A minimal ledger-shaped dict for a re-execution that produced no calc record (棄権/暗算)."""
+    return {"question": question, "answer": answer, "typed_value": {}, "compute_steps": [],
+            "contract": None}
 
 
 def rederive_calc(question: str, *,
@@ -312,19 +317,27 @@ def rederive_calc(question: str, *,
     """Run one independent re-execution of ``question`` and return its calc-ledger-shaped record.
 
     Reuses the fully-tested SOT-2495 calc-ledger wiring: the investigation is run with a fresh profile /
-    own tools (tool-path independence) and its numeric commit is recorded to a throwaway JSONL, which we
-    read back as the re-derived record. A re-execution that abstains or answers non-numerically writes no
-    calc record → a shell record whose ``answer`` drives the :data:`EXEC_UNDECIDABLE` branch.
+    own tools (tool-path independence) and its numeric/derived-calculation commit is recorded to a
+    throwaway JSONL, which we read back as the re-derived record. A re-execution that abstains or produces
+    no calculation record yields a shell whose ``answer`` drives the :data:`EXEC_UNDECIDABLE` branch.
     """
     prof = (profile_factory or CorpusProfile)()
     tools = build_tools(prof)
     if model is None:
         factory = model_factory or exec_model_factory
         model = factory(question, tools)
+    # The contract is part of the calculation semantics.  In particular, a correlation argmax returns
+    # a column label (``bmi``), not a numeric literal, but still needs a replayable calc record.
+    try:
+        from src.rag.agent import question_contract as qc
+
+        contract = qc.classify(question).contract
+    except Exception:  # noqa: BLE001 — classification is advisory; preserve the old numeric path
+        contract = None
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "rederive.jsonl"
         investigation = investigate(model, question, tools, max_turns=max_turns,
-                                    timeout_s=timeout_s, calc_ledger=path)
+                                    timeout_s=timeout_s, calc_ledger=path, contract=contract)
         answer = investigation.answer.answer
         if path.exists():
             lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
@@ -359,6 +372,12 @@ def verify_question(committed: Mapping[str, Any], *, model: str | None = None,
     return verify_execution(committed, rederive=_rederive)
 
 
+def is_verifiable_record(record: Mapping[str, Any] | None) -> bool:
+    """True for a literal number or a value selected by the numeric/derived-calculation contract."""
+    return record is not None and (
+        is_numeric_answer(_answer_of(record)) or record.get("contract") == "numeric")
+
+
 def is_numeric_record(record: Mapping[str, Any] | None) -> bool:
-    """True iff ``record`` carries a numeric committed answer that the execution verifier should re-run."""
-    return record is not None and is_numeric_answer(_answer_of(record))
+    """Backward-compatible name for :func:`is_verifiable_record` (SOT-2501 public API)."""
+    return is_verifiable_record(record)
