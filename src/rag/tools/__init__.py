@@ -39,6 +39,7 @@ from src.rag.tools.emf_pivot import (
     extract_emf_pivot,
     extract_pptx_pivots,
     highlighted_cells,
+    resolve_pivot_semantics,
 )
 from src.rag.tools.chart_numcache import (
     chart_series,

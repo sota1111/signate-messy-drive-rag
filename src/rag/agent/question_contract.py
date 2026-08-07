@@ -37,9 +37,10 @@ than counted as errors.
 """
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable, Mapping, Sequence
 
 from config import settings
 from src.rag import archetype as _archetype
@@ -92,6 +93,7 @@ CONTRACT_COMPLETION: dict[str, tuple[str, ...]] = {
     FORMAT_CHECK: (
         "判定対象の書式属性(太字/下線/色/フォント)を原本から機械抽出する",
         "該当箇所を網羅し、非該当(例:日付)を除外できる",
+        "表/ピボットの場合は生の行・列ラベルを元データのフィールド名へ意味解決し、抽出条件・対象列・集計方法を確定する",
     ),
     CHART_READ: (
         "対象グラフ(図番号/シート/系列)を一意に特定する",
@@ -108,8 +110,9 @@ CONTRACT_COMPLETION: dict[str, tuple[str, ...]] = {
     ),
     NUMERIC: (
         "型付き入力(数値/単位/対象列)を根拠から確定する",
+        "質問が要求する量を分子・分母・母集団まで定義し、『〜のうち』の直前にある条件を分母から落とさない",
         "再実行可能な式で決定論的に導出できる",
-        "計算結果の桁数/単位が質問の要求と一致する",
+        "計算結果の単位と丸め(小数第N位など)が質問の要求と一致する",
     ),
 }
 
@@ -163,7 +166,9 @@ _CHART_RE = re.compile(
     r"可視化したもの|ビンの範囲")
 _FORMAT_RE = re.compile(
     r"太字|ボールド|下線|アンダーライン|イタリック|斜体|取り消し線|"
-    r"フォント|文字色|背景色|セルの色|塗りつぶし|罫線|ハイライト色|マーカー(の色|で)")
+    r"フォント|文字色|背景色|セルの色|塗りつぶし|罫線|ハイライト(?:色|され|した|して)|"
+    r"マーカー(の色|で)|ピボット|pivot",
+    re.I)
 # A multi-hop question threads one entity into the lookup of another ("最も…な人/案件 の …").
 _MULTIHOP_RE = re.compile(
     r"(もっとも|最も|一番|最大|最高|最多).{0,24}(人|担当者|案件|案件名|プロジェクト|会社|社|ファイル)"
@@ -224,6 +229,191 @@ class QuestionContract:
             "confidence": self.confidence,
             "evidence": self.evidence,
         }
+
+
+# --------------------------------------------------------------------------- numeric quantity contract
+# Numeric questions frequently fail even after a correct file lookup because the model silently changes
+# *what quantity is being measured*.  In particular, Japanese ``X のうち Y の割合`` fixes X as the
+# denominator population.  The helpers below turn that wording, the requested unit, and the rounding
+# instruction into a small machine-checkable contract shared by the investigator and exec verifier.
+_ASCII_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_DECIMAL_PLACES_RE = re.compile(r"小数第\s*(\d+)\s*位")
+_NUMERIC_LITERAL_RE = re.compile(r"[+-]?\d+(?:,\d{3})*(?:\.(\d+))?")
+_IGNORED_SCOPE_IDENTIFIERS = frozenset({"csv", "tsv", "xlsx", "xlsm", "df", "data"})
+
+
+@dataclass(frozen=True)
+class NumericRequirements:
+    """The quantity/unit/rounding promises explicitly requested by one numeric question."""
+
+    ratio: bool = False
+    denominator_scope: str = ""
+    denominator_fields: tuple[str, ...] = ()
+    denominator_operators: tuple[str, ...] = ()  # lt/lte/gt/gte/eq
+    unit: str | None = None
+    decimal_places: int | None = None
+
+
+@dataclass(frozen=True)
+class NumericValidation:
+    """Result of checking a proposed numeric answer and its executed formulas against the question."""
+
+    passed: bool
+    issues: tuple[str, ...] = ()
+    denominator_formula: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "passed": self.passed,
+            "issues": list(self.issues),
+            "denominator_formula": self.denominator_formula,
+        }
+
+
+def _denominator_scope(question: str) -> str:
+    """Return the condition immediately governing ``のうち`` (the denominator population)."""
+    if "のうち" not in question:
+        return ""
+    prefix = question.split("のうち", 1)[0]
+    # Drop the document/project preamble while preserving the complete local condition.
+    for sep in ("。", "？", "?", "！", "!", "、", ","):
+        if sep in prefix:
+            prefix = prefix.rsplit(sep, 1)[-1]
+    return prefix.strip()
+
+
+def numeric_requirements(question: str) -> NumericRequirements:
+    """Infer the explicit numeric answer contract without consulting a model or corpus facts."""
+    q = nfc(question or "")
+    ratio = bool(re.search(r"割合|比率|何\s*[%％]|パーセント", q, re.I))
+    scope = _denominator_scope(q) if ratio else ""
+    fields = tuple(dict.fromkeys(
+        token for token in _ASCII_IDENTIFIER_RE.findall(scope)
+        if token.lower() not in _IGNORED_SCOPE_IDENTIFIERS
+    ))
+    ops: list[str] = []
+    for pattern, code in (
+        (r"未満", "lt"), (r"以下", "lte"), (r"(?:より大き|超え|超の)", "gt"),
+        (r"以上", "gte"), (r"(?:=|＝|等しい)", "eq"),
+    ):
+        if re.search(pattern, scope):
+            ops.append(code)
+
+    unit: str | None = None
+    for pattern, canonical in (
+        (r"[%％]|パーセント", "%"), (r"億円|万円|千円|円", "円"),
+        (r"ドル", "ドル"), (r"件", "件"), (r"人", "人"), (r"時間", "時間"),
+        (r"日(?:間|数)?", "日"), (r"倍", "倍"),
+    ):
+        if re.search(pattern, q):
+            unit = canonical
+            break
+    rounding = _DECIMAL_PLACES_RE.search(q)
+    return NumericRequirements(
+        ratio=ratio,
+        denominator_scope=scope,
+        denominator_fields=fields,
+        denominator_operators=tuple(ops),
+        unit=unit,
+        decimal_places=(int(rounding.group(1)) if rounding else None),
+    )
+
+
+def _step_parts(step: Any) -> tuple[str, Any]:
+    if isinstance(step, Mapping):
+        return str(step.get("code", "") or ""), step.get("output")
+    return str(getattr(step, "code", "") or ""), getattr(step, "output", None)
+
+
+def _division_denominator(code: str) -> ast.AST | None:
+    try:
+        tree = ast.parse(code, mode="eval")
+    except (SyntaxError, ValueError):
+        return None
+    return next((n.right for n in ast.walk(tree) if isinstance(n, ast.BinOp)
+                 and isinstance(n.op, ast.Div)), None)
+
+
+def _same_number(left: Any, right: Any) -> bool:
+    try:
+        return abs(float(left) - float(right)) <= max(1e-12, abs(float(right)) * 1e-12)
+    except (TypeError, ValueError):
+        return False
+
+
+def _resolved_denominator_formula(formulas: Sequence[Any]) -> str:
+    """Find the final ratio denominator and follow a numeric literal back to its compute provenance."""
+    parts = [_step_parts(s) for s in formulas]
+    for index in range(len(parts) - 1, -1, -1):
+        code, _output = parts[index]
+        denominator = _division_denominator(code)
+        if denominator is None:
+            continue
+        if isinstance(denominator, ast.Constant) and isinstance(denominator.value, (int, float)):
+            for prior_code, prior_output in reversed(parts[:index]):
+                if prior_code and _same_number(prior_output, denominator.value):
+                    return prior_code
+        try:
+            return ast.unparse(denominator)
+        except Exception:  # pragma: no cover - ast.unparse is available on supported Python
+            return code
+    return ""
+
+
+def _formula_operators(code: str) -> frozenset[str]:
+    try:
+        tree = ast.parse(code, mode="eval")
+    except (SyntaxError, ValueError):
+        return frozenset()
+    mapping = {ast.Lt: "lt", ast.LtE: "lte", ast.Gt: "gt", ast.GtE: "gte", ast.Eq: "eq"}
+    return frozenset(mapping[type(op)] for n in ast.walk(tree) if isinstance(n, ast.Compare)
+                     for op in n.ops if type(op) in mapping)
+
+
+def validate_numeric_answer(question: str, answer: str,
+                            formulas: Sequence[Any] = ()) -> NumericValidation:
+    """Check quantity definition, unit and rounding before a numeric answer may be committed.
+
+    ``formulas`` accepts calc-ledger compute-step dicts or ``ComputeStep``-like objects.  For a literal
+    denominator (``129 / 10938``), its producing step is followed by output value so the population
+    filter remains auditable instead of disappearing behind the count.
+    """
+    req = numeric_requirements(question)
+    issues: list[str] = []
+    denominator = _resolved_denominator_formula(formulas) if req.ratio else ""
+    if req.ratio and req.denominator_scope:
+        if not denominator:
+            issues.append(
+                f"量の定義が未確認: 『{req.denominator_scope}のうち』の分母を計算証跡から特定できない")
+        else:
+            missing_fields = [f for f in req.denominator_fields
+                              if not re.search(rf"\b{re.escape(f)}\b", denominator)]
+            if missing_fields:
+                issues.append(
+                    "量の定義が不一致: 分母に『〜のうち』条件の対象列がない(" +
+                    ", ".join(missing_fields) + f"; 分母={denominator})")
+            present_ops = _formula_operators(denominator)
+            missing_ops = [op for op in req.denominator_operators if op not in present_ops]
+            if missing_ops:
+                issues.append(
+                    "量の定義が不一致: 分母に『〜のうち』条件の比較がない(" +
+                    ", ".join(missing_ops) + f"; 分母={denominator})")
+
+    normalized_answer = nfc(answer or "").replace("％", "%")
+    if req.unit == "%" and "%" not in normalized_answer:
+        issues.append("単位が不一致: 質問は%を要求している")
+    elif req.unit and req.unit not in ("%", "円") and req.unit not in normalized_answer:
+        issues.append(f"単位が不一致: 質問は{req.unit}を要求している")
+    elif req.unit == "円" and "円" not in normalized_answer:
+        issues.append("単位が不一致: 質問は円単位を要求している")
+
+    if req.decimal_places is not None:
+        match = _NUMERIC_LITERAL_RE.search(normalized_answer)
+        actual = len(match.group(1) or "") if match else None
+        if actual != req.decimal_places:
+            issues.append(
+                f"丸めが不一致: 小数第{req.decimal_places}位を要求、回答の小数桁={actual}")
+    return NumericValidation(not issues, tuple(issues), denominator)
 
 
 def _build(contract: str, arch: str, method: str, confidence: float, evidence: str) -> QuestionContract:

@@ -11,8 +11,9 @@ What an obligation is
 Each obligation is a ``{obligation, kind, status, evidence_ref}`` record:
 
 * ``obligation`` — a one-line statement of what must be established (e.g. "回答値の出典を一意に特定する").
-* ``kind`` — one of the seven structural :data:`KINDS` (対象/版の確定・判定規則・列挙・値の対応・単位正規化・
-  計算実行・整合確認), so a loop can reason about *what type* of gap is open without parsing prose.
+* ``kind`` — one of the structural :data:`KINDS` (対象/版の確定・判定規則・列挙・値の対応・量の定義・
+  単位正規化・丸め・計算実行・整合確認), so a loop can reason about *what type* of gap is open without
+  parsing prose.
 * ``status`` — ``"unmet"`` until collected evidence discharges it, then ``"met"``.
 * ``evidence_ref`` — the reference/snippet of the evidence that discharged it (empty while unmet).
 
@@ -47,18 +48,21 @@ SOURCE_LOCATION = "source_location"        # 対象ファイル群と版の確�
 JUDGMENT_RULE = "judgment_rule"            # 判定規則(書式/空間/差分などの規則)
 ENUMERATION = "enumeration"                # 全該当要素の列挙(母集団の閉包)
 VALUE_MAPPING = "value_mapping"            # 値の対応(エンティティ⇔値の解決)
+QUANTITY_DEFINITION = "quantity_definition"  # 量の定義(分子/分母/母集団・「〜のうち」のスコープ)
 UNIT_NORMALIZATION = "unit_normalization"  # 単位正規化(桁/単位の整合)
+ROUNDING = "rounding"                      # 丸め(小数第N位/切上げ/切捨て)
 COMPUTATION = "computation"                # 計算実行(決定論的な再導出)
 CONSISTENCY = "consistency"                # 整合確認(再計算/連鎖の整合)
 
 KINDS: tuple[str, ...] = (
-    SOURCE_LOCATION, JUDGMENT_RULE, ENUMERATION, VALUE_MAPPING,
-    UNIT_NORMALIZATION, COMPUTATION, CONSISTENCY,
+    SOURCE_LOCATION, JUDGMENT_RULE, ENUMERATION, VALUE_MAPPING, QUANTITY_DEFINITION,
+    UNIT_NORMALIZATION, ROUNDING, COMPUTATION, CONSISTENCY,
 )
 
 KIND_LABELS: dict[str, str] = {
     SOURCE_LOCATION: "対象/版の確定", JUDGMENT_RULE: "判定規則", ENUMERATION: "全該当要素の列挙",
-    VALUE_MAPPING: "値の対応", UNIT_NORMALIZATION: "単位正規化", COMPUTATION: "計算実行",
+    VALUE_MAPPING: "値の対応", QUANTITY_DEFINITION: "量の定義", UNIT_NORMALIZATION: "単位正規化",
+    ROUNDING: "丸め", COMPUTATION: "計算実行",
     CONSISTENCY: "整合確認",
 }
 
@@ -94,6 +98,8 @@ CONTRACT_OBLIGATIONS: dict[str, tuple[tuple[str, str], ...]] = {
         (SOURCE_LOCATION, "判定対象の原本(ファイル/箇所)を特定する"),
         (JUDGMENT_RULE, "判定する書式属性(太字/下線/色/フォント)を定義する"),
         (ENUMERATION, "該当箇所を網羅し非該当(例:日付)を除外する"),
+        (VALUE_MAPPING, "表/ピボットでは行・列の生ラベルを元データのフィールド名へ意味解決する(該当時)"),
+        (COMPUTATION, "表/ピボットでは抽出条件・対象列・集計方法の必須3要素を確定する(該当時)"),
     ),
     qc.CHART_READ: (
         (SOURCE_LOCATION, "対象グラフ(図番号/シート/系列)を一意に特定する"),
@@ -112,8 +118,10 @@ CONTRACT_OBLIGATIONS: dict[str, tuple[tuple[str, str], ...]] = {
     qc.NUMERIC: (
         (SOURCE_LOCATION, "型付き入力(対象列/対象ファイル)を根拠から特定する"),
         (VALUE_MAPPING, "数値/単位入力を根拠から確定する"),
+        (QUANTITY_DEFINITION, "要求量を分子・分母・母集団で定義し、『〜のうち』直前の条件を分母に保持する"),
         (COMPUTATION, "再実行可能な式で決定論的に導出する"),
-        (UNIT_NORMALIZATION, "計算結果の桁数/単位を質問の要求に合わせる"),
+        (UNIT_NORMALIZATION, "計算結果の単位を質問の要求に合わせる"),
+        (ROUNDING, "小数第N位・切上げ・切捨て等の丸めを質問の要求に合わせる"),
     ),
 }
 
@@ -176,7 +184,9 @@ _KIND_CUES: dict[str, re.Pattern[str]] = {
         r"隣|向かい|左隣|右隣|座席番号|差分|変更点|実質的な変更|規則|条件|基準|定義"),
     ENUMERATION: re.compile(r"すべて|全て|全部|一覧|漏れ|重複|列挙|網羅|該当箇所|\d+\s*件|\d+\s*名|母集団"),
     VALUE_MAPPING: re.compile(r"対応|⇔|=|:|内線|ext|担当|は\s*[\wぁ-んァ-ヶ一-龠]+\s*(です|である)", re.I),
+    QUANTITY_DEFINITION: re.compile(r"分子|分母|母集団|ベース集合|対象集合|.+のうち|割合の定義|比率の定義"),
     UNIT_NORMALIZATION: re.compile(r"円|万円|千円|%|パーセント|単位|桁|小数|kg|件数|人数|時間|日数"),
+    ROUNDING: re.compile(r"小数第\s*\d+\s*位|四捨五入|切り上げ|切上げ|切り捨て|切捨て|丸め|round", re.I),
     COMPUTATION: re.compile(
         r"合計|総額|平均|最大|最小|最多|差額|計算|集計|式|corpus_aggregate|compute|再計算|=\s*\d"),
     CONSISTENCY: re.compile(r"一致|整合|検証|再計算|再現|突き合わ|確認|クロスチェック|矛盾(が)?ない"),
@@ -260,9 +270,10 @@ class ObligationSet:
 # --------------------------------------------------------------------------- flash generation (opt-in)
 _FLASH_SYSTEM = (
     "あなたは社内ドライブ文書QAの質問を、回答を正当化するために必要な『証拠義務』の構造化リストへ分解します。"
-    "各義務は obligation(必要な確立事項の一文)と kind を持ちます。kind は次の7種のいずれか(英字コード):\n"
+    "各義務は obligation(必要な確立事項の一文)と kind を持ちます。kind は次の9種のいずれか(英字コード):\n"
     "source_location=対象ファイル群と版の確定 / judgment_rule=判定規則 / enumeration=全該当要素の列挙 / "
-    "value_mapping=値の対応 / unit_normalization=単位正規化 / computation=計算実行 / consistency=整合確認。\n"
+    "value_mapping=値の対応 / quantity_definition=量の分子・分母・母集団 / "
+    "unit_normalization=単位正規化 / rounding=丸め / computation=計算実行 / consistency=整合確認。\n"
     "与えられた契約型の完了条件を、この質問に固有(具体的なファイル名/版/対象列など)へ具体化しつつ、"
     "漏れなく最小限の義務へ分解してください。推測で答え本文を作らず、義務のみを返すこと。"
 )

@@ -26,6 +26,7 @@ Design invariants
 """
 from __future__ import annotations
 
+import re
 from typing import Callable
 
 from src.rag.agent import question_contract as _qc
@@ -94,6 +95,11 @@ def first_tools_for(contract: QuestionContract, question: str) -> tuple[str, ...
     ``canonical_route`` (the retrieval_miss fix) instead of the fast chunk-search path.
     """
     base = CONTRACT_FIRST_TOOLS.get(contract.contract, ())
+    if contract.contract == _qc.FORMAT_CHECK and (
+            "ピボット" in question.lower() or (
+                ".pptx" in question.lower() and "ハイライト" in question
+                and any(cue in question for cue in ("抽出条件", "集計内容", "行ラベル", "列ラベル")))):
+        return ("pptx_pivot", *(t for t in base if t != "pptx_pivot"))
     if contract.contract in _DATA_ASSET_CANONICAL_CONTRACTS and references_data_asset(question):
         return ("canonical_route", *(t for t in base if t != "canonical_route"))
     return base
@@ -123,12 +129,55 @@ def route_hint(contract: QuestionContract, question: str) -> str:
             "canonical_route / compute / corpus_aggregate で canonical ファイルへ直行し、"
             "一律の高コスト検索を先に行わない。")
     if contract.contract == _qc.NUMERIC:
+        req = _qc.numeric_requirements(question)
         lines.append(
             "証拠の優先順位は『computeによる生データ再計算・notebookの実行出力 > 文書中のmarkdown/"
             "散文の主張』とする。相関・統計・集計で矛盾した散文を正解根拠にしてはならない。"
             "canonical_routeで元の表データを特定し、computeで同じ統計を自力再計算した結果だけを採用する。"
             "notebook質問で元データが必要なら canonical_route(question=..., kind='train', expr='...') を使う。"
             "矛盾した散文は evidence から除外し、methodに再計算した式・対象列を記録する。")
+        lines.append(
+            "数値を計算する前に、要求量を『分子 / 分母 / 母集団 / 単位 / 丸め』へ書き下す。"
+            "特に『XのうちYの割合』の分母はXを満たす全行であり、Yの部分集合へ勝手に変更してはならない。"
+            "分子件数と分母件数を別々にcomputeし、methodに各定義・件数・最終式を明記する。")
+        if re.search(r"(?:負の相関|相関.{0,12}(?:低|小さ|負))", question):
+            lines.append(
+                "負の相関の順位を求める場合は、目的変数自身を候補から列名で明示的に除外したうえで、"
+                "相関係数を昇順に並べた先頭（最小値）を選ぶ。自己相関は+1で最大側なので、"
+                "『自己相関を飛ばすため』という理由で無条件に2番目の最小値を選んではならない。"
+                "採用した列名と相関係数をcompute結果で確認する。")
+        if req.denominator_scope:
+            lines.append(
+                f"この質問で機械抽出した分母条件: 『{req.denominator_scope}』。"
+                "この条件を満たす行数を分母として独立にcomputeし、分母証跡を欠いた回答は確定しない。")
+            if ("標準化" in req.denominator_scope and req.denominator_fields
+                    and "lt" in req.denominator_operators
+                    and re.search(r"0\s*未満", req.denominator_scope)):
+                field = req.denominator_fields[0]
+                lines.append(
+                    f"標準化 z=({field}-mean)/std で std>0 なので、z<0 の母集団は "
+                    f"{field}<全体平均({field}) と同値。分母は例として "
+                    f"len(df[df['{field}'] < df['{field}'].mean()]) をcomputeする。"
+                    "分子の追加条件を分母へ混ぜず、分母を別証跡として先に確定する。")
+        if req.unit or req.decimal_places is not None:
+            lines.append(
+                "要求書式: " + ", ".join(x for x in (
+                    f"単位={req.unit}" if req.unit else "",
+                    f"小数第{req.decimal_places}位" if req.decimal_places is not None else "",
+                ) if x) + "。丸めは未丸め値の計算後、最後の一段だけで適用する。")
+    if contract.contract == _qc.FORMAT_CHECK and first_tools and first_tools[0] == "pptx_pivot":
+        lines.append(
+            "ピボット回答では生ラベル(例: 8/2)やハイライト値だけを答えてはならない。pptx_pivot の "
+            "semantics / filters / target_column / aggregation_label を使い、必ず『抽出条件 + 対象列 + 集計方法』"
+            "の3要素を回答する。semantics が未解決なら別の元データを探索するか棄権する。")
+    if "主略称" in question:
+        lines.append(
+            "回答表面の必須形式は主略称。ツールが返した主略称をそのまま列挙し、正式社名や案件名へ"
+            "展開・言い換えしない。")
+    if "フルネーム" in question:
+        lines.append(
+            "回答表面の必須形式は人名のフルネームのみ。根拠説明、所属、役割、敬称（様/氏）を"
+            "回答欄へ足さず、抽出した氏名を原文表記のまま返す。")
     if contract.completion_conditions:
         checklist = "".join(f"\n  - {c}" for c in contract.completion_conditions)
         lines.append("回答を確定してよい完了条件(満たすまで棄権しない):" + checklist)
