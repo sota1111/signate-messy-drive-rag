@@ -661,6 +661,28 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                     }))
                     dispatched_tool = True
                     break
+                # SOT-2511 — "no special regulation" is only an intermediate finding for a question
+                # asking what the regulation says.  Reject a premature terminal answer until the
+                # governing fallback rule's rate/tax treatment, billing unit/rounding, cycle and cap are
+                # all present.  The guard embeds no policy values; it only enforces semantic coverage.
+                if not is_abstain(candidate.answer):
+                    from src.rag.agent import question_contract as _question_contract
+
+                    regulation_check = _question_contract.validate_regulation_answer(
+                        question, candidate.answer)
+                    if not regulation_check.passed:
+                        responses.append(ToolResponse(SUBMIT_ANSWER, {
+                            "answer_rejected": True,
+                            "reason": "規定内容回答のfallback一般規定が不完全です。",
+                            "missing": list(regulation_check.missing),
+                            "directive": (
+                                "『特別規定は存在しない』だけで確定せず、同じ契約の一般規定を局所再探索し、"
+                                "単価・税処理・課金単位・丸め・精算周期・上限の有無を回答本文にすべて含めてください。"
+                                "値を原文で確定できない場合は推測せず棄権してください。"
+                            ),
+                        }))
+                        dispatched_tool = True
+                        break
                 # SOT-2508 — a numeric answer is not complete merely because a number was computed.
                 # Enforce the question's quantity definition / unit / rounding contract against the
                 # observed compute trail *before* accepting the terminal answer.  This catches the

@@ -165,6 +165,10 @@ _CHART_RE = re.compile(
     r"グラフ\s*\d|棒グラフ|円グラフ|折れ線|折線|散布図|ヒストグラム|チャート|プロット|"
     r"のグラフ(で|の|に)|グラフ(で|の|に).{0,20}(値|カウント|ビン|系列|軸)|"
     r"可視化したもの|ビンの範囲")
+_GANTT_RE = re.compile(
+    r"ガント|Gantt|(?:実行|実施|作業|予定).{0,16}(?:スケジュール|第\s*\d+\s*週|何週)|"
+    r"(?:スケジュール|工程表).{0,24}(?:第何週|何週目|実行予定|実施予定)",
+    re.I)
 _FORMAT_RE = re.compile(
     r"太字|ボールド|下線|アンダーライン|イタリック|斜体|取り消し線|"
     r"フォント|文字色|背景色|セルの色|塗りつぶし|罫線|ハイライト(?:色|され|した|して)|"
@@ -230,6 +234,83 @@ class QuestionContract:
             "confidence": self.confidence,
             "evidence": self.evidence,
         }
+
+
+# --------------------------------------------------------------------------- regulation-content completeness
+# A negative answer to a "what does the regulation say?" question is not complete when a fallback
+# general rule governs the case.  These helpers define the *shape* of the required answer without
+# embedding any corpus-specific amount or policy value.
+_REGULATION_CONTENT_RE = re.compile(
+    r"(?:規定|規約|契約条件).{0,24}(?:内容|詳細|精算方法|取扱い)|"
+    r"(?:精算方法|取扱い).{0,24}(?:規定|規約|契約条件)")
+_NO_SPECIAL_REGULATION_RE = re.compile(
+    r"(?:特別(?:な)?(?:精算)?(?:規定|方法|取扱い)|該当(?:する)?規定|そのような規定|規定).{0,18}"
+    r"(?:存在し(?:ない|ません)|あり(?:ません|得ない)|設け(?:ていない|られていない)|"
+    r"規定されていません|定め(?:がない|られていない|られていません))|"
+    r"(?:存在し(?:ない|ません)|あり(?:ません|得ない)).{0,18}(?:特別(?:な)?(?:精算)?規定|該当(?:する)?規定)")
+_REGULATION_FALLBACK_COMPLETION = (
+    "特別規定が存在しない場合も、代わりに適用される一般規定の要点(単価と税処理・課金単位と丸め・精算周期・上限)をすべて確定する",
+)
+_GANTT_COMPLETION = (
+    "週ヘッダ列のx座標でグリッドを較正し、バーleft/widthとの半開区間の重なりから開始週・終了週を決定論的に確定する",
+    "週境界の候補が競合する場合は目視で推測せず、決定論的根拠が得られるまで回答を確定しない",
+)
+
+
+def is_regulation_content_question(question: str) -> bool:
+    """Whether the question asks for the contents/handling of a rule, not merely its existence."""
+    return bool(_REGULATION_CONTENT_RE.search(nfc(question or "")))
+
+
+def is_gantt_week_question(question: str) -> bool:
+    """Whether a question asks for an activity's week range on a schedule/Gantt visual."""
+    return bool(_GANTT_RE.search(nfc(question or "")))
+
+
+def completion_conditions(question: str, contract: str) -> tuple[str, ...]:
+    """Return the static contract checklist plus question-specific completion promises."""
+    base = CONTRACT_COMPLETION[contract]
+    if contract == SIMPLE_LOOKUP and is_regulation_content_question(question):
+        return (*base, *_REGULATION_FALLBACK_COMPLETION)
+    if contract == CHART_READ and is_gantt_week_question(question):
+        return (*base, *_GANTT_COMPLETION)
+    return base
+
+
+@dataclass(frozen=True)
+class RegulationValidation:
+    """Result of checking a negative special-rule answer for its fallback-rule details."""
+
+    passed: bool
+    applicable: bool = False
+    missing: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        return {"passed": self.passed, "applicable": self.applicable, "missing": list(self.missing)}
+
+
+def validate_regulation_answer(question: str, answer: str) -> RegulationValidation:
+    """Require rate/unit/rounding/cycle/cap when a content answer says no special rule exists.
+
+    Values are intentionally not prescribed: the validator only checks that the answer carries each
+    semantic field.  The actual values must still come from retrieved source evidence.
+    """
+    if not is_regulation_content_question(question):
+        return RegulationValidation(True)
+    text = nfc(answer or "")
+    if not _NO_SPECIAL_REGULATION_RE.search(text):
+        return RegulationValidation(True)
+
+    checks = (
+        ("単価", re.compile(r"(?:時間|工数)?単価|(?:円|ドル)\s*(?:[/／]\s*)?(?:時間|時|h\b)", re.I)),
+        ("税処理", re.compile(r"(?:消費税|税).{0,10}(?:加算|乗じ|含め|込み)|税込")),
+        ("課金単位", re.compile(r"\d+\s*(?:分|時間)\s*単位|(?:分|時間)ごと")),
+        ("丸め", re.compile(r"切り?上げ|切上げ|切り?捨て|切捨て|四捨五入|丸め")),
+        ("精算周期", re.compile(r"月次|毎月|月ごと|月単位|週次|毎週|日次|一括精算")),
+        ("上限", re.compile(r"上限|限度|キャップ", re.I)),
+    )
+    missing = tuple(label for label, pattern in checks if not pattern.search(text))
+    return RegulationValidation(not missing, True, missing)
 
 
 # --------------------------------------------------------------------------- numeric quantity contract
@@ -417,12 +498,13 @@ def validate_numeric_answer(question: str, answer: str,
     return NumericValidation(not issues, tuple(issues), denominator)
 
 
-def _build(contract: str, arch: str, method: str, confidence: float, evidence: str) -> QuestionContract:
+def _build(contract: str, arch: str, method: str, confidence: float, evidence: str,
+           question: str = "") -> QuestionContract:
     return QuestionContract(
         contract=contract,
         label=CONTRACT_LABELS[contract],
         archetype=arch,
-        completion_conditions=CONTRACT_COMPLETION[contract],
+        completion_conditions=completion_conditions(question, contract),
         route=CONTRACT_ROUTE[contract],
         method=method,
         confidence=confidence,
@@ -445,6 +527,8 @@ def _deterministic(q: str, arch: str) -> tuple[str, float, str] | None:
     # New-dimension refinements apply only to lookup/derivation bases.
     if _SPATIAL_GEOM_RE.search(q):
         return SPATIAL, _CONF_SPECIFIC, "spatial cue (座席/隣/向かい)"
+    if _GANTT_RE.search(q):
+        return CHART_READ, _CONF_SPECIFIC, "Gantt cue (schedule/week range)"
     if _CHART_RE.search(q):
         return CHART_READ, _CONF_SPECIFIC, "chart cue (グラフ/ヒストグラム/系列)"
     if base == SIMPLE_LOOKUP and _FORMAT_RE.search(q):
@@ -534,14 +618,15 @@ def classify(question: str, *, flash: Callable[[str], str | None] | None = None)
     decided = _deterministic(q, arch)
     if decided is not None:
         contract, conf, why = decided
-        return _build(contract, arch, "deterministic", conf, why)
+        return _build(contract, arch, "deterministic", conf, why, q)
 
     # Ambiguous: try the flash arbiter, else default to the weakest simple_lookup.
     if flash is not None:
         code = flash(q)
         if code in CONTRACTS:
-            return _build(code, arch, "flash", _CONF_WEAK, "flash arbitration")
-    return _build(SIMPLE_LOOKUP, arch, "deterministic", _CONF_WEAK, f"fallback (archetype={arch})")
+            return _build(code, arch, "flash", _CONF_WEAK, "flash arbitration", q)
+    return _build(SIMPLE_LOOKUP, arch, "deterministic", _CONF_WEAK,
+                  f"fallback (archetype={arch})", q)
 
 
 # --------------------------------------------------------------------------- accuracy measurement

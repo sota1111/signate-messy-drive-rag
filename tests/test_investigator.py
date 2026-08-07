@@ -362,6 +362,27 @@ def test_numeric_contract_rejects_wrong_denominator_before_commit(tmp_path: Path
                and response.response.get("answer_rejected") is True for response in delivered)
 
 
+def test_regulation_content_rejects_no_rule_only_then_accepts_complete_fallback():
+    q = "契約条件で稼働上限を超えた場合の精算方法に関する規定内容を答えてください。"
+    model = ScriptedModel([
+        _submit("超過時の特別な精算規定は存在しません。"),
+        _submit(
+            "特別な精算規定は存在しません。一般規定により時間単価30,000円に消費税を加算し、15分単位で切上げ、"
+            "月次精算し、上限はありません。"
+        ),
+    ])
+    result = investigate(
+        model, q, [inv.SUBMIT_ANSWER_TOOL], max_turns=3,
+        ledger=False, calc_ledger=False, research=False, enumeration=False,
+        contract="simple_lookup",
+    )
+    assert "15分単位" in result.answer.answer and result.stop_reason == "answered"
+    delivered = [response for turn in model.calls_seen if turn for response in turn]
+    rejection = next(response.response for response in delivered
+                     if response.name == SUBMIT_ANSWER and response.response.get("answer_rejected"))
+    assert set(rejection["missing"]) == {"単価", "税処理", "課金単位", "丸め", "精算周期", "上限"}
+
+
 # --------------------------------------------------------------------------- batch loop (acceptance)
 def _factory_for(answers: dict[str, str]):
     """A model factory that answers each question in one turn via submit_answer."""

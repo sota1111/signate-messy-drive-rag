@@ -95,6 +95,14 @@ def first_tools_for(contract: QuestionContract, question: str) -> tuple[str, ...
     ``canonical_route`` (the retrieval_miss fix) instead of the fast chunk-search path.
     """
     base = CONTRACT_FIRST_TOOLS.get(contract.contract, ())
+    if contract.contract == _qc.SIMPLE_LOOKUP and _qc.is_regulation_content_question(question):
+        # Threshold acronyms in the question are often absent from the governing clause.  Locate the
+        # authoritative contract and read its whole pricing/settlement section before trying literal grep.
+        return ("find_files", "read_office", "file_grep")
+    if contract.contract == _qc.CHART_READ and _qc.is_gantt_week_question(question):
+        # Gantt bars are native PPTX shapes: geometry from read_office is authoritative; vision is only
+        # corroboration.  read_chart_values targets embedded numCache charts and cannot recover bar spans.
+        return ("read_office", *(t for t in base if t != "read_office"))
     if contract.contract == _qc.FORMAT_CHECK and (
             "ピボット" in question.lower() or (
                 ".pptx" in question.lower() and "ハイライト" in question
@@ -170,6 +178,21 @@ def route_hint(contract: QuestionContract, question: str) -> str:
             "ピボット回答では生ラベル(例: 8/2)やハイライト値だけを答えてはならない。pptx_pivot の "
             "semantics / filters / target_column / aggregation_label を使い、必ず『抽出条件 + 対象列 + 集計方法』"
             "の3要素を回答する。semantics が未解決なら別の元データを探索するか棄権する。")
+    if contract.contract == _qc.SIMPLE_LOOKUP and _qc.is_regulation_content_question(question):
+        lines.append(
+            "『特別規定なし』は規定内容回答の完了ではない。特別規定が存在しない場合は、同じ契約で"
+            "代わりに適用される一般規定を探索し、単価と税処理・課金単位と丸め・精算周期・上限の有無を"
+            "回答本文にすべて含める。値は原文から取得し、項目が欠けたまま確定しない。")
+        lines.append(
+            "質問中の閾値・略語が契約原文に登場しなくても、字面grepの空振りだけで棄権しない。まず"
+            "find_filesで対象案件の契約書を特定してread_officeし、料金モデル/単価/見込額/工数記録/"
+            "精算方法の連続条項を読む。『契約総額を固定しない』は料金上限なしの根拠として扱い、"
+            "税別単価だけでなく最終請求時の消費税処理も別途確認する。")
+    if contract.contract == _qc.CHART_READ and _qc.is_gantt_week_question(question):
+        lines.append(
+            "ガント週範囲は read_office 冒頭の【ガント週グリッド】決定論抽出を正本とする。"
+            "週セルは半開区間としてバーが重なり始める最初の週を開始週、重なる最後の週を終了週とする。"
+            "vision目視は裏取りだけに使い、抽出が曖昧/競合なら候補の一方を推測せず棄権する。")
     if "主略称" in question:
         lines.append(
             "回答表面の必須形式は主略称。ツールが返した主略称をそのまま列挙し、正式社名や案件名へ"

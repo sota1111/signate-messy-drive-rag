@@ -8,12 +8,15 @@ Encrypted files are transparently decrypted via extract.passwords.
 from __future__ import annotations
 
 import io
+import re
+from dataclasses import dataclass
 
 import docx
 import openpyxl
 from openpyxl.styles.colors import COLOR_INDEX
 from openpyxl.utils import get_column_letter
 from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from src.rag.corpus import FileRef, nfc
 
@@ -180,6 +183,151 @@ def extract_xlsx(ref: FileRef, data: bytes | None) -> str:
 
 
 # ---------------- PPTX ----------------
+_WEEK_HEADER_RE = re.compile(
+    r"^\s*(?:W(?:EEK)?\s*(\d+)|第\s*(\d+)\s*週(?:目)?|(\d+)\s*週(?:目)?)\s*$", re.I)
+
+
+@dataclass(frozen=True)
+class WeekCell:
+    """One calibrated Gantt week column represented as a half-open x interval."""
+
+    week: int
+    left: int
+    right: int
+
+
+def week_range_for_span(left: int, width: int,
+                        cells: list[WeekCell] | tuple[WeekCell, ...]) -> tuple[int, int] | None:
+    """Map a bar span to every week cell it positively overlaps.
+
+    Both bars and cells are half-open intervals.  Therefore a bar ending exactly at the W9 left edge
+    belongs through W8, while starting exactly at that edge belongs to W9.  Positive overlap—not a
+    visual centre-point guess—defines membership, making boundary ±epsilon behaviour deterministic.
+    """
+    start, end = sorted((int(left), int(left) + int(width)))
+    if start == end:
+        return None
+    weeks = [cell.week for cell in cells if max(start, cell.left) < min(end, cell.right)]
+    return (weeks[0], weeks[-1]) if weeks else None
+
+
+def _week_number(text: str) -> int | None:
+    match = _WEEK_HEADER_RE.match(text or "")
+    if not match:
+        return None
+    return int(next(group for group in match.groups() if group is not None))
+
+
+def _shape_text(shape) -> str:
+    if not getattr(shape, "has_text_frame", False):
+        return ""
+    return " ".join((shape.text or "").split())
+
+
+def _calibrated_week_cells(slide) -> tuple[tuple[WeekCell, ...], int] | None:
+    """Pick the largest same-row week-header run and calibrate its x intervals."""
+    rows: dict[int, list[tuple[int, object]]] = {}
+    for shape in slide.shapes:
+        week = _week_number(_shape_text(shape))
+        if week is not None:
+            rows.setdefault(int(shape.top), []).append((week, shape))
+    if not rows:
+        return None
+    _top, headers = max(rows.items(), key=lambda item: len(item[1]))
+    if len(headers) < 2:
+        return None
+    headers.sort(key=lambda item: int(item[1].left))
+    weeks = [week for week, _shape in headers]
+    if len(set(weeks)) != len(weeks) or any(b <= a for a, b in zip(weeks, weeks[1:])):
+        return None
+    cells: list[WeekCell] = []
+    for index, (week, shape) in enumerate(headers):
+        left = int(shape.left)
+        right = (int(headers[index + 1][1].left) if index + 1 < len(headers)
+                 else int(shape.left) + int(shape.width))
+        if right <= left:
+            return None
+        cells.append(WeekCell(week, left, right))
+    header_bottom = max(int(shape.top) + int(shape.height) for _week, shape in headers)
+    return tuple(cells), header_bottom
+
+
+def extract_gantt_week_ranges(prs: Presentation) -> list[dict[str, object]]:
+    """Extract activity→week spans from native PPTX Gantt shapes without vision.
+
+    Week headers calibrate the x-axis.  Activity labels are text shapes to the left of that grid; each
+    horizontal line (or compact filled rectangle) in the same row is a candidate bar.  Conflicting bar
+    spans are returned as ``ambiguous`` instead of selecting one, so callers can abstain safely.
+    """
+    records: list[dict[str, object]] = []
+    for slide_number, slide in enumerate(prs.slides, 1):
+        calibrated = _calibrated_week_cells(slide)
+        if calibrated is None:
+            continue
+        cells, header_bottom = calibrated
+        grid_left, grid_right = cells[0].left, cells[-1].right
+        tolerance = max(1, (grid_right - grid_left) // 500)
+        labels = []
+        for shape in slide.shapes:
+            text = _shape_text(shape)
+            if not text or _week_number(text) is not None:
+                continue
+            right = int(shape.left) + int(shape.width)
+            if int(shape.top) >= header_bottom and right <= grid_left + tolerance:
+                labels.append((shape, text))
+        if not labels:
+            continue
+
+        by_activity: dict[str, list[tuple[int, int, int, int]]] = {}
+        for shape in slide.shapes:
+            left, top = int(shape.left), int(shape.top)
+            width, height = int(shape.width), int(shape.height)
+            if width <= 0 or left >= grid_right or left + width <= grid_left:
+                continue
+            is_line = shape.shape_type == MSO_SHAPE_TYPE.LINE and height <= max(1, width // 8)
+            has_fill = False
+            if not is_line and not _shape_text(shape):
+                try:
+                    has_fill = shape.fill.type is not None
+                except Exception:
+                    has_fill = False
+            center_y = top + height // 2
+            matched = [
+                (label, text) for label, text in labels
+                if int(label.top) <= center_y < int(label.top) + int(label.height)
+            ]
+            if not matched:
+                continue
+            label, activity = min(
+                matched, key=lambda item: abs(
+                    center_y - (int(item[0].top) + int(item[0].height) // 2)))
+            compact_fill = has_fill and height < max(1, int(label.height) * 3 // 4)
+            if not (is_line or compact_fill):
+                continue
+            span = week_range_for_span(left, width, cells)
+            if span is not None:
+                by_activity.setdefault(activity, []).append((*span, left, width))
+
+        for activity, spans in by_activity.items():
+            candidates = sorted({(start, end) for start, end, _left, _width in spans})
+            if len(candidates) == 1:
+                start, end = candidates[0]
+                geometry = next((left, width) for s, e, left, width in spans
+                                if (s, e) == (start, end))
+                records.append({
+                    "slide": slide_number, "activity": activity, "status": "resolved",
+                    "start_week": start, "end_week": end,
+                    "bar_left": geometry[0], "bar_width": geometry[1],
+                })
+            elif candidates:
+                records.append({
+                    "slide": slide_number, "activity": activity, "status": "ambiguous",
+                    "candidates": [{"start_week": start, "end_week": end}
+                                   for start, end in candidates],
+                })
+    return records
+
+
 def _shape_fill_color(shape) -> str | None:
     try:
         fill = shape.fill
@@ -209,6 +357,23 @@ def _run_highlight(run) -> str | None:
 def extract_pptx(ref: FileRef, data: bytes | None) -> str:
     prs = Presentation(io.BytesIO(data) if data else str(ref.path))
     out: list[str] = []
+    gantt = extract_gantt_week_ranges(prs)
+    if gantt:
+        out.append("【ガント週グリッド:決定論】")
+        for record in gantt:
+            if record["status"] == "resolved":
+                out.append(
+                    f"[スライド{record['slide']}] {record['activity']}: "
+                    f"第{record['start_week']}週目から第{record['end_week']}週目 "
+                    f"(週ヘッダx座標×バーleft/width、半開区間の正の重なり)")
+            else:
+                choices = " / ".join(
+                    f"第{candidate['start_week']}週目から第{candidate['end_week']}週目"
+                    for candidate in record["candidates"])
+                out.append(
+                    f"[スライド{record['slide']}] {record['activity']}: 曖昧({choices})。"
+                    "決定論候補が競合するため回答確定不可")
+        out.append("【/ガント週グリッド】")
     for si, slide in enumerate(prs.slides, 1):
         out.append(f"[スライド{si}]")
         # top-to-bottom, left-to-right ordering (per enumeration rules in the task)
