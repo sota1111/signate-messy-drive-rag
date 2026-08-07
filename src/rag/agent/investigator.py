@@ -90,6 +90,8 @@ SYSTEM_PROMPT = (
     "5. 旧版(old版)と最新版の比較・変更点を問う質問は、grepで手作業比較せず version_diff ツールに質問文を"
     "そのまま渡す。決定論の構造diffが『変更前 → 変更後』を返すので、その value をそのまま回答にする。value が"
     "null のときのみ他手段(grep等)を検討する。\n"
+    "5b. PDFの検索・抽出結果が空で、ページが画像だけの場合は caption_image(file=..., question=質問全文) を"
+    "使う。引用語や『明記』の質問では、条件語と候補が同じ原文行にある vision 出力だけを根拠にする。\n"
     "6a. 内線番号/EXT/座席/『向かい・隣・同じ列・Xから見て右側/左側』を問う質問は seating_lookup "
     "ツールを使う(座席表は画像1枚で"
     "grep/office抽出では読めない)。多段(案件→担当者→内線)では先に担当者の氏名を他ツールで特定し、その氏名を"
@@ -180,6 +182,62 @@ def is_abstain(answer: str) -> bool:
     a = unicodedata.normalize("NFKC", str(answer)).strip().lower()
     return not a or a == unicodedata.normalize("NFKC", ABSTAIN).strip().lower() \
         or "わかりません" in a or "不明" in a
+
+
+def _reference_commit_rejection(question: str, candidate: Answer, contract: str | None, *,
+                                tool_outputs: Sequence[Any],
+                                version_diff_result: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Return a structured rejection when deterministic reference evidence is still incomplete."""
+    if contract == "version_diff":
+        if version_diff_result is None:
+            return {
+                "answer_rejected": True,
+                "reason": "版差分契約で必須の version_diff ツールが未実行です。",
+                "directive": (
+                    "回答を確定せず version_diff(question=質問全文) を実行してください。"
+                    "grep/目視による一部比較だけで回答してはなりません。"),
+            }
+        resolved = version_diff_result.get("value")
+        if resolved is None:
+            if is_abstain(candidate.answer):
+                return None
+            return {
+                "answer_rejected": True,
+                "reason": "全スライド/全シートの決定論的版差分が解決できていません。",
+                "directive": "別の変更を推測せず、追加の版特定ができなければ棄権してください。",
+            }
+        if is_abstain(candidate.answer):
+            return {
+                "answer_rejected": True,
+                "reason": "version_diff は全版差分を解決済みのため棄権できません。",
+                "expected": str(resolved),
+                "directive": "version_diff が返した value を省略・言い換えせずそのまま回答してください。",
+            }
+        if candidate.answer.strip() != str(resolved).strip():
+            return {
+                "answer_rejected": True,
+                "reason": "回答が version_diff の決定論的 value と一致しません。",
+                "expected": str(resolved),
+                "directive": "version_diff が返した value を省略・言い換えせずそのまま回答してください。",
+            }
+
+    if is_abstain(candidate.answer):
+        return None
+
+    from src.rag.agent import obligations as _obligations
+
+    literal_check = _obligations.validate_literal_evidence(
+        question, candidate.answer, tool_outputs)
+    if not literal_check.passed:
+        return {
+            "answer_rejected": True,
+            "reason": "literal 一致の証拠義務が未充足です。",
+            "issues": list(literal_check.issues),
+            "directive": (
+                "引用条件語が候補と同じセル/文に文字列として存在する箇所をツールで確認してください。"
+                "共起しない候補は採用せず、確認不能なら棄権してください。"),
+        }
+    return None
 
 
 # --------------------------------------------------------------------------- transport data types
@@ -292,9 +350,11 @@ def _version_diff(question: str) -> dict[str, Any]:
     answer = diffpair.answer_question_agent(question)
     return _contract.make(
         answer, engine="diffpair",
-        evidence={"applicable": True, "resolved": answer is not None},
+        evidence={"applicable": True, "resolved": answer is not None,
+                  "coverage": "all-slides/all-sheets"},
         scheme="structural-version-diff",
-        note=("隣接版(旧版→最新/vN→vN+1)の構造diff(セル/段落を整列し実質変更のみ)"
+        note=("隣接版(旧版→最新/vN→vN+1)の全スライド/全シート構造diff"
+              "(セル/段落を整列し実質変更のみ)"
               if answer is not None
               else "版ペア不確定/非隣接/読取不能/大規模変更のため棄権(None)"))
 
@@ -378,10 +438,12 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
         ),
         AgentTool(
             "caption_image",
-            "図表PNG画像をvisionモデルで説明する。チャートでは所在・系列名・軸ラベル確認専用で、"
-            "説明中の数値を回答根拠に使用してはならない。数値はread_chart_valuesで取得する。",
-            _obj({"file": _STR}, ["file"]),
-            lambda file: caption_figure(file),
+            "図表PNGを説明し、または画像のみのPDF全ページをvisionモデルで質問別に厳密転記する。"
+            "PDFでは question に元の質問全文を渡す。引用語/『明記』は条件語と候補を同一原文行で返す。"
+            "チャートでは所在・系列名・軸ラベル確認専用で、説明中の数値を回答根拠に使用してはならない。"
+            "数値はread_chart_valuesで取得する。",
+            _obj({"file": _STR, "question": _STR}, ["file"]),
+            lambda file, question=None: caption_figure(file, question=question),
         ),
         AgentTool(
             "pdf_emphasis",
@@ -412,7 +474,8 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
             "『(項目)：変更前 → 変更後』で決定論的に返す。旧版/old版/前の版と最新版の比較・変更箇所を"
             "問う質問に使う。question に質問文をそのまま渡す(会社名・文書名・版指定を含めるほど特定精度が"
             "上がる)。値は決定論・推測なし。版ペアが一意に定まらない/読取不能/変更が大規模すぎる場合は"
-            "value=null を返す(その場合は棄権のまま)。",
+            "value=null を返す(その場合は棄権のまま)。版差分契約では回答確定前の実行が必須で、返された"
+            "value をそのまま回答する。",
             _obj({"question": _STR}, ["question"]),
             lambda question: _version_diff(question),
         ),
@@ -463,7 +526,7 @@ def build_tools(profile: CorpusProfile) -> list[AgentTool]:
     return [*build_generic_tools(profile), SUBMIT_ANSWER_TOOL]
 
 
-def _jsonable(obj: Any, *, max_str: int = 4000, max_items: int = 60, _depth: int = 0) -> Any:
+def _jsonable(obj: Any, *, max_str: int = 8000, max_items: int = 60, _depth: int = 0) -> Any:
     """Best-effort JSON-safe, size-bounded view of a tool result (keeps token cost in check)."""
     if _contract.is_contract(obj):
         obj = _contract.ensure_contract(obj)
@@ -766,6 +829,8 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     regulation_guidance_sent = False
     from src.rag.agent import question_contract as _question_contract
     gantt_question = contract == "chart_read" and _question_contract.is_gantt_week_question(question)
+    tool_outputs: list[Any] = []
+    version_diff_result: Mapping[str, Any] | None = None
     start = clock()
 
     for _turn in range(max_turns):
@@ -822,7 +887,16 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                     text = ABSTAIN
             if contract == "chart_read" and not strict_chart_evidence and not is_abstain(text):
                 text = ABSTAIN
-            answer = Answer(answer=text, confidence=0.0, method="(submit_answer未使用: 最終テキストを採用)")
+            candidate = Answer(answer=text, confidence=0.0,
+                               method="(submit_answer未使用: 最終テキストを採用)")
+            rejection = _reference_commit_rejection(
+                question, candidate, contract, tool_outputs=tool_outputs,
+                version_diff_result=version_diff_result)
+            if rejection is not None:
+                responses = [ToolResponse(SUBMIT_ANSWER, rejection)]
+                iterations += 1
+                continue
+            answer = candidate
             stop_reason = "answered"
             break
 
@@ -874,6 +948,13 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                         }))
                         dispatched_tool = True
                         break
+                rejection = _reference_commit_rejection(
+                    question, candidate, contract, tool_outputs=tool_outputs,
+                    version_diff_result=version_diff_result)
+                if rejection is not None:
+                    responses.append(ToolResponse(SUBMIT_ANSWER, rejection))
+                    dispatched_tool = True
+                    break
                 # SOT-2508 — a numeric answer is not complete merely because a number was computed.
                 # Enforce the question's quantity definition / unit / rounding contract against the
                 # observed compute trail *before* accepting the terminal answer.  This catches the
@@ -949,6 +1030,9 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
             elif call.name == "read_office" and gantt_question:
                 strict_chart_evidence = _has_deterministic_gantt_evidence(out)
             responses.append(ToolResponse(call.name, out))
+            tool_outputs.append(out)
+            if call.name == "version_diff" and isinstance(out, Mapping):
+                version_diff_result = out
             dispatched_tool = True
             if signals is not None:
                 # observe-only: fold the tool outcome into the abstain signals without touching `out`
@@ -959,6 +1043,21 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
             if director is not None:
                 # observe-only: collect successful tool evidence so unmet obligations reflect coverage
                 director.observe(call.name, out)
+            if (contract == "version_diff" and call.name == "version_diff"
+                    and isinstance(out, Mapping) and out.get("value") is not None):
+                # The deterministic full-document differ is the authority for this contract. Once it
+                # resolves, committing its exact value directly avoids a second model turn that could
+                # paraphrase, select a different change, abstain, or fail in transport.
+                answer = Answer(
+                    answer=str(out["value"]), confidence=1.0,
+                    evidence=str(out.get("evidence", "")),
+                    method="version_diff の全スライド/全シート構造差分をそのまま採用",
+                )
+                stop_reason = "answered"
+                submitted = True
+                if director is not None:
+                    director.note_answered()
+                break
         if dispatched_tool:
             # count only genuine tool rounds; the terminal submit_answer turn is not a round
             iterations += 1

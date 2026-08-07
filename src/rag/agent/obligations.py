@@ -36,8 +36,9 @@ into the investigator loop is SOT-2502, so the production answer path is untouch
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field, replace
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from config import settings
 from src.rag.corpus import nfc
@@ -114,7 +115,8 @@ CONTRACT_OBLIGATIONS: dict[str, tuple[tuple[str, str], ...]] = {
     ),
     qc.VERSION_DIFF: (
         (SOURCE_LOCATION, "旧版と新版の対応ペアを一意に確定する"),
-        (JUDGMENT_RULE, "隣接版間の実質的な変更のみを差分として抽出する"),
+        (JUDGMENT_RULE, "diffpairで全スライド/全シートを比較し、隣接版間の実質的な変更のみを抽出する"),
+        (CONSISTENCY, "version_diffツールの決定論結果と回答が一致することを確認する"),
     ),
     qc.NUMERIC: (
         (SOURCE_LOCATION, "型付き入力(対象列/対象ファイル)を根拠から特定する"),
@@ -125,6 +127,100 @@ CONTRACT_OBLIGATIONS: dict[str, tuple[tuple[str, str], ...]] = {
         (ROUNDING, "小数第N位・切上げ・切捨て等の丸めを質問の要求に合わせる"),
     ),
 }
+
+# ``明記`` / ``そのまま`` asks for a *literal* extraction, not a semantic near-match.  Quoted terms
+# are intentionally taken only from the question; this remains corpus-agnostic and cannot smuggle a
+# gold answer into the agent.  The returned terms become both a typed obligation and a commit gate in
+# :mod:`investigator`.
+_LITERAL_REQUEST_RE = re.compile(
+    r"明記|そのまま|原文(?:どおり|通り|表記)|文字列(?:として)?|literal", re.I)
+_QUOTED_TERM_RE = re.compile(r"[「『\"“](.+?)[」』\"”]")
+
+
+def literal_terms(question: str) -> tuple[str, ...]:
+    """Quoted condition terms that must literally occur beside an answer candidate.
+
+    A quoted project/file name in an ordinary lookup does not activate the rule: the question must
+    explicitly request an exact/original/literal extraction (``明記`` / ``そのまま`` / ``原文``).
+    """
+    q = nfc(question or "")
+    if not _LITERAL_REQUEST_RE.search(q):
+        return ()
+    return tuple(dict.fromkeys(
+        term.strip() for term in _QUOTED_TERM_RE.findall(q) if term.strip()
+    ))
+
+
+@dataclass(frozen=True)
+class LiteralValidation:
+    """Result of checking a literal extraction against actual tool output fragments."""
+
+    passed: bool
+    terms: tuple[str, ...] = ()
+    issues: tuple[str, ...] = ()
+
+
+def _literal_norm(value: Any) -> str:
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", nfc(str(value or "")))).lower()
+
+
+def _tool_fragments(value: Any) -> list[str]:
+    """Flatten tool output while retaining row/object locality for literal co-occurrence checks."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        lines = [line.strip() for line in value.splitlines() if line.strip()]
+        # Office extractors sometimes put a table cell or wrapped PDF text on adjacent lines.  Keep
+        # individual lines and bounded three-line windows; never join the whole document, which would
+        # let unrelated distant text satisfy the obligation.
+        out = list(lines)
+        out.extend(" | ".join(lines[i:i + 3]) for i in range(max(0, len(lines) - 2)))
+        return out
+    if isinstance(value, dict):
+        fragments: list[str] = []
+        scalar_values = [str(v) for v in value.values()
+                         if isinstance(v, (str, int, float, bool))]
+        if scalar_values:
+            fragments.append(" | ".join(scalar_values))
+        for nested in value.values():
+            fragments.extend(_tool_fragments(nested))
+        return fragments
+    if isinstance(value, (list, tuple, set)):
+        fragments: list[str] = []
+        for item in value:
+            fragments.extend(_tool_fragments(item))
+        return fragments
+    return [str(value)]
+
+
+def validate_literal_evidence(question: str, answer: str,
+                              tool_outputs: Sequence[Any]) -> LiteralValidation:
+    """Require each answer candidate to co-occur with every quoted condition in tool evidence.
+
+    The model-authored ``Answer.evidence`` is deliberately not accepted here.  Only dispatched tool
+    outputs are supplied by the caller, preventing a confident model from satisfying the gate by
+    merely repeating the condition term in its own prose.
+    """
+    terms = literal_terms(question)
+    if not terms:
+        return LiteralValidation(True)
+    fragments = [_literal_norm(f) for output in tool_outputs for f in _tool_fragments(output)]
+    norm_terms = tuple(_literal_norm(t) for t in terms)
+    candidates = tuple(
+        part.strip() for part in re.split(r"[、,，;；\n]+", answer or "") if part.strip()
+    ) or ((answer or "").strip(),)
+    issues: list[str] = []
+    for candidate in candidates:
+        nc = _literal_norm(candidate)
+        if not nc:
+            continue
+        if not any(nc in fragment and all(term in fragment for term in norm_terms)
+                   for fragment in fragments):
+            issues.append(
+                f"候補『{candidate}』と条件語" +
+                "/".join(f"『{term}』" for term in terms) +
+                "が同一セル/文のツール証拠に literal 共起しない")
+    return LiteralValidation(not issues, terms, tuple(issues))
 
 # --------------------------------------------------------------------------- evidence data types
 @dataclass(frozen=True)
@@ -398,6 +494,15 @@ def decompose(
         if parsed:
             obligations = parsed
             method = "flash"
+    exact_terms = literal_terms(q)
+    if exact_terms:
+        quoted = "・".join(f"『{term}』" for term in exact_terms)
+        literal_obligation = Obligation(
+            obligation=f"引用条件語{quoted}が採用候補と同一セル/文に文字列として存在することを確認する",
+            kind=JUDGMENT_RULE,
+        )
+        if literal_obligation.obligation not in {o.obligation for o in obligations}:
+            obligations = (*obligations, literal_obligation)
     return ObligationSet(question=q, contract=contract, obligations=obligations, method=method)
 
 

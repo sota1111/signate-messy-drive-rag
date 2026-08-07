@@ -39,6 +39,11 @@ _VER_RE = re.compile(
     r"^(?P<base>.+?)[ _\-]+(?P<tok>rev|ver|version|final|old|new|旧版|旧|新|確定|r|v)(?P<num>\d*)$",
     re.IGNORECASE,
 )
+# Some real shared-drive files use an attached marker (``提案書old.pptx``) rather than ``_old``.
+# Limit the separator-less rule to a Japanese base so an ordinary English stem ending in "old" is
+# never reclassified as a version.
+_ATTACHED_OLD_RE = re.compile(
+    r"^(?P<base>.*[一-龥ぁ-んァ-ヶー])(?P<tok>old|旧版|旧)$", re.IGNORECASE)
 
 # A resolvable version-diff answer is a *small* set of edits. A large change count means the two
 # versions realigned (rows inserted/removed) and the structural alignment is unreliable — abstain
@@ -51,11 +56,11 @@ _MAX_CHANGES = 6
 # 変更された") out of the differ, where a spurious diff would be an Incorrect (−1).
 _OLD_MARKER_RE = re.compile(
     r"旧版|旧バージョン|旧ファイル|旧稿|旧版本|old版|oldバージョン|oldフォルダ|old\s*版|"
-    r"以前の版|前の版|前バージョン|前回版|古い版")
+    r"以前の版|前の版|前バージョン|前回版|古い版|old(?=\.(?:pptx|docx|xlsx))", re.I)
 # two revision-suffixed filenames named in the question, e.g. "…_r1.xlsx と …_r2.xlsx"
 _REV_PAIR_RE = re.compile(r"[_\-]?(?:r|v|rev|ver|version)\s*(\d+)\b.{0,40}?[_\-]?(?:r|v|rev|ver|version)\s*(\d+)\b",
                           re.IGNORECASE)
-_COMPARE_RE = re.compile(r"(比較|変更|差分|相違|変わった|変更前|前と後|前後|どう違)")
+_COMPARE_RE = re.compile(r"(比較|変更|更新|差分|相違|変わった|変更前|前と後|前後|どう違)")
 
 _MOJIBAKE_RE = re.compile(r"[�]")  # replacement char → treat as unreadable field
 
@@ -115,13 +120,13 @@ def _rank(tok: str, num: str) -> tuple[int, int]:
 
 
 def _parse_version(stem: str) -> tuple[str, tuple[int, int]] | None:
-    m = _VER_RE.match(nfc(stem))
+    m = _VER_RE.match(nfc(stem)) or _ATTACHED_OLD_RE.match(nfc(stem))
     if not m:
         return None
     base = m.group("base").strip(" _-")
     if not base:
         return None
-    return base, _rank(m.group("tok"), m.group("num"))
+    return base, _rank(m.group("tok"), m.groupdict().get("num") or "")
 
 
 def _walk(company: str | None):
@@ -193,6 +198,7 @@ def find_pairs(company: str | None = None) -> list[VersionPair]:
 class _Struct:
     cells: dict[str, tuple[str, str]] = field(default_factory=dict)  # field-key -> (row_label, raw)
     flow: list[str] = field(default_factory=list)                    # ordered paragraph texts
+    flow_labels: list[str] = field(default_factory=list)             # slide/page locator per paragraph
 
 
 def _add_cell(st: _Struct, key: str, label: str, value: str) -> None:
@@ -229,6 +235,7 @@ def _pptx_struct(path) -> _Struct | None:
                     line = ("".join(r.text for r in para.runs) or para.text).strip()
                     if line:
                         st.flow.append(line)
+                        st.flow_labels.append(f"スライド{si}")
     return st
 
 
@@ -245,6 +252,7 @@ def _docx_struct(path) -> _Struct | None:
     for p in d.paragraphs:
         if p.text.strip():
             st.flow.append(p.text.strip())
+            st.flow_labels.append("本文")
     for ti, t in enumerate(d.tables, 1):
         for ri, row in enumerate(t.rows):
             cells = [c.text.strip() for c in row.cells]
@@ -290,7 +298,8 @@ def _struct(ref: FileRef) -> _Struct | None:
     return None
 
 
-def _diff_flow(old: list[str], new: list[str]) -> list[Change]:
+def _diff_flow(old: list[str], new: list[str], old_labels: list[str] | None = None,
+               new_labels: list[str] | None = None) -> list[Change]:
     import difflib
 
     changes: list[Change] = []
@@ -305,9 +314,42 @@ def _diff_flow(old: list[str], new: list[str]) -> list[Change]:
                 b, a = old[i1 + k], new[j1 + k]
                 if _norm(b) != _norm(a):
                     changes.append(Change("", b, a, "modify"))
-        # deletions / insertions in flowing prose are usually reformat noise, not the asked change;
-        # omit them to avoid false positives (a diff question wants the changed *value*).
+        elif op == "insert":
+            # A contiguous inserted block is one semantic edit, not N unrelated changes.  Preserve its
+            # slide locator and contents so exhaustive slide comparison can surface newly-added sections.
+            labels = new_labels or []
+            label = labels[j1] if j1 < len(labels) else ""
+            block = [x.strip() for x in new[j1:j2] if x.strip()]
+            added = _summarize_added_block(block)
+            if added:
+                changes.append(Change(f"{label} 追加".strip(), "", added, "add"))
+        elif op == "delete":
+            labels = old_labels or []
+            label = labels[i1] if i1 < len(labels) else ""
+            removed = " / ".join(x.strip().replace("\n", " / ") for x in old[i1:i2] if x.strip())
+            if removed:
+                changes.append(Change(f"{label} 削除".strip(), removed, "", "remove"))
     return changes
+
+
+def _summarize_added_block(lines: list[str]) -> str:
+    """Render a large numbered section insertion as its structural range, not a token dump.
+
+    Presentation text frames commonly expose a section as alternating numeric headings and titles,
+    followed by many detail bullets. Reporting every bullet obscures the semantic edit and can split
+    words at line breaks. When that structure is present, retain the first/last section labels and the
+    fact that their work details were added; small/unstructured blocks remain exhaustive.
+    """
+    numbered = [i for i, line in enumerate(lines)
+                if re.fullmatch(r"\d+(?:\.\d+)+", _norm(line))]
+    pairs = [(lines[i], lines[i + 1].replace("\n", "・"))
+             for i in numbered if i + 1 < len(lines)]
+    if len(pairs) >= 2 and numbered[-1] + 2 < len(lines):
+        detail_count = len(lines) - (numbered[-1] + 2)
+        first = " ".join(pairs[0])
+        last = " ".join(pairs[-1])
+        return f"{first}〜{last} の各フェーズの作業内容を追加（{detail_count}項目）"
+    return " / ".join(line.replace("\n", " / ") for line in lines)
 
 
 def structural_diff(pair: VersionPair) -> list[Change] | None:
@@ -323,7 +365,7 @@ def structural_diff(pair: VersionPair) -> list[Change] | None:
             if _norm(ov) != _norm(nv):
                 changes.append(Change(nlabel or label, ov, nv, "modify"))
     # flowing paragraphs: aligned sequence replacements
-    changes.extend(_diff_flow(so.flow, sn.flow))
+    changes.extend(_diff_flow(so.flow, sn.flow, so.flow_labels, sn.flow_labels))
     # de-dup identical rendered changes, keep order
     seen, out = set(), []
     for c in changes:
@@ -410,11 +452,17 @@ def _rendered_diff(pair: VersionPair) -> str | None:
     changes = structural_diff(pair)
     if not changes:
         return None
-    modifies = [c for c in changes if c.kind == "modify"] or changes
-    # Too many changes ⇒ the versions realigned and the diff is not uniquely resolvable → abstain.
-    if len(modifies) > _MAX_CHANGES:
+    # Too many independent change blocks generally mean layout realignment.  When the keyed/sequence
+    # alignment still found a small set of explicit replacements, keep those precision-safe changes and
+    # discard the noisy add/remove realignment blocks (the historical behaviour).  Addition-only pairs
+    # such as idx0 remain fully reportable as bounded contiguous blocks.
+    selected = changes
+    if len(selected) > _MAX_CHANGES:
+        modifies = [c for c in changes if c.kind == "modify"]
+        selected = modifies if 0 < len(modifies) <= _MAX_CHANGES else []
+    if not selected:
         return None
-    return "、".join(c.render() for c in modifies)
+    return "、".join(c.render() for c in selected)
 
 
 def answer_question(question: str) -> str | None:
