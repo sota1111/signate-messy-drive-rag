@@ -21,6 +21,7 @@ from src.rag.agent.abstain_ledger import (
     NOT_RETRIEVED,
     PARSED_AMBIGUOUS,
     RETRIEVED_NOT_PARSED,
+    SPIN_CUTOFF,
     STATE_CODES,
     UNANSWERABLE,
     AbstainSignals,
@@ -82,9 +83,22 @@ def _sig(**kw):
 
 
 # --------------------------------------------------------------------------- state-code vocabulary
-def test_seven_distinct_state_codes():
-    assert len(STATE_CODES) == 7
-    assert len(set(STATE_CODES)) == 7
+def test_distinct_state_codes():
+    # SOT-2522 added SPIN_CUTOFF as the eighth distinct code.
+    assert len(STATE_CODES) == 8
+    assert len(set(STATE_CODES)) == 8
+    assert SPIN_CUTOFF in STATE_CODES
+
+
+def test_classify_spin_cutoff_precedes_budget_and_research_terminal():
+    # A fired spin detector attributes the abstain to SPIN_CUTOFF even though the stop_reason / research
+    # terminal would otherwise read as a plain BUDGET cutoff (spin is the actionable root cause).
+    assert classify(_sig(spin_cutoff=True)) == SPIN_CUTOFF
+    assert classify(_sig(spin_cutoff=True, stop_reason="max_turns")) == SPIN_CUTOFF
+    assert classify(_sig(spin_cutoff=True, stop_reason="spin_cutoff")) == SPIN_CUTOFF
+    assert classify(_sig(spin_cutoff=True, research_terminal="budget")) == SPIN_CUTOFF
+    # Without the spin flag, an ordinary budget cutoff still classifies as BUDGET_EXHAUSTED.
+    assert classify(_sig(stop_reason="max_turns")) == BUDGET_EXHAUSTED
 
 
 # --------------------------------------------------------------------------- classifier (one per code)

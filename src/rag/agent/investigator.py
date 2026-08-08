@@ -131,6 +131,27 @@ ADAPTIVE_BUDGET = _bool_env("RAG_ADAPTIVE_BUDGET", True)
 # the identical output, only faster) and caches nothing on error. Set ``RAG_EVIDENCE_CACHE=0`` to disable.
 EVIDENCE_CACHE = _bool_env("RAG_EVIDENCE_CACHE", True)
 
+# SOT-2522 — spin (dead-end) detection & budget reallocation. A share of BUDGET_EXHAUSTED abstains is the
+# model calling the *same tool with the same (normalized) arguments* over and over: a deterministic tool
+# returns identical output for identical args, so each repeat burns a turn without adding evidence. When a
+# normalized (tool, args) call recurs ``spin_threshold`` times we treat that path as a dead end and, ONCE,
+# feed back a directive that redirects the freed budget to an *untried* deterministic route
+# (canonical_route / compute / version_diff / corpus_aggregate / …). If spinning persists after that one
+# reallocation, the path is cut off early (棄権を前倒し) so the remaining budget is not melted — the overall
+# ``max_turns``/``timeout_s`` cap is never raised (無制限ループにしない). The abstain, if any, is attributed
+# to :data:`~src.rag.agent.abstain_ledger.SPIN_CUTOFF`, distinct from a plain BUDGET cutoff. **Default OFF**
+# (byte-identical answer path): a redirect changes a spinning question's trajectory, which — like
+# ``FIRST_MOVE_ROUTING`` / ``UNANSWERABLE_FALLBACK`` — could nudge a commit, so the mechanism ships dormant
+# and its net gold-100 effect is measured by the single integrated SOT-2527 run before any flip. No corpus
+# fact is ever injected (only tool names), so enabling it can never leak an answer.
+SPIN_DETECTION = _bool_env("RAG_SPIN_DETECTION", False)
+DEFAULT_SPIN_THRESHOLD = 3        # identical (tool, args) calls that mark a path a dead end
+# Deterministic routes offered as the reallocation target when a spin is cut off (names only, no fact).
+_DETERMINISTIC_ROUTES: tuple[str, ...] = (
+    "canonical_route", "compute", "version_diff", "corpus_aggregate",
+    "seating_lookup", "read_chart_values", "file_grep",
+)
+
 # Vertex Gemini list price (USD per 1M tokens), (input, output) — estimates for cost bookkeeping only.
 PRICING: dict[str, tuple[float, float]] = {
     "gemini-2.5-pro": (1.25, 10.0),
@@ -656,6 +677,40 @@ def _budget_boundary_directive(director: Any, enabled: bool, tool_calls: Sequenc
     return director.review(evidence, non_submit, at_boundary=True)
 
 
+def _spin_key(name: str, args: Mapping[str, Any] | None) -> str:
+    """A canonical (tool, args) identity for spin detection (SOT-2522).
+
+    Uses the *same* normalization as the intra-question evidence cache — ``name`` plus a sorted-key JSON
+    dump of ``args`` — so "same tool × same (normalized) arguments" means exactly what a cache hit means:
+    a call that a deterministic tool would answer identically. Unserializable args fall back to ``repr``
+    so the detector degrades gracefully instead of raising.
+    """
+    try:
+        return name + "\x00" + json.dumps(args or {}, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return name + "\x00" + repr(args)
+
+
+def _spin_redirect_directive(name: str, tried: "set[str]") -> str:
+    """The one-shot reallocation directive emitted when a spinning path is first cut off (SOT-2522).
+
+    Names the still-untried deterministic routes so the model spends the freed budget on a *different*
+    path instead of re-issuing the dead-end call. Injects no corpus fact (tool names only); when every
+    deterministic route has already been tried it asks the model to vary its arguments or abstain.
+    """
+    untried = [t for t in _DETERMINISTIC_ROUTES if t != name and t not in tried]
+    if untried:
+        routes = "、".join(untried)
+        return (
+            f"同一ツール『{name}』を同一引数で反復していますが、決定論ツールは同じ入力に同じ結果しか返さず"
+            "新しい根拠は得られません。この経路を打ち切り、未試行の決定論ツール"
+            f"（{routes}）のいずれかに質問文をそのまま渡して別経路で根拠取得を試みてください。"
+            "新経路でも根拠が確定できない場合に限り棄権してください。")
+    return (
+        f"同一ツール『{name}』を同一引数で反復していますが、新しい根拠は得られません。主要な決定論ツールは"
+        "既に試行済みのため、別のファイル/引数での再試行に価値がなければ推測せず棄権してください。")
+
+
 def _first_move_directive(name: str, out: Any) -> str:
     """The seed user-message describing a deterministic first-move result (SOT-2521).
 
@@ -868,7 +923,8 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 contract: "str | None" = None,
                 first_move: "tuple[str, Mapping[str, Any]] | None" = None,
                 fallback: "object | None" = None,
-                budget_boundary: bool = False) -> Investigation:
+                budget_boundary: bool = False,
+                spin_detection: "bool | Mapping[str, Any] | None" = False) -> Investigation:
     """Drive ``model`` through tool-calling until it submits a structured answer.
 
     The loop ends on the first of: the model calls ``submit_answer`` (→ ``answered``); ``max_turns`` is
@@ -951,7 +1007,29 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     director's terminal). The commit threshold is untouched, so it only turns a would-be BUDGET abstain
     into either a grounded answer or a coded, history-bearing abstain. ``False`` by default so existing
     callers are byte-identical; :func:`answer_question` wires it from ``RAG_BUDGET_BOUNDARY_RESEARCH``.
+
+    ``spin_detection`` (SOT-2522) enables dead-end spin detection & budget reallocation. When it is not
+    ``None``/``False``, a normalized ``(tool, args)`` call that recurs ``spin_threshold`` times (default
+    :data:`DEFAULT_SPIN_THRESHOLD`; a ``Mapping`` may override ``threshold``) is treated as a dead end:
+    the loop, ONCE, feeds back a directive redirecting the freed budget to an untried deterministic route
+    (see :func:`_spin_redirect_directive`) instead of re-dispatching the redundant call. If spinning
+    persists after that single reallocation, the path is cut off early (``stop_reason="spin_cutoff"``) so
+    the rest of the budget is not melted — the ``max_turns``/``timeout_s`` cap is never raised. A resulting
+    abstain is attributed to :data:`~src.rag.agent.abstain_ledger.SPIN_CUTOFF`. It injects no corpus fact
+    (tool names only) and never touches the commit threshold, so the answer path is byte-identical when it
+    is ``False`` (default); :func:`answer_question` wires it from ``RAG_SPIN_DETECTION``.
     """
+    spin_enabled = spin_detection not in (None, False)
+    spin_threshold = DEFAULT_SPIN_THRESHOLD
+    if isinstance(spin_detection, Mapping):
+        try:
+            spin_threshold = max(2, int(spin_detection.get("threshold", DEFAULT_SPIN_THRESHOLD)))
+        except (TypeError, ValueError):
+            spin_threshold = DEFAULT_SPIN_THRESHOLD
+    spin_counts: dict[str, int] = {}
+    spin_redirected = False   # a reallocation directive has already been emitted once
+    spin_cutoff = False       # a spin was detected this question (recorded onto the abstain ledger)
+
     record_enabled = ledger not in (None, False)
     if record_enabled:
         from src.rag.agent import abstain_ledger as _abstain_ledger
@@ -1157,6 +1235,7 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
         responses = []
         submitted = False
         dispatched_tool = False
+        spin_terminal = False   # SOT-2522 — early cutoff after a persisting spin (frees the残予算)
         for call in step.function_calls:
             tool_calls.append(call.name)
             if call.name == SUBMIT_ANSWER:
@@ -1301,6 +1380,32 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 stop_reason = "answered"
                 submitted = True
                 break
+            # SOT-2522 — spin (dead-end) detection & budget reallocation. A deterministic tool returns the
+            # same output for the same (normalized) args, so a repeated identical call adds no evidence and
+            # only burns a turn. On the ``spin_threshold``-th recurrence, reallocate once (redirect the
+            # freed budget to an untried deterministic route without re-dispatching); if it keeps spinning
+            # after that single redirect, cut the path off early so the残予算 is not melted. No corpus fact
+            # is injected and the commit threshold is untouched — this only ever turns a would-be BUDGET
+            # abstain into a redirect, a grounded answer via another route, or a coded SPIN_CUTOFF abstain.
+            if spin_enabled:
+                skey = _spin_key(call.name, call.args)
+                spin_counts[skey] = spin_counts.get(skey, 0) + 1
+                if spin_counts[skey] >= spin_threshold:
+                    spin_cutoff = True
+                    if not spin_redirected:
+                        spin_redirected = True
+                        tried = {c for c in tool_calls if c != SUBMIT_ANSWER}
+                        responses.append(ToolResponse(call.name, {
+                            "spin_detected": True,
+                            "reason": (f"同一ツール『{call.name}』を同一引数で{spin_counts[skey]}回"
+                                       "呼び出しました。この経路は袋小路です。"),
+                            "directive": _spin_redirect_directive(call.name, tried),
+                        }))
+                        dispatched_tool = True  # count the guided reallocation round
+                        continue
+                    # already reallocated once and still spinning → cut off early, freeing the残予算.
+                    spin_terminal = True
+                    break
             out = cached_dispatch(call.name, call.args)
             if call.name == "read_chart_values" and _contract.is_contract(out):
                 method = out.get("method") or {}
@@ -1378,6 +1483,12 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
             iterations += 1
         if submitted:
             break
+        if spin_terminal:
+            # SOT-2522 — the reallocation directive did not break the spin; abstain now (answer stays the
+            # ABSTAIN default) so the remaining budget is not melted on a proven dead end.
+            stop_reason = "spin_cutoff"
+            error = error or f"spin cutoff: repeated identical tool call after reallocation"
+            break
     if not submitted and stop_reason == "max_turns":
         error = error or f"max_turns={max_turns} reached without a final answer"
 
@@ -1393,6 +1504,9 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     # `record_abstain`, which always assigns a state code, so a code-less abstain is impossible.
     if record_enabled and is_abstain(investigation.answer.answer):
         signals.stop_reason = stop_reason
+        # SOT-2522 — attribute a spin-detected abstain to SPIN_CUTOFF (distinct from a plain BUDGET cutoff)
+        # whether it ended via early cutoff or by exhausting the cap after the one reallocation directive.
+        signals.spin_cutoff = spin_cutoff
         signals.evidence_text = " ".join(
             t for t in (answer.evidence, answer.method, answer.answer) if t).strip()
         if director is not None:
@@ -1644,4 +1758,5 @@ def answer_question(question: str, *, model: str | None = None,
     return investigate(model_obj, question, tools, max_turns=max_turns, timeout_s=timeout_s,
                        ledger=ledger, calc_ledger=calc_ledger, research=research,
                        enumeration=enumeration, contract=contract, first_move=first_move,
-                       fallback=fallback, budget_boundary=BUDGET_BOUNDARY_RESEARCH)
+                       fallback=fallback, budget_boundary=BUDGET_BOUNDARY_RESEARCH,
+                       spin_detection=SPIN_DETECTION)
