@@ -32,7 +32,9 @@ def load_ledger(path: Path = LEDGER_PATH, scored_only: bool = True) -> list[dict
         # Probe/result summaries are operational diagnostics, not one calibratable submission.
         # They intentionally lack local_score/archetype fields; retain them for full-ledger callers
         # but never validate or fit them as scored calibration observations.
-        if row.get("commit") == "diagnostic":
+        is_probe_summary = ("probe" in str(row.get("submission", "")).lower()
+                            and "local_score" not in row)
+        if row.get("commit") == "diagnostic" or is_probe_summary:
             if not scored_only:
                 rows.append(row)
             continue

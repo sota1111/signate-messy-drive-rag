@@ -77,15 +77,24 @@ def tokenize(text: str) -> list[str]:
 def build(caption_images: bool = True, verbose: bool = True) -> None:
     from src.rag import facts  # deterministic fact-row distillation (SOT-2449)
     from src.rag.extract import extract  # heavy deps, only needed for building
+    from src.rag.index import evidence_index  # typed inverted evidence store (SOT-2531 / #4a)
 
     refs = corpus.walk()
     chunks: list[Chunk] = []
     cid = 0
     n_facts = 0
+    # Typed inverted evidence store (SOT-2531 / #4a). Populated from the SAME extraction pass
+    # below (no second extraction), then written to its own artifact. Guarded end-to-end so a
+    # failure here can never corrupt the chunks/embeddings the serve path depends on.
+    ev_entries: list[evidence_index.EvidenceEntry] = []
     for i, ref in enumerate(refs):
         doc = extract(ref, caption_images=caption_images)
         if not doc.text.strip():
             continue
+        try:
+            ev_entries.extend(evidence_index.scan_doc(ref, doc.text))
+        except Exception:  # additive; never break the primary index build
+            pass
         body_chunks = _split(doc.text)[:MAX_CHUNKS_PER_DOC]
         header = _header(ref)
         for bc in body_chunks:
@@ -105,6 +114,16 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
             print(f"  extracted {i + 1}/{len(refs)} files, {len(chunks)} chunks ({n_facts} facts)")
     if verbose:
         print(f"  fact rows indexed: {n_facts}")
+
+    # Persist the typed evidence store next to (but independent of) the retrieval index.
+    try:
+        ev_counts = evidence_index.write_index(ev_entries)
+        if verbose:
+            print(f"  evidence index: {ev_counts['entries']} entries "
+                  f"from {ev_counts['files']} files -> {evidence_index.default_out_path()}")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  evidence index skipped: {type(e).__name__}: {e}")
 
     if verbose:
         print(f"embedding {len(chunks)} chunks...")
@@ -129,12 +148,3 @@ def load_chunks() -> list[dict]:
 
 def load_embeddings() -> np.ndarray:
     return np.load(settings.INDEX_DIR / "embeddings.npy")
-
-
-if __name__ == "__main__":
-    import argparse
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--no-images", action="store_true", help="skip Gemini PNG captioning")
-    args = ap.parse_args()
-    build(caption_images=not args.no_images)
