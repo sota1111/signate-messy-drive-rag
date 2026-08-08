@@ -279,6 +279,88 @@ def is_staff_population_question(question: str) -> bool:
     return bool(_STAFF_POPULATION_RE.search(nfc(question or "")))
 
 
+# --------------------------------------------------------------------------- deterministic fallback (SOT-2525)
+# Contracts whose evidence is a canonical data asset the chunk index misses (retrieval_miss): the
+# canonical direct route self-resolves the project + kind from the question alone, so it is a safe,
+# corpus-fact-free tool to force once before concluding UNANSWERABLE.
+_CANONICAL_FALLBACK_CONTRACTS = frozenset({NUMERIC, CROSS_AGGREGATE, MULTI_HOP})
+
+
+def deterministic_fallback_plan(
+        question: str, contract: "str | None") -> "tuple[str, dict[str, object]] | None":
+    """The one deterministic, self-resolving tool to try before UNANSWERABLE, or ``None`` (SOT-2525).
+
+    The UNANSWERABLE bucket (12/73 abstains) is dominated by questions whose gold answer *does* exist in
+    a canonical data asset / version pair — the system gave up before ever routing to the deterministic
+    tool. This returns a ``(tool_name, kwargs)`` plan for exactly one such tool, chosen from the contract
+    so it (a) resolves its target from the question text alone and (b) returns corpus-fact-free
+    *evidence*, never a committed answer:
+
+    * ``version_diff(question=…)`` for a ``version_diff`` contract — the deterministic full-document
+      differ self-resolves the version pair.
+    * ``canonical_route(question=…)`` for numeric / cross-file / multi-hop contracts, or any question
+      that names a canonical data asset (:func:`~src.rag.agent.routing.references_data_asset`) — it
+      self-resolves the project + kind and returns ``{rel, project, …}`` records.
+    * ``file_grep(query=<literal term>)`` as a last resort when the question carries an exact quoted /
+      named term — a deterministic full-corpus grep for that literal.
+
+    Returns ``None`` when no deterministic route self-resolves from the question (the abstain then stands
+    unchanged). The chosen tool only ever *seeds evidence*; the answer is still produced by the model
+    subject to every existing commit guard, so a wrong answer is never injected (EV-safe).
+    """
+    from src.rag.agent import obligations as _obligations  # lazy: avoid import cycle
+    from src.rag.agent import routing as _routing          # lazy: avoid import cycle
+
+    if contract == VERSION_DIFF:
+        return "version_diff", {"question": question}
+    if contract in _CANONICAL_FALLBACK_CONTRACTS or _routing.references_data_asset(question):
+        return "canonical_route", {"question": question}
+    literal = _obligations.literal_terms(question)
+    if literal:
+        return "file_grep", {"query": literal[0]}
+    return None
+
+
+class DeterministicFallbackGate:
+    """Force one contract-typed deterministic tool before an UNANSWERABLE abstain is accepted (SOT-2525).
+
+    The investigator constructs the gate per question (only when :data:`RAG_UNANSWERABLE_FALLBACK` is on)
+    and, when the model is about to abstain and neither the enumeration-closure nor the obligation
+    re-search loop intervened, calls :meth:`plan` exactly once to get the deterministic tool to run. The
+    gate is one-shot: after :meth:`plan` has returned (whether or not the tool reached evidence) it
+    returns ``None`` forever, so a still-abstaining model cannot loop on it. It injects no corpus fact and
+    no answer — :meth:`directive` only carries the tool's own output back to the model.
+    """
+
+    def __init__(self, question: str, contract: "str | None") -> None:
+        self.question = question
+        self.contract = contract
+        self._tried = False
+
+    def plan(self) -> "tuple[str, dict[str, object]] | None":
+        """The one deterministic ``(tool_name, kwargs)`` to try, or ``None`` (one-shot)."""
+        if self._tried:
+            return None
+        self._tried = True
+        return deterministic_fallback_plan(self.question, self.contract)
+
+    def directive(self, tool_name: str, out: object) -> str:
+        """The user-message feeding the deterministic tool's evidence back before an abstain."""
+        import json
+
+        try:
+            payload = json.dumps(out, ensure_ascii=False, default=str)[:6000]
+        except (TypeError, ValueError):
+            payload = str(out)[:6000]
+        return (
+            f"UNANSWERABLE と確定する前に、契約型の決定論ツール『{tool_name}』を質問に対して実行しました"
+            "（棄権前の必須フォールバック）。\n"
+            f"実行結果(JSON): {payload}\n"
+            "この結果に質問の根拠が含まれるなら、compute / read_office / read_chart_values 等で確定し "
+            "submit_answer で回答してください。根拠が含まれない・対象が解決できない場合のみ、従来どおり"
+            "棄権してください（推測して回答してはならない）。")
+
+
 def completion_conditions(question: str, contract: str) -> tuple[str, ...]:
     """Return the static contract checklist plus question-specific completion promises."""
     base = CONTRACT_COMPLETION[contract]
