@@ -119,6 +119,36 @@ def first_tools_for(contract: QuestionContract, question: str) -> tuple[str, ...
     return base
 
 
+def deterministic_first_move(contract: QuestionContract,
+                             question: str) -> tuple[str, dict[str, object]] | None:
+    """The tool the *loop* should run deterministically as the first move, or ``None`` (SOT-2521).
+
+    BUDGET_EXHAUSTED is the top abstain cause (54/73): the model burns its turn budget wandering
+    through chunk search before it ever reaches the deterministic tool. The SOT-2498 routing *hint*
+    can only advise — it cannot stop the wandering. This returns a ``(tool_name, kwargs)`` plan the
+    investigator loop executes *before* the model's first turn, seeding the model with canonical
+    evidence so it spends its budget computing/extracting rather than searching.
+
+    Only a tool that (a) resolves its target from the question alone and (b) returns generic,
+    corpus-fact-free *evidence* (never a committed answer) qualifies, so seeding it cannot hard-code
+    an answer:
+
+    * ``canonical_route(question=…)`` — for every contract whose effective first move is the canonical
+      direct route (numeric / cross-file that routes to a file / a ``simple_lookup`` whose evidence
+      lives inside a named data asset the chunk index misses). It self-resolves the project + kind and
+      returns ``{rel, project, …}`` records; the answer is still produced by the model from those.
+
+    Contracts whose first move needs a target the model must still discover (a plain lookup, a chart /
+    format / spatial question, an aggregate needing a metric argument) return ``None`` — their first
+    turn stays model-driven. The decision reuses :func:`first_tools_for`, so the loop's forced first
+    move and the prompt hint can never disagree about what the first tool is.
+    """
+    first_tools = first_tools_for(contract, question)
+    if first_tools and first_tools[0] == "canonical_route":
+        return "canonical_route", {"question": question}
+    return None
+
+
 def route_hint(contract: QuestionContract, question: str) -> str:
     """Build the system-prompt fragment that steers the first move for ``contract`` (advisory).
 

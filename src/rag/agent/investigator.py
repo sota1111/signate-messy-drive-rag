@@ -28,6 +28,7 @@ this change is intentionally self-contained and leaves the green gate untouched.
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -58,6 +59,26 @@ DEFAULT_TIMEOUT_S = 180.0         # wall-clock budget per question (checked betw
 ABSTAIN = settings.ABSTAIN
 SUBMIT_ANSWER = "submit_answer"   # terminal tool name the model calls to finish
 DIRECTIVE_MESSAGE = "__instruction__"  # plain user guidance, never a synthetic function response
+
+
+def _bool_env(key: str, default: bool) -> bool:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# SOT-2521 — whether the convenience :func:`answer_question` entry point wires the loop-side
+# deterministic first move (see :func:`investigate`'s ``first_move``). **Default OFF so the production
+# answer path stays byte-identical.** The always-on variant regressed the single gold-100 measurement
+# (match 21→19, wrong 6→9 vs the SOT-2510 baseline): seeding canonical evidence and telling the model to
+# stop searching nudged premature *wrong* commits on questions the model would otherwise have kept
+# investigating. So the mechanism ships behind this flag, OFF, pending a *narrowed* enablement whose
+# net effect is measured by the single integrated SOT-2527 gold-100 run — mirroring the
+# ``GATE_SLICE_CALIBRATE`` / ``GATE_COMMIT_ON_TIEBREAK`` default-OFF precedent (mechanism landed,
+# relaxation deferred to a real non-regression confirmation). The ``investigate(first_move=…)`` parameter
+# itself is unchanged; only this entry point's default wiring is gated.
+FIRST_MOVE_ROUTING = _bool_env("RAG_FIRST_MOVE_ROUTING", False)
 
 # Vertex Gemini list price (USD per 1M tokens), (input, output) — estimates for cost bookkeeping only.
 PRICING: dict[str, tuple[float, float]] = {
@@ -546,6 +567,47 @@ def _jsonable(obj: Any, *, max_str: int = 8000, max_items: int = 60, _depth: int
     return str(obj)
 
 
+def _first_move_useful(out: Any) -> bool:
+    """Whether a deterministic first-move tool actually reached evidence worth seeding (SOT-2521).
+
+    A first move is only worth seeding when it resolved a concrete target: a ``{value, …}`` contract
+    with a non-empty ``value`` (canonical_route records / a computed value), or a plain non-empty
+    list. An error mapping, an empty ``value`` (no project/kind resolved), or an empty list means the
+    deterministic route did not reach the needle — leave the first turn model-driven instead of
+    seeding a misleading empty result.
+    """
+    if _contract.is_contract(out):
+        value = _contract.ensure_contract(out).get("value")
+        return value not in (None, "", [], {})
+    if isinstance(out, Mapping):
+        return "error" not in out and bool(out)
+    if isinstance(out, (list, tuple)):
+        return bool(out)
+    return out not in (None, "")
+
+
+def _first_move_directive(name: str, out: Any) -> str:
+    """The seed user-message describing a deterministic first-move result (SOT-2521).
+
+    Carries the tool's own output (the same evidence the model would receive had it called the tool
+    itself) and tells the model to build on it — compute / extract — rather than re-run search or the
+    route from scratch. Injects no answer and no policy: the committed answer is still the model's.
+    """
+    import json
+
+    try:
+        payload = json.dumps(out, ensure_ascii=False, default=str)[:6000]
+    except (TypeError, ValueError):
+        payload = str(out)[:6000]
+    return (
+        f"初手として決定論ツール『{name}』を質問に対して実行しました"
+        "（探索予算を canonical 証拠へ直結させるため、chunk 検索は省略済み）。\n"
+        f"実行結果(JSON): {payload}\n"
+        "この結果の primary/records を起点に、canonical_route の再実行や一律の chunk 検索を先に行わず、"
+        "必要なら compute / read_office / read_chart_values で計算・抽出して回答してください。"
+        "この初手で対象が得られていない場合や、より適切な根拠が別にある場合のみ、他ツールへ切り替えてください。")
+
+
 def dispatch(tools_by_name: Mapping[str, AgentTool], name: str, args: Mapping[str, Any] | None) -> Any:
     """Run tool ``name`` with ``args``; return a JSON-safe result or an ``{"error": ...}`` mapping.
 
@@ -733,7 +795,8 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 calc_ledger: "str | object | bool | None" = None,
                 research: "bool | Mapping[str, Any] | object | None" = None,
                 enumeration: "bool | Mapping[str, Any] | object | None" = None,
-                contract: "str | None" = None) -> Investigation:
+                contract: "str | None" = None,
+                first_move: "tuple[str, Mapping[str, Any]] | None" = None) -> Investigation:
     """Drive ``model`` through tool-calling until it submits a structured answer.
 
     The loop ends on the first of: the model calls ``submit_answer`` (→ ``answered``); ``max_turns`` is
@@ -785,6 +848,16 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     per-question alongside the tools actually used. It never influences the loop — the routing *hint*
     itself is injected into the model's system prompt at construction (see :func:`answer_question`), not
     here — so passing it leaves the answer path byte-identical (default ``None``).
+
+    ``first_move`` (SOT-2521) is an optional ``(tool_name, kwargs)`` plan the loop runs *deterministically
+    before the model's first turn*, seeding the model with the tool's evidence (as a plain user directive)
+    so it stops burning its turn budget wandering through chunk search on questions whose evidence is a
+    canonical data-asset needle (BUDGET_EXHAUSTED, the top abstain cause). It only seeds when the tool
+    actually reaches evidence (:func:`_first_move_useful`); an empty/error result falls back to the
+    ordinary model-driven first turn. The seed steers the *first* move only — the model's later tool
+    choice and the commit-vs-abstain decision are untouched — and injects no answer, so the answer path
+    stays byte-identical when it is ``None`` (default). The plan is built by
+    :func:`~src.rag.agent.routing.deterministic_first_move` in :func:`answer_question`.
     """
     record_enabled = ledger not in (None, False)
     if record_enabled:
@@ -833,6 +906,28 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     tool_outputs: list[Any] = []
     version_diff_result: Mapping[str, Any] | None = None
     start = clock()
+
+    # SOT-2521 — deterministic first move: run the routed first-move tool *before* the model's first
+    # turn and seed its evidence, so the model starts from the canonical needle instead of wandering
+    # through chunk search until BUDGET_EXHAUSTED. Only seeds on a useful (non-empty) result; the
+    # observe-only ledgers see it exactly as a normal tool round would, and no answer is injected.
+    if first_move is not None:
+        fm_name, fm_args = first_move
+        if fm_name in by_name:
+            fm_out = dispatch(by_name, fm_name, dict(fm_args or {}))
+            if _first_move_useful(fm_out):
+                tool_calls.append(fm_name)
+                tool_outputs.append(fm_out)
+                if fm_name == "version_diff" and isinstance(fm_out, Mapping):
+                    version_diff_result = fm_out
+                if signals is not None:
+                    signals.observe(fm_name, fm_out)
+                if calc_signals is not None:
+                    calc_signals.observe(fm_name, fm_out)
+                if director is not None:
+                    director.observe(fm_name, fm_out)
+                iterations += 1
+                responses = [ToolResponse(DIRECTIVE_MESSAGE, _first_move_directive(fm_name, fm_out))]
 
     for _turn in range(max_turns):
         if clock() - start > timeout_s:
@@ -1290,12 +1385,19 @@ def answer_question(question: str, *, model: str | None = None,
     tools = build_tools(profile_obj)
     system: str | None = None
     contract: str | None = None
+    first_move: "tuple[str, Mapping[str, Any]] | None" = None
     if routing not in (None, False):
         from src.rag.agent import question_contract as _question_contract
         from src.rag.agent import routing as _routing  # lazy: keeps import free of the classifier deps
         qc = _routing.classify_for_routing(question, flash=contract_flash)
         system = _routing.routed_system_prompt(SYSTEM_PROMPT, qc, question)
         contract = qc.contract
+        # SOT-2521 — the loop-side deterministic first move (see investigate ``first_move``). Reuses the
+        # same first-tool decision as the prompt hint so they can never disagree. Gated OFF by default
+        # (``FIRST_MOVE_ROUTING``): the always-on variant regressed gold-100, so the wiring stays dormant
+        # here — the answer path is byte-identical — until SOT-2527 measures a narrowed enablement.
+        if FIRST_MOVE_ROUTING:
+            first_move = _routing.deterministic_first_move(qc, question)
         started = time.monotonic()
         deterministic: Answer | None = None
         deterministic_tools: list[str] = []
@@ -1340,4 +1442,4 @@ def answer_question(question: str, *, model: str | None = None,
     model_obj = gemini_model_factory(question, tools, model=model, system=system)
     return investigate(model_obj, question, tools, max_turns=max_turns, timeout_s=timeout_s,
                        ledger=ledger, calc_ledger=calc_ledger, research=research,
-                       enumeration=enumeration, contract=contract)
+                       enumeration=enumeration, contract=contract, first_move=first_move)
