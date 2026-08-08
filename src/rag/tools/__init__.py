@@ -5,7 +5,8 @@
   self-discovered passwords / aliases / formats; raw secrets never committed).
 * :mod:`~src.rag.tools.compute_sandbox` — restricted pandas execution (``run``).
 * :mod:`~src.rag.tools.corpus_aggregate` — 全プロジェクト横断の決定論集約 (契約金額/着手金/行数/担当者/
-  契約期間 の count/max/min/period-filter + 会社名↔主略称正規化) (``corpus_aggregate``).
+  役割付き実施体制/契約期間 の count/max/min/period-filter + 会社名↔主略称正規化)
+  (``corpus_aggregate``).
 * :mod:`~src.rag.tools.extract_tools` — thin contract wrappers over corpus/passwords/glossary/
   office/vision extraction.
 * :mod:`~src.rag.tools.file_grep` — NFC-aware cross-corpus full-text / cell grep (``file_grep``).
@@ -22,6 +23,7 @@ from src.rag.tools.compute_sandbox import run as compute_run
 from src.rag.tools.corpus_aggregate import (
     ProjectContract,
     collect_contracts,
+    collect_staff_population,
     corpus_aggregate,
 )
 from src.rag.tools.contract import ContractError, ToolResult, ensure_contract, is_contract, make
@@ -77,6 +79,7 @@ __all__ = [
     "ComputeError",
     "corpus_aggregate",
     "collect_contracts",
+    "collect_staff_population",
     "ProjectContract",
     "ToolResult",
     "ContractError",

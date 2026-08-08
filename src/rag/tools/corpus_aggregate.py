@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -68,11 +69,175 @@ _ROLES: list[tuple[str, str]] = [
 ]
 _NAME = r"([^\n（(\-‐–/／、,|]+)"
 
-METRICS = {"contract_amount", "deposit", "train_rows", "amount_per_row", "period_days", "staff"}
+METRICS = {
+    "contract_amount", "deposit", "train_rows", "amount_per_row", "period_days", "staff",
+    "staff_population",
+}
 OPS = {"max", "min", "count", "filter", "list"}
 
 _CONTRACT_EXT = {"docx", "pdf", "pptx"}
 _TRAIN_NAMES = ("train.csv", "train.xlsx", "train.tsv")
+
+# Four authoritative document families named by the cross-corpus roster question.  The aliases are
+# document taxonomy, not corpus facts; values and people are always extracted at runtime.
+_STAFF_DOCUMENT_TYPES: dict[str, str] = {
+    "proposal": "PP",
+    "contract": "契約書",
+    "plan": "PLAN",
+    "report": "FR",
+}
+_ROLE_LABEL = (
+    r"(?:エグゼクティブスポンサー|プロジェクトマネージャー|"
+    r"リード(?:データサイエンティスト|DS)|データ(?:サイエンティスト|エンジニア)|"
+    r"ビジネスアナリスト|QA(?:レビューア(?:ー)?|レビュー担当)?|PM|DS|DE|BA)"
+)
+_PERSON = r"([一-龯々]{1,4}[ \u3000]+[一-龯々]{1,4})"
+_ROLE_THEN_PERSON = re.compile(_ROLE_LABEL + r"\s*(?:[：:|─―\-]|\s)\s*" + _PERSON, re.I)
+_PERSON_THEN_ROLE = re.compile(
+    r"^\s*" + _PERSON + r"\s*(?:[：:|─―\-]|\s)\s*" + _ROLE_LABEL + r"(?:\b|\s|$)", re.I)
+_EXACT_PERSON = re.compile(r"^" + _PERSON + r"(?:\s*(?:部長|課長|室長))?$", re.I)
+
+
+def _person_key(name: str) -> str:
+    """Canonical identity key for cross-document deduplication.
+
+    Office sources mix ordinary/full-width spaces and common glyph variants (for example 斉/斎).
+    Normalising those typographic variants prevents one person from being counted twice without
+    consulting a corpus-specific roster.
+    """
+    text = unicodedata.normalize("NFKC", str(name)).strip()
+    text = re.sub(r"\s+", " ", text)
+    return text.translate(str.maketrans({"斉": "斎", "髙": "高"})).replace(" ", "")
+
+
+def _display_person(name: str) -> str:
+    text = unicodedata.normalize("NFKC", str(name)).strip()
+    return re.sub(r"\s+", " ", text).translate(str.maketrans({"斉": "斎", "髙": "高"}))
+
+
+def _extract_role_names(text: str) -> list[str]:
+    """Extract role-bound people from one PP/contract/PLAN/FR text representation.
+
+    Handles role→name tables/paragraphs, name→role report lines, and PPTX layouts where extraction
+    emits a role shape and its name shape on adjacent lines.  A bare name is never accepted unless a
+    supported DA role is in the same or immediately adjacent layout block.
+    """
+    lines = [unicodedata.normalize("NFKC", line).strip() for line in str(text).splitlines()]
+    found: list[str] = []
+    for line in lines:
+        found.extend(m.group(1) for m in _ROLE_THEN_PERSON.finditer(line))
+        found.extend(m.group(1) for m in _PERSON_THEN_ROLE.finditer(line))
+    for index, line in enumerate(lines):
+        if not re.search(_ROLE_LABEL, line, re.I):
+            continue
+        if _ROLE_THEN_PERSON.search(line) or _PERSON_THEN_ROLE.search(line):
+            continue
+        # Separate PPTX text boxes: tolerate a duplicate colour-annotation role line between label/name.
+        for candidate in lines[index + 1:index + 5]:
+            match = _EXACT_PERSON.match(candidate)
+            if match:
+                found.append(match.group(1))
+                break
+            if re.search(_ROLE_LABEL, candidate, re.I) and candidate != line:
+                break
+    out: list[str] = []
+    seen: set[str] = set()
+    for name in found:
+        key = _person_key(name)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(_display_person(name))
+    return out
+
+
+def _staff_ref_rank(ref: FileRef) -> tuple[int, int, int]:
+    """Rank canonical revisions without timestamps (latest/final > numeric revision > unversioned)."""
+    label = unicodedata.normalize("NFKC", ref.rel).lower()
+    final = 1 if re.search(r"final|latest|最新版|最終版", label) else 0
+    revisions = [int(match[1])
+                 for match in re.findall(r"(?:^|[_\-.])(v|r)(\d+)(?:[_\-.]|$)", label)]
+    revision = max(revisions, default=0)
+    # Prefer a shorter canonical path over nested supporting material at equal revision.
+    return final, revision, -len(Path(ref.rel).parts)
+
+
+def _authoritative_staff_refs(refs: Sequence[FileRef]) -> tuple[list[FileRef], dict[str, Any]]:
+    """Resolve exactly one canonical PP/contract/PLAN/FR per project, recording every exclusion."""
+    projects = list(dict.fromkeys(r.project for r in refs if r.project and r.project != "社内管理"))
+    selected: list[FileRef] = []
+    excluded: list[dict[str, str]] = []
+    missing: list[dict[str, str]] = []
+    name_cues = {
+        "proposal": "提案書", "contract": "契約書", "plan": "スケジュール", "report": "最終報告",
+    }
+    for project in projects:
+        for category, doc_type in _STAFF_DOCUMENT_TYPES.items():
+            candidates = [r for r in refs if r.project == project and r.category == category
+                          and r.ext in {"docx", "xlsx", "pptx", "pdf"}]
+            cue = name_cues[category]
+            named = [r for r in candidates if cue in unicodedata.normalize("NFKC", r.name)]
+            if named:
+                candidates = named
+            eligible: list[FileRef] = []
+            for ref in candidates:
+                label = unicodedata.normalize("NFKC", ref.rel).lower()
+                if ("/old/" in label or re.search(r"(?:^|[_\-.])old(?:[_\-.]|$)", label)
+                        or "draft" in label or ref.name.startswith("~$")):
+                    excluded.append({"file": ref.rel, "reason": "superseded_or_draft"})
+                else:
+                    eligible.append(ref)
+            if not eligible:
+                missing.append({"project": project, "document_type": doc_type})
+                continue
+            chosen = max(eligible, key=_staff_ref_rank)
+            selected.append(chosen)
+            excluded.extend({"file": r.rel, "reason": "lower_revision"}
+                            for r in eligible if r is not chosen)
+    return selected, {
+        "projects": projects,
+        "document_types": list(_STAFF_DOCUMENT_TYPES.values()),
+        "selected_files": [r.rel for r in selected],
+        "excluded_files": excluded,
+        "missing": missing,
+    }
+
+
+def collect_staff_population(*, corpus_dir: str | Path | None = None,
+                             refs: Sequence[FileRef] | None = None) -> tuple[list[str], dict[str, Any]]:
+    """Union DA role-bound people across canonical PP/contract/PLAN/FR sources."""
+    if refs is None:
+        refs = walk(Path(corpus_dir)) if corpus_dir is not None else walk()
+    selected, population = _authoritative_staff_refs(refs)
+    people: list[str] = []
+    seen: set[str] = set()
+    per_file: dict[str, list[str]] = {}
+    unreadable: list[str] = []
+    for ref in selected:
+        try:
+            doc = _extract(ref, caption_images=False)
+            names = _extract_role_names(getattr(doc, "text", ""))
+        except Exception:  # noqa: BLE001 — recorded as incomplete; never guessed
+            names = []
+            unreadable.append(ref.rel)
+        per_file[ref.rel] = names
+        for name in names:
+            key = _person_key(name)
+            if key not in seen:
+                seen.add(key)
+                people.append(name)
+    evidence = {
+        **population,
+        "per_file": per_file,
+        "unreadable_files": unreadable,
+        "closure": {
+            "authoritative_population_resolved": not population["missing"],
+            "inclusion_exclusion_recorded": True,
+            "second_path_novel_candidates": [],
+            "enumeration_count": len(people),
+            "aggregate_count": len(seen),
+        },
+    }
+    return people, evidence
 
 
 # --------------------------------------------------------------------------- field extraction
@@ -301,7 +466,8 @@ def corpus_aggregate(metric: str, op: str = "max", *,
     Parameters
     ----------
     metric : one of ``contract_amount`` / ``deposit`` / ``train_rows`` / ``amount_per_row`` /
-        ``period_days`` / ``staff``.
+        ``period_days`` / ``staff`` / ``staff_population``.  ``staff_population`` unions role-bound
+        DA people across every project's canonical PP/contract/PLAN/FR source.
     op : ``max`` / ``min`` (extreme project for a numeric metric), ``count`` (metric=staff → most
         frequent 乙 person; other metrics → number of projects with a known value), ``filter``
         (period overlap window + ``min_days``), ``list`` (all project records).
@@ -318,6 +484,30 @@ def corpus_aggregate(metric: str, op: str = "max", *,
         return _err(f"unknown metric {metric!r}", metrics=sorted(METRICS))
     if op not in OPS:
         return _err(f"unknown op {op!r}", ops=sorted(OPS))
+
+    # ---- complete staff population across PP / contract / PLAN / FR (idx86) --------------------
+    if metric == "staff_population":
+        if op not in ("count", "list"):
+            return _err(f"metric=staff_population supports op count/list, not {op!r}")
+        people, evidence = collect_staff_population(corpus_dir=corpus_dir)
+        closure = evidence["closure"]
+        complete = (
+            closure["authoritative_population_resolved"]
+            and closure["inclusion_exclusion_recorded"]
+            and not closure["second_path_novel_candidates"]
+            and closure["enumeration_count"] == closure["aggregate_count"]
+            and not evidence["unreadable_files"]
+        )
+        if not complete:
+            return _contract.make(
+                None, engine="corpus_aggregate",
+                evidence={**evidence, "reason": "PP/契約書/PLAN/FR の母集団閉包が未成立"},
+                metric=metric, op=op, closure="failed")
+        value: Any = people if op == "list" else {"count": len(people), "people": people}
+        return _contract.make(
+            value, engine="corpus_aggregate", evidence=evidence,
+            metric=metric, op=op, closure="four_conditions_satisfied",
+            note="4文書型×全案件の役割付きDA人物を正本列挙→表記正規化→union→件数照合。")
 
     recs = collect_contracts(corpus_dir=corpus_dir, glossary=glossary)
     pool = [r for r in recs if r.fixed or not fixed_only]

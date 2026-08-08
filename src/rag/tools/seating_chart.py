@@ -50,6 +50,10 @@ _RELATION_ALIASES: dict[str, str] = {
     "adjacent": "adjacent", "next": "adjacent",
     "同じ列": "same_column", "同列": "same_column", "same_column": "same_column",
     "同じ行": "same_row", "同行": "same_row", "same_row": "same_row",
+    "右側": "right_side", "右手": "right_side", "右方向": "right_side",
+    "right_side": "right_side", "to the right": "right_side",
+    "左側": "left_side", "左手": "left_side", "左方向": "left_side",
+    "left_side": "left_side", "to the left": "left_side",
 }
 
 
@@ -273,7 +277,18 @@ def _match_name(seats: Sequence[Seat], name: str) -> list[Seat]:
 
 
 def _relation_neighbours(seats: Sequence[Seat], seat: Seat, relation: str) -> list[Seat]:
-    """Resolve a spatial ``relation`` around ``seat`` within its POD (deterministic layout rules)."""
+    """Resolve a spatial ``relation`` around ``seat`` within its POD.
+
+    ``row``/``col`` are the two axes of the reviewed isometric 2x2 island.  Screen-left/screen-right
+    cannot be used for questions phrased "X から見て": every occupant faces inward, so their local
+    right axis rotates with their corner.  For side queries we therefore map a seat to a normalized
+    corner ``(x, y)`` and project every other seat into the occupant's inward-facing frame.  A desk
+    straight ahead lies on the separating ray and belongs to both broad "側" half-planes; this is the
+    distinction between 右側/左側 and the narrower 隣 relation.
+
+    The older ``opposite`` pairing remains the chart's reviewed face-to-face calibration (same column,
+    other row), preserving the pinned idx58 anchor while side relations use the new perspective frame.
+    """
     if seat.row is None or seat.col is None:
         return []  # satellite desk: no grid neighbours
     pod = [s for s in seats if s.pod == seat.pod and s is not seat
@@ -286,6 +301,29 @@ def _relation_neighbours(seats: Sequence[Seat], seat: Seat, relation: str) -> li
         return [s for s in pod if s.col == seat.col]
     if relation == "same_row":       # 同じ行: same row, any other column
         return [s for s in pod if s.row == seat.row]
+    if relation in ("right_side", "left_side"):
+        # Reviewed 2x2 corners: row 0/1 = east/west side, col 0/1 = north/south side.
+        # Every occupant faces the centre.  In screen coordinates (+y downward), a right vector for
+        # forward=(fx, fy) is (-fy, fx).
+        sx = 1 if seat.row == 0 else -1
+        sy = -1 if seat.col == 0 else 1
+        fx, fy = -sx, -sy
+        rx, ry = -fy, fx
+
+        def projection(other: Seat) -> tuple[int, int]:
+            ox = 1 if other.row == 0 else -1
+            oy = -1 if other.col == 0 else 1
+            dx, dy = ox - sx, oy - sy
+            return dx * rx + dy * ry, dx * fx + dy * fy
+
+        out: list[Seat] = []
+        for other in pod:
+            lateral, forward = projection(other)
+            if relation == "right_side" and (lateral > 0 or (lateral == 0 and forward > 0)):
+                out.append(other)
+            elif relation == "left_side" and (lateral < 0 or (lateral == 0 and forward > 0)):
+                out.append(other)
+        return out
     return []
 
 
@@ -307,6 +345,7 @@ def _evidence(directory: Directory, **extra: Any) -> dict[str, Any]:
 
 def seating_lookup(name: str | None = None, *, ext: str | None = None, role: str | None = None,
                    relation: str | None = None, pod: int | None = None,
+                   field: str = "ext",
                    file: str | Path = "座席表.pptx",
                    vision_fn: Callable[[bytes], list[dict[str, Any]]] | None = None) -> dict[str, Any]:
     """座席ディレクトリに対する氏名/EXT/役割/空間関係ルックアップ(contract 形式)。
@@ -314,8 +353,9 @@ def seating_lookup(name: str | None = None, *, ext: str | None = None, role: str
     Query forms (precision-first — every unresolved / ambiguous / not-found case returns
     ``value=None`` so the agent abstains instead of guessing):
 
-    * ``name`` (+ optional ``relation``) — 氏名で座席を引く。``relation`` (向かい/隣/同列/同行) を
-      与えると、その人の空間的な隣人の EXT を返す(idx58: ``井上`` の向かい → ``7102``)。
+    * ``name`` (+ optional ``relation``) — 氏名で座席を引く。``relation`` (向かい/隣/同列/同行/
+      右側/左側) を与えると、その人の空間的な隣人を返す。``field=name`` は氏名、既定の
+      ``field=ext`` は EXT を返す(idx58: ``井上`` の向かい → ``7102``)。
     * ``ext`` — 内線から人物レコードを引く。
     * ``role`` (+ optional ``pod``) — 役割(Exec/PM/DS/…)で EXT を引く(``pod`` で島を絞る)。
 
@@ -328,6 +368,9 @@ def seating_lookup(name: str | None = None, *, ext: str | None = None, role: str
                              scheme="unresolved", note="座席ディレクトリを抽出できなかった(棄権)")
 
     rel = canonical_relation(relation)
+    if field not in {"ext", "name", "seat"}:
+        return contract.make(None, engine="seating", evidence=_evidence(directory, field=field),
+                             scheme="unresolved", note="field は ext/name/seat のいずれか")
 
     # --- name (+ optional spatial relation) --------------------------------------------------
     if name:
@@ -341,19 +384,38 @@ def seating_lookup(name: str | None = None, *, ext: str | None = None, role: str
         person = matches[0]
         if rel:
             neighbours = _relation_neighbours(seats, person, rel)
-            if len(neighbours) != 1:
+            broad_side = rel in {"right_side", "left_side"}
+            if not neighbours or (not broad_side and len(neighbours) != 1):
                 return contract.make(
                     None, engine="seating",
                     evidence=_evidence(directory, subject=person.to_dict(), relation=rel,
                                        n_neighbours=len(neighbours)),
                     scheme="unresolved", relation=rel,
                     note="空間関係の隣人が一意に定まらない(棄権)")
-            nb = neighbours[0]
+            def emitted(s: Seat) -> Any:
+                if field == "name":
+                    return s.name
+                if field == "seat":
+                    return s.to_dict()
+                return s.ext
+
+            emitted_values = [emitted(s) for s in neighbours]
+            value: Any = emitted_values if broad_side or len(emitted_values) != 1 else emitted_values[0]
+            population = [s.to_dict() for s in seats if s.pod == person.pod and s is not person]
+            closure = ({
+                "authoritative_population_resolved": directory.origin == "reviewed",
+                "inclusion_exclusion_recorded": True,
+                "second_path_novel_candidates": [],
+                "enumeration_count": len(neighbours),
+                "aggregate_count": len(emitted_values),
+            } if broad_side else None)
             return contract.make(
-                nb.ext, engine="seating",
+                value, engine="seating",
                 evidence=_evidence(directory, subject=person.to_dict(), relation=rel,
-                                   neighbour=nb.to_dict()),
-                scheme="spatial", relation=rel)
+                                   neighbour=(neighbours[0].to_dict() if len(neighbours) == 1 else None),
+                                   neighbours=[s.to_dict() for s in neighbours],
+                                   population=population, closure=closure),
+                scheme="spatial", relation=rel, field=field)
         return contract.make(
             person.ext, engine="seating",
             evidence=_evidence(directory, seat=person.to_dict()), scheme="name")

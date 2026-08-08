@@ -201,3 +201,20 @@ def test_idx46_max_deposit_case_and_its_es():
     # 着手金最大 = 白峰(SHR)、その ES = 中村 誠 (内線は seating_chart で 7201)
     assert r["value"]["abbrev"] == "SHR"
     assert r["value"]["staff"]["ES"] == "中村 誠"
+
+
+@_needs_corpus
+def test_idx86_closed_staff_population_across_four_document_types():
+    r = ca.corpus_aggregate("staff_population", "count")
+    assert r["value"]["count"] == 19
+    assert len(r["value"]["people"]) == 19
+    assert len(r["evidence"]["selected_files"]) == 40  # 10 projects × PP/contract/PLAN/FR
+    assert r["evidence"]["missing"] == []
+    assert r["evidence"]["unreadable_files"] == []
+    assert r["evidence"]["closure"] == {
+        "authoritative_population_resolved": True,
+        "inclusion_exclusion_recorded": True,
+        "second_path_novel_candidates": [],
+        "enumeration_count": 19,
+        "aggregate_count": 19,
+    }
