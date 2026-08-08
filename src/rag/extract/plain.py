@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from src.rag.corpus import FileRef
@@ -14,8 +15,26 @@ def read_text_any(path: Path) -> str:
         return ""
 
 
+# A page-marker line ("[ページ12]") carries no content; strip these to judge whether the text layer
+# actually yielded anything.  An image-only (scanned) PDF returns only markers → an empty body.
+_PAGE_MARKER_RE = re.compile(r"^\[ページ\d+\]$")
+
+
+def _text_layer_body(pdf_text: str) -> str:
+    """The extracted PDF text minus its structural page markers (for the image-only-PDF check)."""
+    return "".join(ln for ln in pdf_text.splitlines()
+                   if ln.strip() and not _PAGE_MARKER_RE.match(ln.strip()) and ln.strip() != "[表]")
+
+
 def extract_pdf(ref: FileRef) -> str:
-    """Text layer via pdfplumber (keeps tables as pipe rows). OCR fallback handled by vision layer."""
+    """Text layer via pdfplumber (keeps tables as pipe rows); image-only PDFs fall back to vision OCR.
+
+    A scanned 会議録 / 報告書 has no searchable text layer, so pdfplumber/pypdf return only the page
+    markers.  When the text layer is effectively empty AND the OCR fallback is enabled
+    (:func:`src.rag.extract.vision.pdf_ocr_enabled`, ``RAG_PDF_OCR`` default OFF), transcribe the page
+    rasters via Gemini vision so the document's content (action-item tables / owners / milestones)
+    becomes readable.  Default OFF ⇒ byte-identical to the previous text-only behaviour.
+    """
     out: list[str] = []
     try:
         import pdfplumber
@@ -37,8 +56,16 @@ def extract_pdf(ref: FileRef) -> str:
             for pi, page in enumerate(pypdf.PdfReader(str(ref.path)).pages, 1):
                 out.append(f"[ページ{pi}]\n{page.extract_text() or ''}")
         except Exception:
-            return ""
-    return "\n".join(out)
+            out = []
+    text = "\n".join(out)
+    if not _text_layer_body(text).strip():
+        from src.rag.extract import vision
+
+        if vision.pdf_ocr_enabled():
+            ocr = vision.ocr_image_pdf(ref.path)
+            if ocr and ocr.strip():
+                return ocr
+    return text
 
 
 def extract_csv(ref: FileRef) -> str:
