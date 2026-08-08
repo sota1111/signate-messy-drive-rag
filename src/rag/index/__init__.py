@@ -159,6 +159,24 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  canonical manifest skipped: {type(e).__name__}: {e}")
 
+    # Pre-index decrypt cache (SOT-2529 / 事前処理 #2): resolve every encrypted Office file's
+    # password ONCE here and persist it into corpus_profile.json, so the run-wide shared profile
+    # (SOT-2528) is pre-warmed and the first runtime decrypt/extract_office hits the cache instead
+    # of brute-forcing sibling docs × dates × formats per question. Additive and fully guarded — a
+    # failure here can never corrupt the retrieval index; secrets only reach the gitignored runtime
+    # profile; runtime consultation stays opt-in (RAG_SHARE_CORPUS_PROFILE) so the champion serve
+    # path is byte-identical by default.
+    try:
+        from src.rag.index import precomputed_passwords
+        pw_counts = precomputed_passwords.build(refs)
+        if verbose:
+            print(f"  pre-index decrypt: {pw_counts['encrypted']} encrypted "
+                  f"(resolved={pw_counts['resolved']}, cached={pw_counts['cached']}, "
+                  f"unresolved={pw_counts['unresolved']}) -> {pw_counts['path']}")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  pre-index decrypt skipped: {type(e).__name__}: {e}")
+
     if verbose:
         print(f"embedding {len(chunks)} chunks...")
     texts = [c.text for c in chunks]
