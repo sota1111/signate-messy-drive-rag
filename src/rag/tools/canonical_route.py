@@ -229,15 +229,45 @@ def _rank_key(ref: FileRef, kind: Kind) -> tuple:
     return (prefer_rank, variant, rel.count("/"), rel)
 
 
-def discover(project: str | None, kind: Kind, *, ext_hint: str | None = None,
-             corpus_dir: Path | None = None) -> list[FileRef]:
-    """All corpus files of ``kind`` in ``project`` (or corpus-wide when ``project`` is None), ranked.
+def _discover_live(project: str | None, kind: Kind, *, ext_hint: str | None = None,
+                   corpus_dir: Path | None = None) -> list[FileRef]:
+    """Live walk+match implementation of :func:`discover` (bypasses the precomputed manifest).
 
     Pure over :func:`src.rag.corpus.walk`; the canonical copy (preferred path, non-variant) sorts first.
+    The index-time manifest builder (SOT-2530) calls this directly so it precomputes from the true
+    corpus scan rather than recursing into its own cache.
     """
     hits = [r for r in walk(corpus_dir)
             if (project is None or r.project == project) and _matches_kind(r, kind, ext_hint)]
     return sorted(hits, key=lambda r: _rank_key(r, kind))
+
+
+def discover(project: str | None, kind: Kind, *, ext_hint: str | None = None,
+             corpus_dir: Path | None = None) -> list[FileRef]:
+    """All corpus files of ``kind`` in ``project`` (or corpus-wide when ``project`` is None), ranked.
+
+    Fast path (SOT-2530 / 事前処理 #3): when the precomputed canonical manifest is enabled
+    (``RAG_CANONICAL_MANIFEST``), the project→kind→rel resolution is an O(1) dict lookup over the
+    index-time manifest instead of re-walking the corpus and running ``_matches_kind`` on every
+    file per call (find_files/canonical_route run ~1,119× on the BUDGET questions). The manifest
+    stores the *ext_hint-agnostic* ranked rel list for each (project, kind); an ``ext_hint`` narrows
+    it here exactly as :func:`_matches_kind` would (only ``kind.exts`` members are ever a valid hint),
+    so the result is byte-identical to the live scan. Any miss — a manifest that is disabled, absent,
+    stale (corpus/KINDS signature drift), or missing this project — falls back to the live walk, so
+    correctness/非劣化 is unchanged and only the slow path is removed. Default OFF ⇒ byte-identical.
+    """
+    if project is not None:
+        from src.rag.index import canonical_manifest
+
+        if canonical_manifest.enabled():
+            rels = canonical_manifest.lookup_rels(project, kind.name, corpus_dir=corpus_dir)
+            if rels is not None:
+                by_rel = canonical_manifest.rel_index(corpus_dir)
+                refs = [by_rel[r] for r in rels if r in by_rel]
+                if ext_hint and ext_hint in kind.exts:
+                    refs = [r for r in refs if r.ext.lower() == ext_hint]
+                return refs
+    return _discover_live(project, kind, ext_hint=ext_hint, corpus_dir=corpus_dir)
 
 
 # --------------------------------------------------------------------------- record + tool
