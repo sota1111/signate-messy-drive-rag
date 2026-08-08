@@ -829,6 +829,71 @@ def _deterministic_staff_population_answer(question: str) -> Answer | None:
     )
 
 
+def _strict_literal_vision_answer(question: str, result: object) -> Answer | None:
+    """Return the only literal candidate proven to share its visual line with the condition."""
+    from src.rag.agent import obligations as _obligations
+
+    if not isinstance(result, Mapping):
+        return None
+    literal = _obligations.literal_terms(question)
+    value = result.get("value")
+    candidates = value if isinstance(value, list) else []
+    if not literal or len(candidates) != 1 or not isinstance(candidates[0], Mapping):
+        return None
+    candidate = str(candidates[0].get("candidate", "") or "").strip()
+    conditioned_text = str(candidates[0].get("conditioned_text", "") or "")
+    literal_check = _obligations.validate_literal_evidence(question, candidate, [result])
+    strict_line = (
+        candidates[0].get("same_visual_line") is True
+        and candidate in conditioned_text
+        and all(term in conditioned_text for term in literal)
+    )
+    if not candidate or not strict_line or not literal_check.passed:
+        return None
+    return Answer(
+        answer=candidate,
+        confidence=1.0,
+        evidence=str(result.get("evidence", "")),
+        method="同一視覚行の単一 literal 候補をそのまま採用",
+    )
+
+
+def _deterministic_literal_report_answer(question: str) -> Answer | None:
+    """Inspect one canonical report before a literal lookup can wander or abstain.
+
+    A report-like question may name only the project, leaving an image-only final report invisible to
+    text grep.  Resolve the project from the question, require exactly one PDF in the canonical
+    ``report`` category, then accept only the strict single-line literal contract above.  Ambiguous
+    files, zero/multiple candidates, or Vision errors fail closed to the ordinary agent path.
+    """
+    from src.rag.agent import obligations as _obligations
+
+    if not _obligations.literal_terms(question):
+        return None
+    if not re.search(r"報告|今後|運用|成果|結果|総括", question):
+        return None
+    route = canonical_route(question)
+    project = (route.get("evidence") or {}).get("project") if _contract.is_contract(route) else None
+    if not project:
+        return None
+    found = find_files(str(project), ext="pdf")
+    files = found.get("value") if _contract.is_contract(found) else None
+    reports = [
+        item for item in files or []
+        if isinstance(item, Mapping)
+        and str(item.get("ext", "")).lower() == "pdf"
+        and item.get("category") == "report"
+        and item.get("rel")
+    ]
+    if len(reports) != 1:
+        return None
+    try:
+        result = caption_figure(str(reports[0]["rel"]), question=question)
+    except Exception:
+        return None
+    return _strict_literal_vision_answer(question, result)
+
+
 def _deterministic_gantt_answer(question: str, profile: CorpusProfile) -> Answer | None:
     """Resolve a uniquely named PPTX activity from native Gantt geometry, without an LLM."""
     route = canonical_route(question)
@@ -1436,33 +1501,14 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 # visual-line locality and the smallest directly modified candidate.  When exactly one
                 # such candidate remains, it is deterministic evidence: commit it directly instead of
                 # asking the model to re-select (or repeatedly rediscover) neighbouring cell items.
-                from src.rag.agent import obligations as _obligations
-
-                literal = _obligations.literal_terms(question)
-                value = out.get("value")
-                candidates = value if isinstance(value, list) else []
-                if literal and len(candidates) == 1 and isinstance(candidates[0], Mapping):
-                    candidate = str(candidates[0].get("candidate", "") or "").strip()
-                    conditioned_text = str(
-                        candidates[0].get("conditioned_text", "") or "")
-                    literal_check = _obligations.validate_literal_evidence(
-                        question, candidate, [out])
-                    strict_line = (
-                        candidates[0].get("same_visual_line") is True
-                        and candidate in conditioned_text
-                        and all(term in conditioned_text for term in literal)
-                    )
-                    if candidate and strict_line and literal_check.passed:
-                        answer = Answer(
-                            answer=candidate, confidence=1.0,
-                            evidence=str(out.get("evidence", "")),
-                            method="同一視覚行の単一 literal 候補をそのまま採用",
-                        )
-                        stop_reason = "answered"
-                        submitted = True
-                        if director is not None:
-                            director.note_answered()
-                        break
+                literal_answer = _strict_literal_vision_answer(question, out)
+                if literal_answer is not None:
+                    answer = literal_answer
+                    stop_reason = "answered"
+                    submitted = True
+                    if director is not None:
+                        director.note_answered()
+                    break
             if (contract == "version_diff" and call.name == "version_diff"
                     and isinstance(out, Mapping) and out.get("value") is not None):
                 # The deterministic full-document differ is the authority for this contract. Once it
@@ -1709,6 +1755,10 @@ def answer_question(question: str, *, model: str | None = None,
         elif _question_contract.is_staff_population_question(question):
             deterministic = _deterministic_staff_population_answer(question)
             deterministic_tools = ["corpus_aggregate", "enumeration_closure"]
+        elif contract == "simple_lookup":
+            deterministic = _deterministic_literal_report_answer(question)
+            if deterministic is not None:
+                deterministic_tools = ["canonical_route", "find_files", "caption_image"]
         elif contract == "chart_read" and _question_contract.is_gantt_week_question(question):
             deterministic = _deterministic_gantt_answer(question, profile_obj)
             deterministic_tools = ["canonical_route", "find_files", "read_office"]

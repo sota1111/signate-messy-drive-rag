@@ -556,6 +556,56 @@ def test_single_strict_literal_vision_candidate_commits_without_model_reselectio
     assert len(model.calls_seen) == 1
 
 
+def test_literal_report_answer_resolves_unique_report_and_commits_strict_candidate(monkeypatch):
+    q = "ある病院の今後の運用で『別契約』と明記されたものを抽出してください。"
+    monkeypatch.setattr(inv, "canonical_route", lambda question: {
+        "value": [], "evidence": {"project": "ある病院"}, "method": {"engine": "route"},
+    })
+    monkeypatch.setattr(inv, "find_files", lambda query, ext=None: {
+        "value": [
+            {"rel": "project/meeting.pdf", "ext": "pdf", "category": "meeting"},
+            {"rel": "project/final.pdf", "ext": "pdf", "category": "report"},
+        ],
+        "evidence": {"matched": 2}, "method": {"engine": "corpus"},
+    })
+    seen = []
+
+    def caption(file, question=None):
+        seen.append((file, question))
+        return {
+            "value": [{
+                "candidate": "監視ダッシュボード構築",
+                "condition": "別契約",
+                "conditioned_text": "監視ダッシュボード構築（別契約）",
+                "same_visual_line": True,
+            }],
+            "evidence": {"file": file},
+            "method": {"engine": "vision"},
+        }
+
+    monkeypatch.setattr(inv, "caption_figure", caption)
+    answer = inv._deterministic_literal_report_answer(q)
+    assert answer is not None
+    assert answer.answer == "監視ダッシュボード構築"
+    assert seen == [("project/final.pdf", q)]
+
+
+def test_literal_report_answer_fails_closed_when_report_is_ambiguous(monkeypatch):
+    q = "ある病院の今後の運用で『別契約』と明記されたものを抽出してください。"
+    monkeypatch.setattr(inv, "canonical_route", lambda question: {
+        "value": [], "evidence": {"project": "ある病院"}, "method": {"engine": "route"},
+    })
+    monkeypatch.setattr(inv, "find_files", lambda query, ext=None: {
+        "value": [
+            {"rel": "project/a.pdf", "ext": "pdf", "category": "report"},
+            {"rel": "project/b.pdf", "ext": "pdf", "category": "report"},
+        ],
+        "evidence": {"matched": 2}, "method": {"engine": "corpus"},
+    })
+    monkeypatch.setattr(inv, "caption_figure", lambda *args, **kwargs: pytest.fail("must not scan"))
+    assert inv._deterministic_literal_report_answer(q) is None
+
+
 def test_simple_lookup_empty_first_turn_gets_one_bounded_tool_retry():
     lookup = AgentTool(
         "read_office", "d", {"type": "object", "properties": {}},

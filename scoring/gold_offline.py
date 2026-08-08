@@ -352,7 +352,7 @@ def attach_abstain_state_codes(report: "Report", path: Path | None = None) -> "R
 def _abstain_state_block(items: list[Item], abstain_codes: dict[int, dict]) -> dict:
     """Aggregate abstains by state code and by state-code × archetype — METRICS ONLY (no text).
 
-    ``by_code`` always lists all seven codes (zeros included) so history diffs are stable and an
+    ``by_code`` always lists all registered codes (zeros included) so history diffs are stable and an
     improvement Issue can read a per-cause increase/decrease straight off the entry."""
     from src.rag.agent.abstain_ledger import STATE_CODES
 
