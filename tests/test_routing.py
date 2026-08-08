@@ -191,6 +191,164 @@ def test_routed_system_prompt_appends_hint_to_base():
     assert routing.route_hint(contract, q) in out
 
 
+# --------------------------------------------------------------------------- deterministic first move (SOT-2521)
+def test_first_move_for_numeric_is_canonical_route():
+    q = "京橋信用ソリューションズの train.xlsx の loan_amnt の平均は。"
+    contract = qc.classify(q)
+    assert contract.contract == qc.NUMERIC
+    plan = routing.deterministic_first_move(contract, q)
+    assert plan == ("canonical_route", {"question": q})
+
+
+def test_first_move_for_data_asset_simple_lookup_is_canonical_route():
+    q = "京橋信用ソリューションズの分析コードにおいて、勾配ブースティングの n_estimators は。"
+    contract = qc.classify(q)
+    assert contract.contract == qc.SIMPLE_LOOKUP and routing.references_data_asset(q)
+    assert routing.deterministic_first_move(contract, q) == ("canonical_route", {"question": q})
+
+
+def test_first_move_none_for_plain_lookup_and_specialised_contracts():
+    # a plain (non-data-asset) simple lookup keeps its model-driven first turn (first tool = file_grep)
+    plain = "この会社の代表者名は誰ですか。"
+    assert not routing.references_data_asset(plain)
+    assert routing.deterministic_first_move(qc.classify(plain), plain) is None
+    # specialised contracts lead with a tool that needs a target the model must still discover → None
+    chart = "AG_ratioのヒストグラムで最も多いカウント数はいくつですか。"
+    assert qc.classify(chart).contract == qc.CHART_READ
+    assert routing.deterministic_first_move(qc.classify(chart), chart) is None
+    diff = "提案書の旧版と新版で実質的に変更された点は何ですか。"
+    assert qc.classify(diff).contract == qc.VERSION_DIFF
+    assert routing.deterministic_first_move(qc.classify(diff), diff) is None
+
+
+def test_first_move_agrees_with_prompt_hint_first_tool():
+    # the forced loop first-move tool must equal the first tool named in the prompt hint (no divergence)
+    for q in (
+        "京橋信用ソリューションズの train.xlsx の loan_amnt の平均は。",
+        "京橋信用ソリューションズの分析コードにおいて、勾配ブースティングの n_estimators は。",
+    ):
+        contract = qc.classify(q)
+        plan = routing.deterministic_first_move(contract, q)
+        assert plan is not None
+        assert plan[0] == routing.first_tools_for(contract, q)[0]
+
+
+# --------------------------------------------------------------------------- loop seeds the first move (SOT-2521)
+class _RecordingModel:
+    """Fake model that records every ``tool_responses`` it is handed (to assert the seed message)."""
+
+    def __init__(self, steps, *, model_name="fake-model"):
+        self._steps = list(steps)
+        self._i = 0
+        self.model_name = model_name
+        self.seen = []
+
+    def next(self, tool_responses):
+        self.seen.append(tool_responses)
+        if self._i >= len(self._steps):
+            return Step(function_calls=(), final_text=ABSTAIN, usage=Usage(1, 1))
+        step = self._steps[self._i]
+        self._i += 1
+        return step
+
+
+def _fake_tool(name, result):
+    return inv.AgentTool(name, "d", {"type": "object", "properties": {}}, lambda **kw: result)
+
+
+def _contract_result(value):
+    return {"value": value, "evidence": {}, "method": {}}
+
+
+def test_investigate_seeds_deterministic_first_move_before_first_turn():
+    tools = [_fake_tool("canonical_route", _contract_result([{"rel": "案件/train.xlsx"}])),
+             inv.SUBMIT_ANSWER_TOOL]
+    model = _RecordingModel([_submit("42", confidence=0.9)])
+    res = investigate(model, "…", tools, max_turns=5, contract="numeric",
+                      first_move=("canonical_route", {"question": "…"}))
+    # the model's very first turn already carries the deterministic first-move evidence as a directive
+    first_responses = model.seen[0]
+    assert first_responses and first_responses[0].name == inv.DIRECTIVE_MESSAGE
+    assert "canonical_route" in first_responses[0].response
+    assert "案件/train.xlsx" in first_responses[0].response
+    # the forced first move is recorded as a real tool round; the model still produces the answer
+    assert res.tool_calls[0] == "canonical_route"
+    assert res.iterations >= 1
+    assert res.answer.answer == "42"
+
+
+def test_investigate_first_move_skipped_when_result_is_empty():
+    # canonical_route resolved nothing (no project) → no misleading seed, ordinary first turn
+    tools = [_fake_tool("canonical_route", _contract_result([])), inv.SUBMIT_ANSWER_TOOL]
+    model = _RecordingModel([_submit("x", confidence=0.5)])
+    res = investigate(model, "…", tools, max_turns=5, contract="numeric",
+                      first_move=("canonical_route", {"question": "…"}))
+    assert model.seen[0] is None                 # no seed → first turn gets no tool responses
+    assert res.tool_calls[0] != "canonical_route"  # the forced move was not recorded
+
+
+def test_investigate_first_move_default_none_is_byte_identical():
+    tools = [_fake_tool("canonical_route", _contract_result([{"rel": "x"}])), inv.SUBMIT_ANSWER_TOOL]
+    model = _RecordingModel([_submit("7", confidence=0.9)])
+    res = investigate(model, "…", tools, max_turns=5, contract="numeric")  # no first_move
+    assert model.seen[0] is None
+    assert "canonical_route" not in res.tool_calls
+    assert res.answer.answer == "7"
+
+
+def test_answer_question_passes_deterministic_first_move_to_loop(monkeypatch):
+    # end-to-end (offline): with the SOT-2521 flag ON, routing for a numeric data-asset question seeds
+    # canonical_route as the deterministic first move before the model's first turn.
+    captured = {}
+
+    def fake_canonical_route(question=None, **kw):
+        captured["fm_question"] = question
+        return _contract_result([{"rel": "03.データ/train.xlsx", "project": "P"}])
+
+    def fake_factory(question, tools, *, model=None, system=None):
+        return _RecordingModel([_submit("直行で得た値", confidence=0.9)])
+
+    # patch the tool the investigator tool set actually dispatches (module-level import), and the factory
+    monkeypatch.setattr(inv, "FIRST_MOVE_ROUTING", True)  # opt in to the gated mechanism (default OFF)
+    monkeypatch.setattr(inv, "canonical_route", fake_canonical_route)
+    monkeypatch.setattr(inv, "gemini_model_factory", fake_factory)
+    res = inv.answer_question(
+        "京橋信用ソリューションズの train.xlsx の loan_amnt の平均は。",
+        ledger=False, calc_ledger=False, research=False, enumeration=False)
+
+    assert res.contract == qc.NUMERIC
+    assert res.tool_calls and res.tool_calls[0] == "canonical_route"
+    assert captured["fm_question"] == "京橋信用ソリューションズの train.xlsx の loan_amnt の平均は。"
+    assert res.answer.answer == "直行で得た値"
+
+
+def test_answer_question_first_move_default_off_is_byte_identical(monkeypatch):
+    # SOT-2521 — the mechanism is gated OFF by default: the production answer path must NOT run the
+    # deterministic first move (byte-identical to before the feature). The always-on variant regressed
+    # gold-100, so enablement is deferred to SOT-2527; the default here forces no forced first move.
+    assert inv.FIRST_MOVE_ROUTING is False  # ships OFF
+    called = {"canonical_route": False}
+
+    def fake_canonical_route(question=None, **kw):
+        called["canonical_route"] = True
+        return _contract_result([{"rel": "03.データ/train.xlsx", "project": "P"}])
+
+    def fake_factory(question, tools, *, model=None, system=None):
+        return _RecordingModel([_submit("モデル主導の値", confidence=0.9)])
+
+    monkeypatch.setattr(inv, "canonical_route", fake_canonical_route)
+    monkeypatch.setattr(inv, "gemini_model_factory", fake_factory)
+    res = inv.answer_question(
+        "京橋信用ソリューションズの train.xlsx の loan_amnt の平均は。",
+        ledger=False, calc_ledger=False, research=False, enumeration=False)
+
+    # routing still classifies the contract (hint path unchanged), but no deterministic first move ran
+    assert res.contract == qc.NUMERIC
+    assert called["canonical_route"] is False
+    assert "canonical_route" not in res.tool_calls
+    assert res.answer.answer == "モデル主導の値"
+
+
 # --------------------------------------------------------------------------- investigate records contract
 def test_investigate_records_contract_label_on_investigation():
     model = _ScriptedModel([_submit("42", confidence=0.8)])
