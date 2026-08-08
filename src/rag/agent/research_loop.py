@@ -166,6 +166,7 @@ class ResearchRound:
     kind: str
     obligations: tuple[str, ...]
     tactics: tuple[str, ...]
+    boundary: bool = False  # SOT-2524: this round was triggered at the max_turns/timeout boundary hook
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -173,6 +174,7 @@ class ResearchRound:
             "kind": self.kind,
             "obligations": list(self.obligations),
             "tactics": list(self.tactics),
+            "boundary": self.boundary,
         }
 
 
@@ -236,12 +238,18 @@ class ResearchDirector:
         return self.obligations().unmet(items)
 
     # -- decision -------------------------------------------------------------------------------------
-    def review(self, evidence_text: str = "", tool_call_count: int = 0) -> str | None:
+    def review(self, evidence_text: str = "", tool_call_count: int = 0, *,
+               at_boundary: bool = False) -> str | None:
         """Decide whether to keep re-searching before accepting an abstain.
 
         Returns a targeted re-search directive (continue) or ``None`` (finalize). On ``None`` it sets
         :attr:`terminal` to :data:`BUDGET` (budget exhausted) or :data:`UNANSWERABLE` (every unmet
         obligation's tactic already tried — thorough non-existence).
+
+        ``at_boundary`` (SOT-2524) only tags the emitted :class:`ResearchRound` so the abstain ledger can
+        attribute the round to the max_turns/timeout boundary hook rather than a deliberate abstain; the
+        budget/unmet decision itself is identical either way (the director is agnostic to *why* it is
+        asked to keep searching — the commit threshold is never touched).
         """
         if len(self.rounds) >= self.budget.max_rounds or tool_call_count >= self.budget.max_tool_calls:
             self.terminal = BUDGET
@@ -258,7 +266,8 @@ class ResearchDirector:
         self._targeted.add(kind)
         self.rounds.append(ResearchRound(
             round=len(self.rounds) + 1, kind=kind,
-            obligations=tuple(o.obligation for o in target), tactics=tactics))
+            obligations=tuple(o.obligation for o in target), tactics=tactics,
+            boundary=at_boundary))
         return _directive(kind, target, tactics)
 
     def note_answered(self) -> None:
