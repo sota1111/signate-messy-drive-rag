@@ -266,6 +266,8 @@ def test_abstain_codes_latest_ledger_record_wins(tmp_path):
 
 
 def test_abstain_codes_missing_ledger_is_all_uncoded(tmp_path):
+    from src.rag.agent.abstain_ledger import STATE_CODES
+
     gold = {0: "a"}
     preds = _preds({"index": 0, "question": "q", "answer": settings.ABSTAIN})
     rep = GO.evaluate(preds, gold, judge=_stub_judge({}))
@@ -274,4 +276,5 @@ def test_abstain_codes_missing_ledger_is_all_uncoded(tmp_path):
     assert block["n_abstain"] == 1 and block["coded"] == 0 and block["uncoded"] == 1
     assert rep.abstain_codes == {}
     # every state code is present as a zero so history diffs stay stable
-    assert set(block["by_code"].values()) == {0} and len(block["by_code"]) == 7
+    assert set(block["by_code"].values()) == {0}
+    assert set(block["by_code"]) == set(STATE_CODES)
