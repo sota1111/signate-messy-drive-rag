@@ -125,6 +125,24 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  evidence index skipped: {type(e).__name__}: {e}")
 
+    # Deterministic structure pre-store (SOT-2533 / #4b sibling): precompute the runtime-expensive
+    # structure extractions (highlights / chart numCache / pivot conditions / seating directory /
+    # version diffs) once, so the runtime tools read a persisted answer instead of re-parsing per
+    # question. Additive and fully guarded — a failure here can never corrupt the retrieval index,
+    # and runtime consultation is opt-in (RAG_STRUCTURE_STORE) so the champion serve path is
+    # byte-identical by default.
+    try:
+        from src.rag.index import structure_store
+        st_counts = structure_store.build(refs)
+        if verbose:
+            print(f"  structure store: {st_counts['files']} files "
+                  f"(highlights={st_counts['highlights']}, charts={st_counts['charts']}, "
+                  f"pivots={st_counts['pivots']}, seating={st_counts['seating']}, "
+                  f"version_pairs={st_counts['version_pairs']}) -> {structure_store.default_out_path()}")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  structure store skipped: {type(e).__name__}: {e}")
+
     if verbose:
         print(f"embedding {len(chunks)} chunks...")
     texts = [c.text for c in chunks]

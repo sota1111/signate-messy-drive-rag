@@ -464,14 +464,20 @@ def highlight_extract(file: str | Path | FileRef, *, color: str | None = None,
     ref = resolve_ref(file)
     target = _norm_color_query(color)
 
-    if ref.ext in _OFFICE_EXTS:
-        items = _office_items(ref, profile)
-    elif ref.ext == "pdf":
-        items = _pdf_items(ref)
-    else:
-        raise ContractError(
-            f"unsupported file for highlight extraction: .{ref.ext} "
-            "(expected xlsx/xlsm/pptx/docx/pdf)")
+    # Deterministic structure pre-store (SOT-2533): a fresh cached (unfiltered) item list is used
+    # verbatim, so the colour filter/contract below yield a byte-identical result to a live read.
+    # A miss / stale entry / disabled flag returns None and we extract live (zero regression).
+    from src.rag.index import structure_store
+    items = structure_store.lookup_highlight_items(ref)
+    if items is None:
+        if ref.ext in _OFFICE_EXTS:
+            items = _office_items(ref, profile)
+        elif ref.ext == "pdf":
+            items = _pdf_items(ref)
+        else:
+            raise ContractError(
+                f"unsupported file for highlight extraction: .{ref.ext} "
+                "(expected xlsx/xlsm/pptx/docx/pdf)")
 
     items = [it for it in items if _color_matches(it["method"].get("color"), target)]
     colors = sorted({it["method"]["color"] for it in items if it["method"].get("color")})

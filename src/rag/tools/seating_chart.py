@@ -233,6 +233,9 @@ def build_directory(file: str | Path = "座席表.pptx", *,
     """Build the seating :class:`Directory` for ``file`` (default: the corpus 座席表).
 
     Resolution order (precision-first):
+    0. **structure pre-store** (SOT-2533) — when enabled and the default (no injected ``vision_fn``)
+       path is taken, a fresh cached *reviewed* directory is reconstructed verbatim, skipping the
+       pptx open / image decode / hashing. A miss/stale entry falls through to the live path below.
     1. **reviewed anchor** — if the image's decoded-pixel sha256 is pinned in
        :data:`_REVIEWED_DIRECTORIES`, use that human-verified directory (deterministic, correct,
        carries seat coordinates for spatial queries);
@@ -242,6 +245,25 @@ def build_directory(file: str | Path = "座席表.pptx", *,
 
     Results memoise on the pixel hash so repeated questions don't re-extract/re-call vision.
     """
+    ref = resolve_ref(file)
+    if vision_fn is None:  # only the deterministic/reviewed path is ever persisted
+        from src.rag.index import structure_store
+
+        cached = structure_store.lookup_seating(ref)
+        if cached is not None:
+            seats = tuple(Seat(name=s["name"], ext=s["ext"], role=s["role"], pod=s["pod"],
+                               row=s.get("row"), col=s.get("col")) for s in cached["seats"])
+            directory = Directory(seats, cached["file"], cached["pixel_sha"], cached["origin"])
+            if use_cache:
+                _DIRECTORY_MEMO[cached["pixel_sha"]] = directory
+            return directory
+    return _build_directory_live(ref, vision_fn=vision_fn, use_cache=use_cache)
+
+
+def _build_directory_live(file: str | Path = "座席表.pptx", *,
+                          vision_fn: Callable[[bytes], list[dict[str, Any]]] | None = None,
+                          use_cache: bool = True) -> Directory:
+    """Live (store-bypassing) directory build — the deterministic reviewed / generic-vision core."""
     ref = resolve_ref(file)
     png, pixel_sha = extract_seating_image(ref)
     if use_cache and pixel_sha in _DIRECTORY_MEMO:
