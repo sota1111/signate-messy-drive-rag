@@ -121,9 +121,52 @@ def test_idx30_quantity_contract_pins_denominator_unit_and_rounding() -> None:
     assert validate_numeric_answer(q, "1.18%", correct).passed
 
 
+def test_numeric_contract_rejects_uncomputed_notebook_claim() -> None:
+    result = validate_numeric_answer(
+        "notebookを確認して目的変数と相関が最も高い数値特徴量を教えてください。",
+        "age",
+        [],
+    )
+    assert not result.passed
+    assert any("決定論的計算証跡" in issue for issue in result.issues)
+
+
 def test_pivot_highlight_question_is_format_contract() -> None:
     q = "基礎分析.pptxで黄色ハイライトされている数値の抽出条件と集計内容を答えてください。"
     assert classify(q).contract == FORMAT_CHECK
+
+
+def test_regulation_content_contract_requires_fallback_general_rule() -> None:
+    q = "契約条件において、稼働が上限を超えた場合の精算方法に関する規定内容を答えてください。"
+    result = classify(q)
+    assert result.contract == SIMPLE_LOOKUP
+    assert any("一般規定" in condition and "単価" in condition and "上限" in condition
+               for condition in result.completion_conditions)
+
+    incomplete = qc.validate_regulation_answer(q, "超過時の特別な精算規定は存在しません。")
+    assert not incomplete.passed and incomplete.applicable
+    assert set(incomplete.missing) == {"単価", "税処理", "課金単位", "丸め", "精算周期", "上限"}
+
+    cycle3_wording = qc.validate_regulation_answer(
+        q, "200時間を超えた場合でも特別な精算方法は規定されていません。時間単価は30,000円です。")
+    assert not cycle3_wording.passed and cycle3_wording.applicable
+    assert "税処理" in cycle3_wording.missing and "上限" in cycle3_wording.missing
+
+    complete = qc.validate_regulation_answer(
+        q,
+        "特別な精算規定は存在しません。一般規定として時間単価30,000円に消費税を加算し、15分単位で切上げ、"
+        "月次精算し、上限はありません。",
+    )
+    assert complete.passed and complete.applicable and not complete.missing
+
+
+def test_gantt_week_question_is_chart_read_with_geometry_completion() -> None:
+    q = "提案書.pptxでモデル改善の実行予定スケジュールは案件開始から第何週目ですか。"
+    result = classify(q)
+    assert result.contract == CHART_READ
+    assert any("left/width" in condition for condition in result.completion_conditions)
+    assert qc.is_gantt_week_question(q)
+    assert all("numCache" not in condition for condition in result.completion_conditions)
 
 
 # --------------------------------------------------------------------------- hybrid flash arbitration

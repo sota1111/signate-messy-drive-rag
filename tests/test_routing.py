@@ -98,6 +98,28 @@ def test_chart_route_forbids_vision_numeric_evidence():
     assert "画像から読んだ数値では回答を確定しない" in hint
 
 
+def test_gantt_week_route_uses_native_geometry_before_vision():
+    q = "提案書.pptxのモデル改善は実行予定スケジュール上、第何週目ですか。"
+    contract = qc.classify(q)
+    assert contract.contract == qc.CHART_READ
+    tools = routing.first_tools_for(contract, q)
+    assert tools == ("read_office",)
+    assert "caption_image" not in tools
+    hint = routing.route_hint(contract, q)
+    assert "【ガント週グリッド】" in hint and "半開区間" in hint and "裏取り" in hint
+
+
+def test_regulation_route_hint_forbids_no_rule_only_answer():
+    q = "契約条件で上限超過時の精算方法に関する規定内容を答えてください。"
+    contract = qc.classify(q)
+    assert routing.first_tools_for(contract, q) == ("find_files", "read_office", "file_grep")
+    hint = routing.route_hint(contract, q)
+    assert "『特別規定なし』は規定内容回答の完了ではない" in hint
+    for field in ("単価", "課金単位", "精算周期", "上限"):
+        assert field in hint
+    assert "字面grepの空振りだけで棄権しない" in hint
+
+
 def test_negative_correlation_hint_excludes_target_by_name_before_argmin():
     q = "顧客データにおいて、目的変数と最も強い負の相関を持つカラムは何ですか。"
     contract = qc.classify(q)

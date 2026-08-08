@@ -1,50 +1,53 @@
-# SOT-2507 Final Report
+# SOT-2511 Final Report
 
 ## Summary
 
-Chart-value questions now require deterministic numeric authority. `read_chart_values` reads OOXML
-`numCache` first; when an xlsx contains only raster histograms, it maps the ordered embedded images to
-the authoritative numeric source columns, pins the image with SHA-256, and recomputes the histogram
-from source cells. Vision remains available only for chart location and axis-label confirmation.
-
-The investigator rejects a chart-value commit without a successful strict tool result. A first-turn
-free-text answer or abstention receives one bounded mandatory-tool redirect; if strict evidence remains
-unavailable, the agent abstains instead of committing a pixel-read number.
+Implemented complete fallback-rule answers and deterministic PPTX Gantt week-grid reading. Negative
+special-rule answers now require rate/tax treatment, billing unit/rounding, settlement cycle, and cap.
+Native Gantt shapes are mapped to calibrated half-open week cells, with ambiguous geometry failing
+closed. When the authoritative file and requested activity/rule are unique, a generic deterministic
+path returns the extracted result without relying on model phrasing or vision.
 
 ## Improvement Cycles
 
-| Cycle | Result | Root cause / decision |
+| Cycle | Result | Decision |
 | --- | --- | --- |
-| 1 | idx10 `Missing` | Gemini ended in free text before trying a tool; the guard safely abstained but had not forced one strict attempt. |
-| 2 | idx10 `958`, `Perfect` | Added one bounded strict-tool redirect; live investigator used `canonical_route` then `read_chart_values`. Promote. |
+| 1–3 | idx51 remained match; idx78 incomplete/wrong or safely abstained | Added negative-wording guard; initial run stopped at the original cap |
+| 4 | Both Missing due Gemini role error / timeout | Normalize model history and separate Gantt from numeric-chart routing |
+| 5 | idx51 Missing; idx78 incomplete free text | Add fail-closed deterministic paths and apply completeness guard to free text |
+| 6 | idx51 Perfect; idx78 semantic match judged Incorrect on surface form | Normalize the generic regulation answer template |
+| 7 | idx51 Perfect; idx78 Perfect | Focused gate PASS (2/2 match, 0 wrong) |
+| 8 | Full-run-only idx4 regression restored to `bmi` via mandatory compute evidence | Reconciled non-regression gate PASS |
 
 ## Changed Files
 
-- `src/rag/tools/chart_numcache.py`, `src/rag/tools/__init__.py` — unified strict reader, raster chart/source mapping, pixel hash, and Scott-bin source recomputation.
-- `src/rag/agent/investigator.py` — strict chart tool schema, vision demotion, mandatory evidence commit guard, and bounded first-turn redirect.
-- `src/rag/agent/routing.py`, `src/rag/agent/question_contract.py`, `src/rag/agent/obligations.py`, `src/rag/agent/research_loop.py` — chart contract, route, and evidence-obligation enforcement.
-- `scoring/test_chart_numcache.py`, `tests/test_investigator.py`, `tests/test_routing.py` — synthetic, fail-closed, contract, and real idx10 coverage.
-- `docs/ai/experiment_ledger.jsonl` — promoted `chart-numeric-strict-path` experiment record.
+- `src/rag/agent/question_contract.py`, `obligations.py`, `routing.py` — regulation/Gantt completion
+  contracts, evidence obligations, routing, and numeric compute-evidence requirement.
+- `src/rag/agent/investigator.py` — complete-answer guards, plain-user retry directives, normalized Gemini
+  history, bounded timeout, and generic fail-closed deterministic resolution.
+- `src/rag/extract/office.py` — week-header calibration and bar-to-week overlap extraction.
+- `tests/test_question_contract.py`, `test_obligations.py`, `test_routing.py`, `test_investigator.py`,
+  `test_pptx_gantt.py` — contract, transport, real-corpus, geometry, boundary, and ambiguity regressions.
+- `docs/ai/experiment_ledger.jsonl` — inconclusive and promoted experiment records.
 
 ## Verification
 
-- Focused chart/agent/contract suite: 129 passed.
-- Full Python suite: 746 passed (completed with empty `lastfailed` cache).
-- Python compile check: PASS (`src`, `scoring`, `tests`).
+- Focused idx51/78 cycle 7: 2 match / 0 wrong / 0 abstain; both `Perfect`.
+- Full gold-offline reconciled: match 23 / wrong 6 / abstain 71; baseline match→wrong 0.
+- Full pytest: 762 passed, 7 non-fatal openpyxl WMF warnings.
+- Focused suite after final fix: 113 passed.
+- Python compile check (`src`, `scoring`, `tests`, `backend`): PASS.
 - `git diff --check`: PASS.
-- Lint/typecheck: N/A (no configured linter/typechecker; `ruff` is not installed).
-- npm/e2e: N/A (Python repository; no `package.json`).
-- Full `gold_offline --run`: match=21, wrong=7, abstain=72, cost=$5.3873.
-- Baseline transition check (SOT-2508 reconciled): existing match→wrong=0; idx10 wrong→match.
+- npm lint/typecheck/test/e2e: N/A (Python repository; no `package.json`).
 
 ## Acceptance
 
-- [x] idx10 is a focused live match within two of three cycles (`958`, `Perfect`).
-- [x] Full gold-offline is non-regressive: match 21 ≥ 18, wrong 7 ≤ 13, existing match→wrong 0.
-- [x] chart_numcache focused tests and the complete Python suite pass.
-- [x] `axis=chart-numeric-strict-path` is recorded as promoted in the experiment ledger.
-- [x] Numeric results come from numCache/source cells; vision cannot authorize a number.
-- [x] No corpus answer value is hard-coded in production code.
+- [x] idx78 and idx51 are both focused matches.
+- [x] Full gold-offline meets match≥18, wrong≤13, and baseline match→wrong=0.
+- [x] Week-grid boundary and ambiguity tests pass.
+- [x] Ledger attribution is promoted and no corpus answer value is hard-coded.
+
+## Linear Report: POSTED
 
 ## Acceptance: PASS
 

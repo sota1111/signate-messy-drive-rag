@@ -345,11 +345,28 @@ def flash_decompose(question: str, contract: str, *, model: str | None = None,
 
 
 # --------------------------------------------------------------------------- decomposition entry point
-def _template_obligations(contract: str) -> tuple[Obligation, ...]:
-    return tuple(
+def _template_obligations(contract: str, question: str = "") -> tuple[Obligation, ...]:
+    obligations = tuple(
         Obligation(obligation=text, kind=kind)
         for kind, text in CONTRACT_OBLIGATIONS.get(contract, CONTRACT_OBLIGATIONS[qc.SIMPLE_LOOKUP])
     )
+    if contract == qc.SIMPLE_LOOKUP and qc.is_regulation_content_question(question):
+        # A no-special-rule finding still leaves the governing fallback rule to establish.  Split its
+        # semantic fields across distinct kinds so one generic lookup hit cannot make the whole answer
+        # appear complete; the submit guard independently validates the final answer surface.
+        obligations += (
+            Obligation("特別規定の不存在時に適用される一般規定の単価と税処理を確定する", VALUE_MAPPING),
+            Obligation("一般規定の課金単位と切上げ/切捨て等の丸め規則を確定する", ROUNDING),
+            Obligation("一般規定の精算周期を確定する", JUDGMENT_RULE),
+            Obligation("一般規定に上限/限度があるかを確定する", CONSISTENCY),
+        )
+    if contract == qc.CHART_READ and qc.is_gantt_week_question(question):
+        obligations += (
+            Obligation("週ヘッダ列のx座標系を較正する", JUDGMENT_RULE),
+            Obligation("バーleft/widthと週セルの重なりから開始週・終了週を決定論的に対応づける", VALUE_MAPPING),
+            Obligation("開始週候補が競合しないことを確認し、競合時は回答を確定しない", CONSISTENCY),
+        )
+    return obligations
 
 
 def decompose(
@@ -374,7 +391,7 @@ def decompose(
         contract = qc.SIMPLE_LOOKUP
 
     method = "template"
-    obligations = _template_obligations(contract)
+    obligations = _template_obligations(contract, q)
     if flash is not None:
         produced = flash(q, contract)
         parsed = _obligations_from_items(produced)

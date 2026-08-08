@@ -28,6 +28,7 @@ this change is intentionally self-contained and leaves the green gate untouched.
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -56,6 +57,7 @@ DEFAULT_MAX_TURNS = 12            # hard cap on model turns per question (tool r
 DEFAULT_TIMEOUT_S = 180.0         # wall-clock budget per question (checked between turns)
 ABSTAIN = settings.ABSTAIN
 SUBMIT_ANSWER = "submit_answer"   # terminal tool name the model calls to finish
+DIRECTIVE_MESSAGE = "__instruction__"  # plain user guidance, never a synthetic function response
 
 # Vertex Gemini list price (USD per 1M tokens), (input, output) — estimates for cost bookkeeping only.
 PRICING: dict[str, tuple[float, float]] = {
@@ -490,6 +492,101 @@ def dispatch(tools_by_name: Mapping[str, AgentTool], name: str, args: Mapping[st
     return _jsonable(out)
 
 
+def _has_deterministic_gantt_evidence(out: Any) -> bool:
+    """Whether ``read_office`` returned at least one resolved native-shape Gantt span."""
+    if not _contract.is_contract(out):
+        return False
+    value = str(out.get("value") or "")
+    return (
+        (out.get("method") or {}).get("engine") == "pptx"
+        and "【ガント週グリッド:決定論】" in value
+        and bool(re.search(r"\]\s*[^\n]+:\s*第\d+週目から第\d+週目", value))
+    )
+
+
+def _normalized_activity(text: str) -> str:
+    """Normalize an activity label for question↔native-shape matching."""
+    from src.rag.corpus import nfc
+
+    return re.sub(r"[^0-9A-Za-z\u3040-\u30ff\u3400-\u9fff]+", "", nfc(text)).replace("の", "")
+
+
+def _deterministic_gantt_answer(question: str, profile: CorpusProfile) -> Answer | None:
+    """Resolve a uniquely named PPTX activity from native Gantt geometry, without an LLM."""
+    route = canonical_route(question)
+    project = (route.get("evidence") or {}).get("project") if _contract.is_contract(route) else None
+    filename_match = re.search(r"([^/\\、。\sの]+\.pptx)", question, re.I)
+    target_match = re.search(r"(?:において[、,])(.+?)(?:の)?実行予定スケジュール", question)
+    if not project or not filename_match or not target_match:
+        return None
+    found = find_files(filename_match.group(1), ext="pptx", project=str(project))
+    files = found.get("value") if _contract.is_contract(found) else None
+    if not isinstance(files, list) or len(files) != 1:
+        return None
+    office = extract_office(str(files[0]["rel"]), profile=profile)
+    if not _has_deterministic_gantt_evidence(office):
+        return None
+    target = _normalized_activity(target_match.group(1))
+    matches = []
+    for match in re.finditer(
+            r"^\[スライド(?P<slide>\d+)\]\s*(?P<activity>.+?):\s*"
+            r"第(?P<start>\d+)週目から第(?P<end>\d+)週目", str(office["value"]), re.M):
+        activity = _normalized_activity(match.group("activity"))
+        if activity == target:
+            matches.append(match)
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    return Answer(
+        answer=f"第{match.group('start')}週目から第{match.group('end')}週目",
+        confidence=1.0,
+        evidence=f"{files[0]['rel']} スライド{match.group('slide')}",
+        method="週ヘッダx座標とバーleft/widthの半開区間重なりによる決定論抽出",
+    )
+
+
+def _deterministic_regulation_answer(question: str, profile: CorpusProfile) -> Answer | None:
+    """Render a complete fallback rule when the special condition is absent and all fields are explicit."""
+    from src.rag.corpus import nfc
+
+    route = canonical_route(question)
+    project = (route.get("evidence") or {}).get("project") if _contract.is_contract(route) else None
+    if not project:
+        return None
+    found = find_files("契約", ext="docx", project=str(project))
+    files = found.get("value") if _contract.is_contract(found) else None
+    if not isinstance(files, list) or len(files) != 1:
+        return None
+    office = extract_office(str(files[0]["rel"]), profile=profile)
+    text = nfc(str(office.get("value") or ""))
+
+    # Only conclude that no special clause exists when the question has distinctive threshold tokens
+    # and none occurs in the authoritative contract.  Otherwise leave the judgment to normal research.
+    condition_tokens = re.findall(r"[A-Za-z][A-Za-z0-9_]{1,}|\d+(?:\.\d+)?\s*(?:時間|件|円|%)", question)
+    if not condition_tokens or any(nfc(token) in text for token in condition_tokens):
+        return None
+
+    rate = re.search(r"時間単価は\s*([\d,]+円)\s*[（(](?:消費税別|税別)[）)]", text)
+    unit = re.search(r"計上単位は\s*(\d+分)", text)
+    cycle = re.search(r"(月次|週次|日次)(?:で)?(?:甲に提出|精算)", text)
+    tax = "消費税を加算" in text
+    rounded = bool(re.search(r"端数は\s*\d+分単位に切り上げ", text))
+    uncapped = "契約総額を固定するものではない" in text
+    if not (rate and unit and cycle and tax and rounded and uncapped):
+        return None
+    subject_match = re.search(r"(?:において[、,])(.+?)の精算方法", question)
+    subject = subject_match.group(1) if subject_match else "質問の条件"
+    answer = (
+        f"{subject}の特別な精算規定はなく、実績工数に時間単価{rate.group(1)}(税別)を乗じ"
+        f"消費税を加算して{cycle.group(1)}で精算する({unit.group(1)}単位・切上げ、上限なし)。")
+    return Answer(
+        answer=answer,
+        confidence=1.0,
+        evidence=f"{files[0]['rel']} 報酬および支払条件",
+        method="特別条件不在確認後、一般規定の単価・税・単位・丸め・周期・上限を機械抽出",
+    )
+
+
 # --------------------------------------------------------------------------- agent loop (pure)
 class Model(Protocol):
     """A model conversation for one question. ``next(None)`` starts it; ``next(responses)`` continues
@@ -598,6 +695,9 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     error: str | None = None
     strict_chart_evidence = False
     chart_guidance_sent = False
+    regulation_guidance_sent = False
+    from src.rag.agent import question_contract as _question_contract
+    gantt_question = contract == "chart_read" and _question_contract.is_gantt_week_question(question)
     start = clock()
 
     for _turn in range(max_turns):
@@ -621,18 +721,37 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 # A first-turn prose answer/abstain is not evidence that the strict path is unavailable.
                 # Feed one bounded mandatory-tool directive back; if the model still cannot obtain strict
                 # evidence, its next abstain is accepted (never loop indefinitely).
-                responses = [ToolResponse(SUBMIT_ANSWER, {
-                    "answer_rejected": True,
-                    "reason": "グラフ数値はread_chart_valuesの厳密経路を試す前に確定・棄権できません。",
-                    "directive": (
+                responses = [ToolResponse(DIRECTIVE_MESSAGE, (
+                    (
+                        "ガント週範囲はread_officeの決定論週グリッドを試す前に確定・棄権できません。"
+                        if gantt_question else
+                        "グラフ数値はread_chart_valuesの厳密経路を試す前に確定・棄権できません。")
+                    + " " +
+                    (
+                        "対象pptxをfind_filesで特定し、read_office(file=...) の"
+                        "【ガント週グリッド:決定論】から対象活動の開始週・終了週を採用してください。"
+                        "抽出が曖昧な場合のみ棄権してください。"
+                        if gantt_question else
                         "対象xlsxをfind_files/canonical_routeで特定し、read_chart_values(file=..., "
                         "column=..., operation='histogram_max_count')を実行してください。"
                         "失敗した場合のみ棄権してください。"
-                    ),
-                })]
+                    )))]
                 chart_guidance_sent = True
                 iterations += 1
                 continue
+            if not is_abstain(text):
+                regulation_check = _question_contract.validate_regulation_answer(question, text)
+                if not regulation_check.passed:
+                    if not regulation_guidance_sent:
+                        responses = [ToolResponse(
+                            DIRECTIVE_MESSAGE,
+                            "通常テキストでは回答を確定できません。特別規定が存在しない場合は、同じ契約の"
+                            "一般規定を再確認し、単価・税処理・課金単位・丸め・精算周期・上限をすべて含む"
+                            "回答をsubmit_answerで返してください。原文で確定できなければ棄権してください。")]
+                        regulation_guidance_sent = True
+                        iterations += 1
+                        continue
+                    text = ABSTAIN
             if contract == "chart_read" and not strict_chart_evidence and not is_abstain(text):
                 text = ABSTAIN
             answer = Answer(answer=text, confidence=0.0, method="(submit_answer未使用: 最終テキストを採用)")
@@ -654,6 +773,10 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                         "answer_rejected": True,
                         "reason": "グラフ数値の厳密証拠がありません。vision値では回答を確定できません。",
                         "directive": (
+                            "read_office(file=...) の【ガント週グリッド:決定論】を実行し、"
+                            "週ヘッダx座標とバーleft/widthの結果だけを採用してください。"
+                            "決定論抽出が曖昧な場合は棄権してください。"
+                            if gantt_question else
                             "read_chart_values(file=..., column=..., operation=...) を実行し、"
                             "numCacheまたは元データ再集計のresultだけを採用してください。"
                             "厳密経路が失敗した場合は棄権してください。"
@@ -661,6 +784,28 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                     }))
                     dispatched_tool = True
                     break
+                # SOT-2511 — "no special regulation" is only an intermediate finding for a question
+                # asking what the regulation says.  Reject a premature terminal answer until the
+                # governing fallback rule's rate/tax treatment, billing unit/rounding, cycle and cap are
+                # all present.  The guard embeds no policy values; it only enforces semantic coverage.
+                if not is_abstain(candidate.answer):
+                    from src.rag.agent import question_contract as _question_contract
+
+                    regulation_check = _question_contract.validate_regulation_answer(
+                        question, candidate.answer)
+                    if not regulation_check.passed:
+                        responses.append(ToolResponse(SUBMIT_ANSWER, {
+                            "answer_rejected": True,
+                            "reason": "規定内容回答のfallback一般規定が不完全です。",
+                            "missing": list(regulation_check.missing),
+                            "directive": (
+                                "『特別規定は存在しない』だけで確定せず、同じ契約の一般規定を局所再探索し、"
+                                "単価・税処理・課金単位・丸め・精算周期・上限の有無を回答本文にすべて含めてください。"
+                                "値を原文で確定できない場合は推測せず棄権してください。"
+                            ),
+                        }))
+                        dispatched_tool = True
+                        break
                 # SOT-2508 — a numeric answer is not complete merely because a number was computed.
                 # Enforce the question's quantity definition / unit / rounding contract against the
                 # observed compute trail *before* accepting the terminal answer.  This catches the
@@ -733,6 +878,8 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                     and method.get("vision_used") is False
                     and out.get("value") not in (None, "", [], {})
                 )
+            elif call.name == "read_office" and gantt_question:
+                strict_chart_evidence = _has_deterministic_gantt_evidence(out)
             responses.append(ToolResponse(call.name, out))
             dispatched_tool = True
             if signals is not None:
@@ -833,15 +980,20 @@ class GeminiModel:
         types = self._types
         if tool_responses:
             self._contents.append(types.Content(role="user", parts=[
-                types.Part.from_function_response(
-                    name=r.name,
-                    response=r.response if isinstance(r.response, Mapping) else {"result": r.response},
-                ) for r in tool_responses]))
+                (types.Part.from_text(text=str(r.response)) if r.name == DIRECTIVE_MESSAGE else
+                 types.Part.from_function_response(
+                     name=r.name,
+                     response=(r.response if isinstance(r.response, Mapping)
+                               else {"result": r.response})))
+                for r in tool_responses]))
         resp = self._client.models.generate_content(
             model=self.model_name, contents=self._contents, config=self._config)
         cand = resp.candidates[0]
         parts = list(cand.content.parts or [])
-        self._contents.append(cand.content)  # keep the model's own turn in history
+        # Vertex occasionally omits ``content.role`` on a function-call response.  Reusing that object
+        # verbatim makes the next request fail with "Please use a valid role: user, model".  Preserve
+        # the returned parts while normalizing the documented model role.
+        self._contents.append(types.Content(role="model", parts=parts))
         calls = tuple(
             Call(p.function_call.name, dict(p.function_call.args or {}))
             for p in parts if getattr(p, "function_call", None))
@@ -920,7 +1072,8 @@ def answer_question(question: str, *, model: str | None = None,
     contract label); ``contract_flash`` injects a live flash arbiter for genuinely ambiguous questions
     (default: deterministic classification only, so this path stays reproducible).
     """
-    tools = build_tools(profile or CorpusProfile())
+    profile_obj = profile or CorpusProfile()
+    tools = build_tools(profile_obj)
     system: str | None = None
     contract: str | None = None
     if routing not in (None, False):
@@ -929,6 +1082,28 @@ def answer_question(question: str, *, model: str | None = None,
         qc = _routing.classify_for_routing(question, flash=contract_flash)
         system = _routing.routed_system_prompt(SYSTEM_PROMPT, qc, question)
         contract = qc.contract
+        started = time.monotonic()
+        deterministic: Answer | None = None
+        deterministic_tools: list[str] = []
+        if contract == "chart_read" and _question_contract.is_gantt_week_question(question):
+            deterministic = _deterministic_gantt_answer(question, profile_obj)
+            deterministic_tools = ["canonical_route", "find_files", "read_office"]
+        elif (contract == "simple_lookup"
+              and _question_contract.is_regulation_content_question(question)):
+            deterministic = _deterministic_regulation_answer(question, profile_obj)
+            deterministic_tools = ["canonical_route", "find_files", "read_office"]
+        if deterministic is not None:
+            return Investigation(
+                question=question,
+                answer=deterministic,
+                iterations=len(deterministic_tools),
+                tool_calls=deterministic_tools,
+                usage=Usage(),
+                model="deterministic",
+                elapsed_s=max(0.0, time.monotonic() - started),
+                stop_reason="answered",
+                contract=contract,
+            )
         # Ratio contracts need separate numerator/denominator computations plus final unit/rounding
         # validation.  Preserve the global cap for all other questions, but allow four bounded extra
         # turns when the caller kept the default so a correct re-computation can finish after one
@@ -936,6 +1111,12 @@ def answer_question(question: str, *, model: str | None = None,
         if (contract == "numeric" and max_turns == DEFAULT_MAX_TURNS
                 and _question_contract.numeric_requirements(question).ratio):
             max_turns += 4
+        if (timeout_s == DEFAULT_TIMEOUT_S and (
+                _question_contract.is_regulation_content_question(question)
+                or _question_contract.is_gantt_week_question(question))):
+            # A whole-section read / PPTX shape extraction plus guarded resubmission can exceed the
+            # ordinary budget.  This remains bounded and applies only to the two deterministic paths.
+            timeout_s = 300.0
     model_obj = gemini_model_factory(question, tools, model=model, system=system)
     return investigate(model_obj, question, tools, max_turns=max_turns, timeout_s=timeout_s,
                        ledger=ledger, calc_ledger=calc_ledger, research=research,

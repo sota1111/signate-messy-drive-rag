@@ -101,6 +101,24 @@ def test_decompose_is_deterministic_and_serialisable() -> None:
     assert all(set(o) == {"obligation", "kind", "status", "evidence_ref"} for o in d["obligations"])
 
 
+def test_regulation_content_adds_fallback_general_rule_obligations() -> None:
+    q = "契約条件で上限超過時の精算方法に関する規定内容を答えてください。"
+    oset = decompose(q)
+    assert oset.contract == qc.SIMPLE_LOOKUP
+    fallback = [o for o in oset.obligations if "一般規定" in o.obligation]
+    assert len(fallback) == 4
+    assert {o.kind for o in fallback} == {VALUE_MAPPING, ROUNDING, JUDGMENT_RULE, CONSISTENCY}
+
+
+def test_gantt_question_adds_grid_mapping_and_conflict_obligations() -> None:
+    q = "提案書.pptxの工程表でモデル改善は第何週目に実施予定ですか。"
+    oset = decompose(q)
+    assert oset.contract == qc.CHART_READ
+    assert any("x座標系" in o.obligation for o in oset.obligations)
+    assert any("left/width" in o.obligation for o in oset.obligations)
+    assert any("競合" in o.obligation for o in oset.obligations)
+
+
 def test_explicit_contract_override_and_bad_contract_falls_back() -> None:
     forced = decompose("任意の質問", contract=qc.NUMERIC)
     assert forced.contract == qc.NUMERIC
