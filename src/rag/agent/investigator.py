@@ -80,6 +80,15 @@ def _bool_env(key: str, default: bool) -> bool:
 # itself is unchanged; only this entry point's default wiring is gated.
 FIRST_MOVE_ROUTING = _bool_env("RAG_FIRST_MOVE_ROUTING", False)
 
+# SOT-2525 — whether :func:`answer_question` wires the loop-side deterministic tool fallback tried before
+# an UNANSWERABLE abstain is accepted (see :func:`investigate`'s ``fallback``). **Default OFF so the
+# production answer path stays byte-identical** (mirroring the ``RAG_FIRST_MOVE_ROUTING`` default-OFF
+# precedent). When on, a question about to abstain forces one contract-typed deterministic tool
+# (canonical_route / version_diff / file_grep, each self-resolving from the question) and only feeds real
+# evidence back — never an answer. Its net effect on gold-100 is measured by the single integrated
+# SOT-2527 run before any default flip.
+UNANSWERABLE_FALLBACK = _bool_env("RAG_UNANSWERABLE_FALLBACK", False)
+
 # Vertex Gemini list price (USD per 1M tokens), (input, output) — estimates for cost bookkeeping only.
 PRICING: dict[str, tuple[float, float]] = {
     "gemini-2.5-pro": (1.25, 10.0),
@@ -797,7 +806,8 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 research: "bool | Mapping[str, Any] | object | None" = None,
                 enumeration: "bool | Mapping[str, Any] | object | None" = None,
                 contract: "str | None" = None,
-                first_move: "tuple[str, Mapping[str, Any]] | None" = None) -> Investigation:
+                first_move: "tuple[str, Mapping[str, Any]] | None" = None,
+                fallback: "object | None" = None) -> Investigation:
     """Drive ``model`` through tool-calling until it submits a structured answer.
 
     The loop ends on the first of: the model calls ``submit_answer`` (→ ``answered``); ``max_turns`` is
@@ -859,6 +869,17 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     choice and the commit-vs-abstain decision are untouched — and injects no answer, so the answer path
     stays byte-identical when it is ``None`` (default). The plan is built by
     :func:`~src.rag.agent.routing.deterministic_first_move` in :func:`answer_question`.
+
+    ``fallback`` (SOT-2525) is an optional one-shot gate
+    (:class:`~src.rag.agent.question_contract.DeterministicFallbackGate`) tried when the model is about to
+    abstain and neither the enumeration-closure nor the obligation re-search loop intervened. It forces
+    the question's *contract-typed deterministic tool* (canonical_route / version_diff / file_grep — each
+    self-resolving from the question text) to run exactly once before UNANSWERABLE is accepted, and — only
+    when that tool actually reaches evidence (:func:`_first_move_useful`) — feeds the evidence back so the
+    model may answer from it (subject to every existing commit guard, so no answer is injected). When the
+    tool reaches nothing, the abstain stands unchanged (従来の安全動作を維持). It is one-shot so a still-
+    abstaining model cannot loop, and injects no corpus fact, so the answer path is byte-identical when it
+    is ``None`` (default). The gate is built in :func:`answer_question` behind ``RAG_UNANSWERABLE_FALLBACK``.
     """
     record_enabled = ledger not in (None, False)
     if record_enabled:
@@ -1123,6 +1144,35 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                         }))
                         dispatched_tool = True  # count the re-search round; send the directive next turn
                         break
+                # SOT-2525 — deterministic tool fallback before concluding UNANSWERABLE: when the model
+                # is about to abstain and neither the enumeration closure nor the obligation re-search
+                # intervened, force ONE contract-typed deterministic tool (canonical_route / version_diff
+                # / file_grep, each self-resolving from the question) and — only if it reached concrete
+                # evidence — feed that evidence back so the model may answer from it. One-shot; when the
+                # tool reaches nothing the abstain proceeds unchanged (従来の安全動作を維持).
+                if fallback is not None and is_abstain(candidate.answer):
+                    fb_plan = fallback.plan()
+                    if fb_plan is not None and fb_plan[0] in by_name:
+                        fb_name, fb_args = fb_plan
+                        fb_out = dispatch(by_name, fb_name, dict(fb_args or {}))
+                        tool_calls.append(fb_name)
+                        tool_outputs.append(fb_out)
+                        if fb_name == "version_diff" and isinstance(fb_out, Mapping):
+                            version_diff_result = fb_out
+                        if signals is not None:
+                            signals.observe(fb_name, fb_out)
+                        if calc_signals is not None:
+                            calc_signals.observe(fb_name, fb_out)
+                        if director is not None:
+                            director.observe(fb_name, fb_out)
+                        if _first_move_useful(fb_out):
+                            responses.append(ToolResponse(SUBMIT_ANSWER, {
+                                "abstain_rejected": True,
+                                "reason": "UNANSWERABLE と確定する前に契約型の決定論ツールを実行しました。",
+                                "directive": fallback.directive(fb_name, fb_out),
+                            }))
+                            dispatched_tool = True  # count the forced fallback round; re-prompt next turn
+                            break
                 answer = candidate
                 if director is not None and not is_abstain(answer.answer):
                     director.note_answered()
@@ -1393,6 +1443,7 @@ def answer_question(question: str, *, model: str | None = None,
     system: str | None = None
     contract: str | None = None
     first_move: "tuple[str, Mapping[str, Any]] | None" = None
+    fallback: "object | None" = None
     if routing not in (None, False):
         from src.rag.agent import question_contract as _question_contract
         from src.rag.agent import routing as _routing  # lazy: keeps import free of the classifier deps
@@ -1405,6 +1456,11 @@ def answer_question(question: str, *, model: str | None = None,
         # here — the answer path is byte-identical — until SOT-2527 measures a narrowed enablement.
         if FIRST_MOVE_ROUTING:
             first_move = _routing.deterministic_first_move(qc, question)
+        # SOT-2525 — deterministic tool fallback before UNANSWERABLE (see investigate ``fallback``).
+        # Gated OFF by default (``UNANSWERABLE_FALLBACK``): the wiring stays dormant so the answer path is
+        # byte-identical until SOT-2527 measures its net effect on gold-100.
+        if UNANSWERABLE_FALLBACK:
+            fallback = _question_contract.DeterministicFallbackGate(question, contract)
         started = time.monotonic()
         deterministic: Answer | None = None
         deterministic_tools: list[str] = []
@@ -1449,4 +1505,5 @@ def answer_question(question: str, *, model: str | None = None,
     model_obj = gemini_model_factory(question, tools, model=model, system=system)
     return investigate(model_obj, question, tools, max_turns=max_turns, timeout_s=timeout_s,
                        ledger=ledger, calc_ledger=calc_ledger, research=research,
-                       enumeration=enumeration, contract=contract, first_move=first_move)
+                       enumeration=enumeration, contract=contract, first_move=first_move,
+                       fallback=fallback)
