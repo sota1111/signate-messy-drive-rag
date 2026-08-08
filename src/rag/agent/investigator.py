@@ -826,6 +826,7 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     error: str | None = None
     strict_chart_evidence = False
     chart_guidance_sent = False
+    simple_lookup_guidance_sent = False
     regulation_guidance_sent = False
     from src.rag.agent import question_contract as _question_contract
     gantt_question = contract == "chart_read" and _question_contract.is_gantt_week_question(question)
@@ -850,6 +851,20 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
             # The model answered in free text without the terminal tool: accept it, but we have no
             # self-reported confidence, so record 0.0 and note the shortcut in ``method``.
             text = (step.final_text or "").strip() or ABSTAIN
+            if (contract == "simple_lookup" and not tool_calls and is_abstain(text)
+                    and not simple_lookup_guidance_sent):
+                # An empty first model turn is a transport/model omission, not evidence that a named
+                # source is absent.  Give the ordinary lookup path one bounded mandatory-tool retry;
+                # the second abstain remains terminal so this cannot loop or inflate every question.
+                responses = [ToolResponse(DIRECTIVE_MESSAGE, (
+                    "空の初回応答だけでは棄権できません。質問で指定された会社・ファイル名を使って "
+                    "find_files を実行し、対象がOffice文書なら read_office、表データなら "
+                    "canonical_route を実行してください。抽出結果から質問の行・グループ・最大/最後などの"
+                    "条件を確認し、根拠が得られた場合だけ submit_answer してください。"
+                    "必須ツールでも対象を解決できない場合のみ棄権してください。"))]
+                simple_lookup_guidance_sent = True
+                iterations += 1
+                continue
             if contract == "chart_read" and not strict_chart_evidence and not chart_guidance_sent:
                 # A first-turn prose answer/abstain is not evidence that the strict path is unavailable.
                 # Feed one bounded mandatory-tool directive back; if the model still cannot obtain strict
@@ -1043,6 +1058,38 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
             if director is not None:
                 # observe-only: collect successful tool evidence so unmet obligations reflect coverage
                 director.observe(call.name, out)
+            if call.name == "caption_image" and isinstance(out, Mapping):
+                # A question-specific Vision extraction has already enforced literal co-occurrence,
+                # visual-line locality and the smallest directly modified candidate.  When exactly one
+                # such candidate remains, it is deterministic evidence: commit it directly instead of
+                # asking the model to re-select (or repeatedly rediscover) neighbouring cell items.
+                from src.rag.agent import obligations as _obligations
+
+                literal = _obligations.literal_terms(question)
+                value = out.get("value")
+                candidates = value if isinstance(value, list) else []
+                if literal and len(candidates) == 1 and isinstance(candidates[0], Mapping):
+                    candidate = str(candidates[0].get("candidate", "") or "").strip()
+                    conditioned_text = str(
+                        candidates[0].get("conditioned_text", "") or "")
+                    literal_check = _obligations.validate_literal_evidence(
+                        question, candidate, [out])
+                    strict_line = (
+                        candidates[0].get("same_visual_line") is True
+                        and candidate in conditioned_text
+                        and all(term in conditioned_text for term in literal)
+                    )
+                    if candidate and strict_line and literal_check.passed:
+                        answer = Answer(
+                            answer=candidate, confidence=1.0,
+                            evidence=str(out.get("evidence", "")),
+                            method="同一視覚行の単一 literal 候補をそのまま採用",
+                        )
+                        stop_reason = "answered"
+                        submitted = True
+                        if director is not None:
+                            director.note_answered()
+                        break
             if (contract == "version_diff" and call.name == "version_diff"
                     and isinstance(out, Mapping) and out.get("value") is not None):
                 # The deterministic full-document differ is the authority for this contract. Once it

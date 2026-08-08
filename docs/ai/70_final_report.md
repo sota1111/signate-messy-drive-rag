@@ -16,27 +16,29 @@ Gemini Vision 構造抽出へ送る。xlsx はフェーズ等のグルーピン�
 | 2 | 通信上の棄権 | `監視ダッシュボード構築（別契約）` の原文へ到達 | T27 正答 | 解決済み版差分の棄権禁止、Vision の役割限定を強化 |
 | 3 | 差分解決後の再送 error | 対象原文へ到達（隣接項目を含む） | T27 正答 | 版差分を直接確定、Vision を最小候補の構造出力へ変更 |
 | 4（再開後に許可） | 意味相当の決定論出力だが judge は Incorrect | 隣接項目を含み Incorrect | 初手の空応答を安全棄権 | 0 match / 1 abstain / 2 wrong、追加実行上限に到達 |
+| 5（再度許可） | 共通見出しを含む追記表面へ正規化して match | Vision は正しい単一候補を返したが再探索が上限到達 | 空初手再誘導後に T27 正答 | 2 match / 1 abstain / 0 wrong、後続で単一候補直接 commit を追加 |
 
-当初上限3 cycle後、Linear の明示指示で cycle 4 を1回追加した。生成済み回答の正式 focused 採点は cycle 1 が
+当初上限3 cycle後、Linear の明示指示で cycle 4 と cycle 5 を各1回追加した。生成済み回答の正式 focused 採点は cycle 1 が
 match 0 / abstain 1 / wrong 2、cycle 2・3 がそれぞれ match 1 / abstain 1 / wrong 1 であり、
-cycle 4 は match 0 / abstain 1 / wrong 2 だった。idx0 はスライド6の4.1〜4.5作業内容追記を決定論出力したが
-judge が Incorrect、idx52 は Vision の同一行から隣接項目を含めて Incorrect、idx89 は初手の空応答を
-NOT_RETRIEVED として安全棄権した。3問同時 match の受け入れ条件は未達で、再度の focused 実行は未承認のため行っていない。
+cycle 4 は match 0 / abstain 1 / wrong 2、cycle 5 は match 2 / abstain 1 / wrong 0 だった。cycle 5 では idx0 と
+idx89 が match。idx52 は Vision ツールが正しい単一候補を返した後もモデルが再探索を続け、max_turns=12 の
+`BUDGET_EXHAUSTED` で棄権した。この原因に対する単一 strict literal 候補の直接 commit は追加しオフライン回帰を
+通したが、明示された追加 cycle 上限を越える有料 focused 再生成は未承認のため行っていない。
 
 ## Changed Files
 
-- `src/rag/agent/{investigator,obligations,question_contract,routing}.py` — 必須版差分、literal証拠義務、commit gate、画像PDF優先ルーティング。
+- `src/rag/agent/{investigator,obligations,question_contract,routing}.py` — 必須版差分、literal証拠義務、空初手再誘導、単一 strict literal 直接 commit、画像PDF優先ルーティング。
 - `src/rag/{archetype,diffpair}.py` — attached `old` 名の分類、全版構造比較、追加セクションの構造要約。
-- `src/rag/extract/office.py`, `src/rag/tools/{compute_sandbox,extract_tools}.py` — xlsxグループ列補完と質問別Gemini Vision PDF抽出。
+- `src/rag/extract/office.py`, `src/rag/tools/{compute_sandbox,extract_tools}.py` — xlsxグループ列補完と同一視覚行境界を持つ質問別Gemini Vision PDF抽出。
 - `scoring/test_{compute,diffpair,tool_contract}.py`, `tests/test_{investigator,obligations,routing,office_xlsx}.py` — 決定論・誤選択防止・実コーパス回帰テスト。
-- `docs/ai/experiment_ledger.jsonl` — `deterministic-reference-selection` 軸の cycle 3/4 inconclusive 結果。
+- `docs/ai/experiment_ledger.jsonl` — `deterministic-reference-selection` 軸の cycle 3/4/5 inconclusive 結果。
 
 ## Verification
 
-- Focused contract/regression tests after rebase: 148 passed.
+- Focused contract/regression tests after cycle 5 fix: 107 passed.
 - Formal focused scoring: cycle 1 = 0/1/2、cycle 2 = 1/1/1、cycle 3 = 1/1/1
-  cycle 4 = 0/1/2（match / abstain / wrong、受け入れ条件未達）。
-- Full pytest after rebase: 777 passed, 7 non-fatal openpyxl WMF warnings.
+  cycle 4 = 0/1/2、cycle 5 = 2/1/0（match / abstain / wrong、受け入れ条件未達）。
+- Full pytest after cycle 5 fix: 781 passed, 7 non-fatal openpyxl WMF warnings.
 - Python compile check (`src`, `scoring`, `backend`, `tests`): PASS.
 - `git diff --check`: PASS.
 - npm lint/typecheck/test/e2e: N/A（Python repository、`package.json` なし）。
@@ -55,11 +57,11 @@ NOT_RETRIEVED として安全棄権した。3問同時 match の受け入れ条�
 
 ## Remaining Issues
 
-cycle 4 でも focused 条件を満たせなかった。必要な次の修正は、(1) literal Vision 行を項目境界で構造化して
-`別契約` が修飾する単一項目だけを採用すること、(2) simple lookup の空 first-turn を一度だけ必須ツールへ
-再誘導すること、(3) version diff の正規化表面を judge 契約へ合わせること。PR #73 は受け入れ未達のため
-クローズ済みで、最新 `main` へ rebase したローカルブランチを保持している。次へ進むには、これらを直した後の
-追加 focused cycle を許可するか、既存 Gold-100 全体閾値通過をもって受け入れるかの人判断が必要。
+cycle 5 でも3問同時 focused 条件は満たせなかった。3つの一般修正に加え、cycle 5 で露呈した
+「Vision が厳密な単一 literal 候補を返した後の再選択」を直接 commit へ置き換え、回帰は green である。
+ただしこの後続修正を実APIで確認するには、明示された cycle 5 を越える追加 focused cycle の許可が必要。
+PR #73 はクローズ済みで、最新 `main` へ rebase したローカルブランチを保持している。受け入れ未達のため
+push・PR再作成・merge・full gold_offline 再実行は行っていない。
 
 ## Linear Report: POSTED
 

@@ -250,8 +250,13 @@ def caption_figure(file: str | Path | FileRef, question: str | None = None) -> d
                             "candidate": {"type": "string"},
                             "condition": {"type": "string"},
                             "source": {"type": "string"},
+                            "conditioned_text": {"type": "string"},
+                            "same_visual_line": {"type": "boolean"},
                         },
-                        "required": ["page", "scope", "candidate", "condition", "source"],
+                        "required": [
+                            "page", "scope", "candidate", "condition", "source",
+                            "conditioned_text", "same_visual_line",
+                        ],
                     },
                 },
             },
@@ -268,7 +273,10 @@ def caption_figure(file: str | Path | FileRef, question: str | None = None) -> d
                 "回答候補を同じ表セル・同じ文・同じ行で確認してください。質問が主語・所属・役割・表の欄を"
                 "限定している場合は、その限定と一致する行だけを採用し、引用語があっても別の節・表・役割の"
                 "候補は混ぜないでください。candidate は引用条件が直接修飾する最小の役務名だけにし、同じセルの"
-                "隣接項目を含めないでください。source もその条件と候補が共存する最小句だけを転記してください。"
+                "隣接項目を含めないでください。特に読点で並ぶ項目や改行で分かれた項目を連結しないでください。"
+                "conditioned_text には条件語とcandidateが載る同一の視覚上の行だけを転記し、条件語が別の行なら"
+                "same_visual_line=false としてください。source は確認用のセル全体、candidate は条件語の直前にある"
+                "同一行の単一項目としてください。"
                 "該当しない場合は matches=[] としてください。"
             )
             images = [llm.Image(data=data, mime_type=mime) for data, mime in batch]
@@ -279,8 +287,32 @@ def caption_figure(file: str | Path | FileRef, question: str | None = None) -> d
             )
             try:
                 parsed = json.loads(raw)
-                matches.extend(item for item in parsed.get("matches", [])
-                               if isinstance(item, dict))
+                parsed_matches = [item for item in parsed.get("matches", [])
+                                  if isinstance(item, dict)]
+                # Literal requests need a stronger invariant than semantic proximity: the returned
+                # candidate and condition must both be present on the exact visual line reported by
+                # Vision.  This rejects adjacent items in the same table cell (the common wrapped-line
+                # failure) before the agent can concatenate them into one answer.
+                if question:
+                    from src.rag.agent.obligations import literal_terms
+
+                    terms = literal_terms(question)
+                else:
+                    terms = ()
+                if terms:
+                    def _same_line_match(item: dict[str, Any]) -> bool:
+                        line = str(item.get("conditioned_text", "") or "")
+                        candidate = str(item.get("candidate", "") or "").strip()
+                        condition = str(item.get("condition", "") or "").strip()
+                        return (
+                            item.get("same_visual_line") is True
+                            and bool(candidate) and bool(condition)
+                            and candidate in line and condition in line
+                            and all(term in line for term in terms)
+                        )
+
+                    parsed_matches = [item for item in parsed_matches if _same_line_match(item)]
+                matches.extend(parsed_matches)
             except (json.JSONDecodeError, AttributeError):
                 chunks.append(raw)
         value: Any = matches if matches else chunks

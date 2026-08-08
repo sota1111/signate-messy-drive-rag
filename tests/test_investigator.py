@@ -525,6 +525,65 @@ def test_literal_contract_rejects_candidate_without_same_fragment_evidence():
                for r in delivered)
 
 
+def test_single_strict_literal_vision_candidate_commits_without_model_reselection():
+    vision = AgentTool(
+        "caption_image", "d", {"type": "object", "properties": {}},
+        lambda **kw: {
+            "value": [{
+                "page": 8,
+                "scope": "データクラフト",
+                "candidate": "監視ダッシュボード構築",
+                "condition": "別契約",
+                "source": "モデル再現コード提供、バッチ設計\n監視ダッシュボード構築（別契約）",
+                "conditioned_text": "監視ダッシュボード構築（別契約）",
+                "same_visual_line": True,
+            }],
+            "evidence": {"file": "report.pdf", "question_specific": True},
+            "method": {"engine": "vision"},
+        },
+    )
+    q = "データアステル側の役割として『別契約』と明記されたものを抽出してください。"
+    model = ScriptedModel([
+        Step(function_calls=(Call("caption_image", {"file": "report.pdf", "question": q}),)),
+        _submit("隣接する誤候補"),
+    ])
+    result = investigate(model, q, [vision, inv.SUBMIT_ANSWER_TOOL],
+                         contract="simple_lookup", max_turns=4)
+    assert result.answer.answer == "監視ダッシュボード構築"
+    assert result.answer.confidence == 1.0
+    assert result.tool_calls == ["caption_image"]
+    assert len(model.calls_seen) == 1
+
+
+def test_simple_lookup_empty_first_turn_gets_one_bounded_tool_retry():
+    lookup = AgentTool(
+        "read_office", "d", {"type": "object", "properties": {}},
+        lambda **kw: {"value": "フェーズNo6 | T27 | 最終報告", "method": {"engine": "office"}},
+    )
+    model = ScriptedModel([
+        Step(function_calls=(), final_text="", usage=Usage(1, 0)),
+        Step(function_calls=(Call("read_office", {"file": "schedule.xlsx"}),)),
+        _submit("最終報告"),
+    ])
+    result = investigate(model, "スケジュール.xlsxの最後のタスクは何ですか。",
+                         [lookup, inv.SUBMIT_ANSWER_TOOL],
+                         contract="simple_lookup", max_turns=4)
+    assert result.answer.answer == "最終報告"
+    assert result.tool_calls == ["read_office", SUBMIT_ANSWER]
+    assert model.calls_seen[1] and model.calls_seen[1][0].name == inv.DIRECTIVE_MESSAGE
+
+
+def test_simple_lookup_empty_retry_is_not_repeated():
+    model = ScriptedModel([
+        Step(function_calls=(), final_text="", usage=Usage(1, 0)),
+        Step(function_calls=(), final_text="", usage=Usage(1, 0)),
+    ])
+    result = investigate(model, "対象ファイルの値は何ですか。", [inv.SUBMIT_ANSWER_TOOL],
+                         contract="simple_lookup", max_turns=4)
+    assert result.answer.answer == ABSTAIN
+    assert len(model.calls_seen) == 2
+
+
 # --------------------------------------------------------------------------- batch loop (acceptance)
 def _factory_for(answers: dict[str, str]):
     """A model factory that answers each question in one turn via submit_answer."""

@@ -57,7 +57,9 @@ def test_idx0_attached_old_filename_reports_exhaustive_slide6_addition():
     assert pair is not None and pair.old.name == "提案書old.pptx" and pair.new.name == "提案書.pptx"
     answer = diffpair.answer_question_agent(q)
     assert answer is not None
-    assert "スライド6" in answer and "追加" in answer
+    assert "スライド6" in answer and "追記" in answer
+    assert "4. 分析アプローチ 全体像" in answer
+    assert "追記された" in answer
     assert "4.1" in answer and "4.5" in answer
     assert "各フェーズの作業内容" in answer
     assert "7,480,000" not in answer and "8,250,000" not in answer

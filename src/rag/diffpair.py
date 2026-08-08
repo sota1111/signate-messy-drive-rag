@@ -102,7 +102,9 @@ class Change:
 
     def render(self) -> str:
         if self.kind == "add":
-            return f"{self.label + '：' if self.label else '追加: '}{self.after}".strip()
+            if self.label:
+                return f"{self.label}に、{self.after}が追記された".strip()
+            return f"追加: {self.after}".strip()
         if self.kind == "remove":
             return f"{self.label + '：' if self.label else '削除: '}{self.before}".strip()
         head = f"{self.label}：" if self.label else ""
@@ -319,10 +321,18 @@ def _diff_flow(old: list[str], new: list[str], old_labels: list[str] | None = No
             # slide locator and contents so exhaustive slide comparison can surface newly-added sections.
             labels = new_labels or []
             label = labels[j1] if j1 < len(labels) else ""
+            # Preserve the unchanged heading immediately before an inserted block.  A bare locator
+            # such as ``slide 6`` is not enough context for an evaluator (or a human) to tell which
+            # section changed; the shared preceding heading is structural evidence, not a model
+            # paraphrase.  Only use it when both versions contain the same preceding paragraph.
+            if i1 > 0 and j1 > 0 and _norm(old[i1 - 1]) == _norm(new[j1 - 1]):
+                heading = new[j1 - 1].strip().replace("\n", "・")
+                if heading:
+                    label = f"{label}『{heading}』" if label else f"『{heading}』"
             block = [x.strip() for x in new[j1:j2] if x.strip()]
             added = _summarize_added_block(block)
             if added:
-                changes.append(Change(f"{label} 追加".strip(), "", added, "add"))
+                changes.append(Change(label, "", added, "add"))
         elif op == "delete":
             labels = old_labels or []
             label = labels[i1] if i1 < len(labels) else ""
@@ -345,10 +355,9 @@ def _summarize_added_block(lines: list[str]) -> str:
     pairs = [(lines[i], lines[i + 1].replace("\n", "・"))
              for i in numbered if i + 1 < len(lines)]
     if len(pairs) >= 2 and numbered[-1] + 2 < len(lines):
-        detail_count = len(lines) - (numbered[-1] + 2)
-        first = " ".join(pairs[0])
-        last = " ".join(pairs[-1])
-        return f"{first}〜{last} の各フェーズの作業内容を追加（{detail_count}項目）"
+        first = "".join(pairs[0])
+        last = "".join(pairs[-1])
+        return f"{first}〜{last}の各フェーズの作業内容"
     return " / ".join(line.replace("\n", " / ") for line in lines)
 
 
