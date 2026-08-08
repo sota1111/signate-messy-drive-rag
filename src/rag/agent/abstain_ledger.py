@@ -47,10 +47,14 @@ EVIDENCE_CONFLICT = "EVIDENCE_CONFLICT"      # 複数の根拠が矛盾し確定
 EVIDENCE_INCOMPLETE = "EVIDENCE_INCOMPLETE"  # 根拠が部分的で回答に必要な情報が揃わなかった
 UNANSWERABLE = "UNANSWERABLE"                # コーパス内に根拠が存在せず原理的に導出できなかった
 BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"        # 反復上限/タイムアウトで確定前に打ち切った
+# SOT-2522 — 同一ツール×同一(正規化)引数の反復(空回り)を袋小路と判断し早期打ち切りした。BUDGET_EXHAUSTED
+# (単純な反復上限/タイムアウト)とは別バケット: こちらは「同じ無効手を繰り返して予算を溶かした」帰属で、
+# 再配分/経路多様化で回収余地がある浪費を BUDGET から切り出して可視化する。
+SPIN_CUTOFF = "SPIN_CUTOFF"                  # 空回り(同一ツール反復)検出で袋小路と判断し打ち切った
 
 STATE_CODES: tuple[str, ...] = (
     NOT_RETRIEVED, RETRIEVED_NOT_PARSED, PARSED_AMBIGUOUS, EVIDENCE_CONFLICT,
-    EVIDENCE_INCOMPLETE, UNANSWERABLE, BUDGET_EXHAUSTED,
+    EVIDENCE_INCOMPLETE, UNANSWERABLE, BUDGET_EXHAUSTED, SPIN_CUTOFF,
 )
 
 # Free-text obligation template per code (the "what was NOT obtained" statement).
@@ -62,6 +66,7 @@ _DEFAULT_OBLIGATION: dict[str, str] = {
     EVIDENCE_INCOMPLETE: "根拠が部分的で、回答に必要な情報が揃わなかった。",
     UNANSWERABLE: "コーパス内に回答の根拠が存在せず、原理的に導出できなかった。",
     BUDGET_EXHAUSTED: "反復上限/タイムアウトに達し、根拠を確定する前に打ち切った。",
+    SPIN_CUTOFF: "同一ツールを同一引数で反復する空回りを袋小路と判断し、経路を早期に打ち切った。",
 }
 
 # The "kind" of the structured obligation per code (machine-groupable diagnosis bucket).
@@ -73,6 +78,7 @@ _OBLIGATION_KIND: dict[str, str] = {
     EVIDENCE_INCOMPLETE: "completeness",
     UNANSWERABLE: "existence",
     BUDGET_EXHAUSTED: "budget",
+    SPIN_CUTOFF: "spin",
 }
 
 # --------------------------------------------------------------------------- tool → phase buckets
@@ -133,6 +139,11 @@ class AbstainSignals:
 
     stop_reason: str = "answered"
     evidence_text: str = ""            # model's own evidence/method/answer free text (keyword mining)
+    # SOT-2522 — set True by the investigator when its spin (dead-end) detector fired on this question
+    # (同一ツール×同一引数の反復を検出し再配分/早期打ち切りした). Observer-only: it never changes the
+    # answer path; it only lets :func:`classify` attribute the abstain to :data:`SPIN_CUTOFF` distinctly
+    # from a plain :data:`BUDGET_EXHAUSTED` cutoff.
+    spin_cutoff: bool = False
     # SOT-2502 — obligation-driven re-search phase results (empty unless the research loop ran):
     research_trace: tuple[dict[str, Any], ...] = ()  # ordered targeted re-search rounds
     research_terminal: str = ""        # why re-search stopped: "budget" | "unanswerable" | "answered"
@@ -194,7 +205,14 @@ def classify(signals: AbstainSignals) -> str:
     reason takes precedence — ``"budget"`` → :data:`BUDGET_EXHAUSTED` (反復/ツール上限で打ち切り),
     ``"unanswerable"`` → :data:`UNANSWERABLE` (全戦術を尽くした不存在確認). An empty terminal (research
     off, or the model committed) leaves the pre-existing signal-based precedence unchanged.
+
+    SOT-2522: a fired spin (dead-end) detector takes precedence over every other cause →
+    :data:`SPIN_CUTOFF`. It sits above the budget check because a spin abstain *is* a budget abstain by
+    stop_reason, but the spin was the actionable root cause (再配分/多様化で回収余地がある浪費) and must be
+    attributable distinctly from an ordinary max_turns/timeout cutoff.
     """
+    if getattr(signals, "spin_cutoff", False):
+        return SPIN_CUTOFF
     if signals.research_terminal == "budget":
         return BUDGET_EXHAUSTED
     if signals.research_terminal == "unanswerable":

@@ -6,6 +6,7 @@ uses the real deterministic tools (a real ``find_files`` grep over the corpus, p
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -824,3 +825,84 @@ def test_evidence_cache_env_off_reexecutes(monkeypatch):
     ])
     investigate(model, "…", tools, max_turns=6)
     assert len(sink) == 2  # cache disabled → identical call executes twice
+
+
+# --------------------------------------------------------------------------- SOT-2522 spin detection
+def _grep_step(query):
+    return Step(function_calls=(Call("file_grep", {"query": query}),), usage=Usage(1, 1))
+
+
+def test_spin_detection_off_by_default_is_byte_identical():
+    # With spin detection off (the default), a model that repeats the same call spins to max_turns
+    # exactly as before — the tool executes every turn and the abstain is a plain budget cutoff.
+    sink = []
+    tools = [_counting_tool(sink, name="file_grep"), inv.SUBMIT_ANSWER_TOOL]
+    steps = [_grep_step("同じ") for _ in range(10)]
+    res = investigate(model := ScriptedModel(steps), "…", tools, max_turns=5)
+    assert res.stop_reason == "max_turns"
+    assert res.answer.answer == ABSTAIN
+    assert res.tool_calls == ["file_grep"] * 5  # no spin directive injected
+    assert "spin" not in (res.error or "")
+
+
+def test_spin_detection_redirects_once_then_cuts_off(tmp_path: Path):
+    # A model that keeps calling the same tool with the same args is detected as spinning: on the
+    # threshold-th repeat it is redirected (once) toward untried deterministic routes; when it keeps
+    # spinning, the path is cut off early and the abstain is recorded as SPIN_CUTOFF (not BUDGET).
+    from src.rag.agent import abstain_ledger as al
+
+    sink = []
+    tools = [_counting_tool(sink, name="file_grep"), inv.SUBMIT_ANSWER_TOOL]
+    steps = [_grep_step("同じ") for _ in range(12)]  # model never varies its call
+    model = ScriptedModel(steps)
+    ledger_path = tmp_path / "abstain.jsonl"
+    res = investigate(model, "対象の値は？", tools, max_turns=12,
+                      spin_detection={"threshold": 3}, ledger=str(ledger_path))
+    assert res.stop_reason == "spin_cutoff"
+    assert res.answer.answer == ABSTAIN
+    # cut off well before max_turns=12 → budget was freed (無駄ターン減少)
+    assert res.iterations < 12
+    # the reallocation directive was fed back exactly once as a spin_detected response
+    spin_msgs = [tr for turn in model.calls_seen if turn for tr in turn
+                 if isinstance(tr.response, dict) and tr.response.get("spin_detected")]
+    assert len(spin_msgs) == 1
+    directive = spin_msgs[0].response["directive"]
+    assert "canonical_route" in directive  # redirect names untried deterministic routes
+    # the abstain is attributed to SPIN_CUTOFF in the ledger, distinct from BUDGET_EXHAUSTED
+    rows = [json.loads(x) for x in ledger_path.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1 and rows[0]["state_code"] == al.SPIN_CUTOFF
+
+
+def test_spin_redirect_lets_model_recover_via_another_route():
+    # After the reallocation directive, a model that switches to a different route and commits an answer
+    # finishes normally — the redirect reallocated the budget instead of dead-ending the question.
+    sink = []
+    tools = [_counting_tool(sink, name="file_grep"),
+             _counting_tool(sink, name="canonical_route"), inv.SUBMIT_ANSWER_TOOL]
+    steps = [
+        _grep_step("同じ"), _grep_step("同じ"), _grep_step("同じ"),  # spins to threshold=3 → redirect
+        Step(function_calls=(Call("canonical_route", {"question": "q"}),), usage=Usage(1, 1)),
+        _submit("回答42", confidence=0.9, evidence="canonical_route", method="route"),
+    ]
+    model = ScriptedModel(steps)
+    res = investigate(model, "対象の値は？", tools, max_turns=12, spin_detection=True)
+    assert res.stop_reason == "answered"
+    assert res.answer.answer == "回答42"
+    assert "canonical_route" in res.tool_calls
+
+
+def test_spin_detection_ignores_varied_arguments():
+    # Distinct arguments are not a spin: a model exploring different queries is never cut off.
+    sink = []
+    tools = [_counting_tool(sink, name="file_grep"), inv.SUBMIT_ANSWER_TOOL]
+    steps = [
+        _grep_step("a"), _grep_step("b"), _grep_step("c"), _grep_step("d"),
+        _submit("見つけた", confidence=0.8, evidence="file_grep", method="grep"),
+    ]
+    model = ScriptedModel(steps)
+    res = investigate(model, "…", tools, max_turns=12, spin_detection={"threshold": 3})
+    assert res.stop_reason == "answered"
+    assert res.answer.answer == "見つけた"
+    spin_msgs = [tr for turn in model.calls_seen if turn for tr in turn
+                 if isinstance(tr.response, dict) and tr.response.get("spin_detected")]
+    assert not spin_msgs  # varied args → no spin directive
