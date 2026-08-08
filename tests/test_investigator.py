@@ -7,6 +7,7 @@ uses the real deterministic tools (a real ``find_files`` grep over the corpus, p
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -148,6 +149,24 @@ def test_chart_contract_accepts_numcache_or_source_compute_evidence():
         model, "AG_ratioのヒストグラムで最も多いカウントは。",
         [strict, inv.SUBMIT_ANSWER_TOOL], max_turns=3, contract="chart_read")
     assert res.answer.answer == "958"
+
+
+def test_gantt_contract_accepts_native_week_grid_evidence_without_numcache():
+    strict = AgentTool(
+        "read_office", "gantt", {"type": "object", "properties": {}},
+        lambda **_kw: {
+            "value": "【ガント週グリッド:決定論】\n[スライド5] モデル改善: 第6週目から第8週目\n【/ガント週グリッド】",
+            "evidence": {"file": "proposal.pptx"},
+            "method": {"engine": "pptx"},
+        })
+    model = ScriptedModel([
+        Step(function_calls=(Call("read_office", {}),)),
+        _submit("第6週目から第8週目", evidence="proposal.pptx", method="native Gantt geometry"),
+    ])
+    res = investigate(
+        model, "提案書のモデル改善の実行予定スケジュールは案件開始から第何週目ですか。",
+        [strict, inv.SUBMIT_ANSWER_TOOL], max_turns=3, contract="chart_read")
+    assert res.answer.answer == "第6週目から第8週目"
 
 
 def test_chart_contract_free_text_without_strict_evidence_abstains():
@@ -383,6 +402,42 @@ def test_regulation_content_rejects_no_rule_only_then_accepts_complete_fallback(
     assert set(rejection["missing"]) == {"単価", "税処理", "課金単位", "丸め", "精算周期", "上限"}
 
 
+def test_regulation_content_free_text_cannot_bypass_completion_guard():
+    q = "契約条件で稼働上限を超えた場合の精算方法に関する規定内容を答えてください。"
+    complete = (
+        "特別な精算規定は存在しません。一般規定として時間単価30,000円に消費税を加算し、"
+        "15分単位で切上げ、月次精算し、上限はありません。")
+    model = ScriptedModel([
+        Step(function_calls=(), final_text="特別規定はありません。"),
+        _submit(complete),
+    ])
+    result = investigate(
+        model, q, [inv.SUBMIT_ANSWER_TOOL], max_turns=3,
+        ledger=False, calc_ledger=False, research=False, enumeration=False,
+        contract="simple_lookup",
+    )
+    assert result.answer.answer == complete
+    assert model.calls_seen[1][0].name == inv.DIRECTIVE_MESSAGE
+
+
+def test_real_focused_questions_resolve_deterministically_without_hardcoded_values():
+    from src.rag import corpus
+
+    if not corpus.walk():
+        pytest.skip("corpus not present")
+    profile = CorpusProfile()
+    gantt = inv._deterministic_gantt_answer(
+        "白峰信用リスク評価の提案書.pptxにおいて、モデルの高度化（説明性・セグメント分析）の"
+        "実行予定スケジュールは案件開始から第何週目に実施予定でしょうか。", profile)
+    regulation = inv._deterministic_regulation_answer(
+        "ひがし丘の契約条件において、ACTHが200時間を超えた場合の精算方法に関する規定内容を答えてください。",
+        profile)
+    assert gantt is not None and gantt.answer == "第6週目から第8週目"
+    assert regulation is not None
+    assert "25,000円" in regulation.answer and "消費税を加算" in regulation.answer
+    assert "30分単位" in regulation.answer and "月次" in regulation.answer and "上限なし" in regulation.answer
+
+
 # --------------------------------------------------------------------------- batch loop (acceptance)
 def _factory_for(answers: dict[str, str]):
     """A model factory that answers each question in one turn via submit_answer."""
@@ -437,3 +492,23 @@ def test_to_genai_tools_builds_function_declarations_including_submit_answer():
     decls = genai_tools[0].function_declarations
     assert {d.name for d in decls} == {t.name for t in tools}
     assert SUBMIT_ANSWER in {d.name for d in decls}
+
+
+def test_gemini_model_normalizes_missing_candidate_role(monkeypatch):
+    from google.genai import types
+    from src.rag import llm
+
+    response = SimpleNamespace(
+        candidates=[SimpleNamespace(content=types.Content(
+            role=None, parts=[types.Part.from_text(text="done")]))],
+        usage_metadata=None,
+    )
+    fake_client = SimpleNamespace(models=SimpleNamespace(
+        generate_content=lambda **_kwargs: response))
+    monkeypatch.setattr(llm, "client", lambda: fake_client)
+
+    model = inv.GeminiModel("q", [])
+    step = model.next(None)
+
+    assert step.final_text == "done"
+    assert model._contents[-1].role == "model"

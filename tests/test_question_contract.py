@@ -121,6 +121,16 @@ def test_idx30_quantity_contract_pins_denominator_unit_and_rounding() -> None:
     assert validate_numeric_answer(q, "1.18%", correct).passed
 
 
+def test_numeric_contract_rejects_uncomputed_notebook_claim() -> None:
+    result = validate_numeric_answer(
+        "notebookを確認して目的変数と相関が最も高い数値特徴量を教えてください。",
+        "age",
+        [],
+    )
+    assert not result.passed
+    assert any("決定論的計算証跡" in issue for issue in result.issues)
+
+
 def test_pivot_highlight_question_is_format_contract() -> None:
     q = "基礎分析.pptxで黄色ハイライトされている数値の抽出条件と集計内容を答えてください。"
     assert classify(q).contract == FORMAT_CHECK
@@ -156,6 +166,7 @@ def test_gantt_week_question_is_chart_read_with_geometry_completion() -> None:
     assert result.contract == CHART_READ
     assert any("left/width" in condition for condition in result.completion_conditions)
     assert qc.is_gantt_week_question(q)
+    assert all("numCache" not in condition for condition in result.completion_conditions)
 
 
 # --------------------------------------------------------------------------- hybrid flash arbitration

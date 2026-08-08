@@ -102,7 +102,7 @@ def first_tools_for(contract: QuestionContract, question: str) -> tuple[str, ...
     if contract.contract == _qc.CHART_READ and _qc.is_gantt_week_question(question):
         # Gantt bars are native PPTX shapes: geometry from read_office is authoritative; vision is only
         # corroboration.  read_chart_values targets embedded numCache charts and cannot recover bar spans.
-        return ("read_office", *(t for t in base if t != "read_office"))
+        return ("read_office",)
     if contract.contract == _qc.FORMAT_CHECK and (
             "ピボット" in question.lower() or (
                 ".pptx" in question.lower() and "ハイライト" in question
@@ -201,7 +201,7 @@ def route_hint(contract: QuestionContract, question: str) -> str:
         lines.append(
             "回答表面の必須形式は人名のフルネームのみ。根拠説明、所属、役割、敬称（様/氏）を"
             "回答欄へ足さず、抽出した氏名を原文表記のまま返す。")
-    if contract.contract == _qc.CHART_READ:
+    if contract.contract == _qc.CHART_READ and not _qc.is_gantt_week_question(question):
         lines.append(
             "グラフ数値はread_chart_valuesのnumCacheまたは元データ再集計だけを根拠にする。"
             "ヒストグラム最多件数は対象列をcolumn、operation='histogram_max_count'として呼ぶ。"

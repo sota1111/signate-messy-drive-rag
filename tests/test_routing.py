@@ -103,8 +103,8 @@ def test_gantt_week_route_uses_native_geometry_before_vision():
     contract = qc.classify(q)
     assert contract.contract == qc.CHART_READ
     tools = routing.first_tools_for(contract, q)
-    assert tools[0] == "read_office"
-    assert tools.index("read_office") < tools.index("caption_image")
+    assert tools == ("read_office",)
+    assert "caption_image" not in tools
     hint = routing.route_hint(contract, q)
     assert "【ガント週グリッド】" in hint and "半開区間" in hint and "裏取り" in hint
 

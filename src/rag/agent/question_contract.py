@@ -273,7 +273,9 @@ def completion_conditions(question: str, contract: str) -> tuple[str, ...]:
     if contract == SIMPLE_LOOKUP and is_regulation_content_question(question):
         return (*base, *_REGULATION_FALLBACK_COMPLETION)
     if contract == CHART_READ and is_gantt_week_question(question):
-        return (*base, *_GANTT_COMPLETION)
+        # Native-shape Gantt bars have no numCache/source column.  Keep target identification, then
+        # apply the dedicated week-grid geometry promises instead of contradictory numeric-chart ones.
+        return (base[0], *_GANTT_COMPLETION)
     return base
 
 
@@ -462,6 +464,8 @@ def validate_numeric_answer(question: str, answer: str,
     """
     req = numeric_requirements(question)
     issues: list[str] = []
+    if not formulas:
+        issues.append("決定論的計算証跡がない: compute等で再実行可能な値を取得していない")
     denominator = _resolved_denominator_formula(formulas) if req.ratio else ""
     if req.ratio and req.denominator_scope:
         if not denominator:
