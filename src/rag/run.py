@@ -70,13 +70,21 @@ def _agent_result(d: dict) -> dict:
     return d
 
 
-def make_worker(gen: str, hard: bool) -> Callable[[int, str], tuple[int, dict]]:
-    """Build the per-question answer function for backend ``gen`` (see module docstring)."""
+def make_worker(gen: str, hard: bool,
+                profile: "CorpusProfile | None" = None) -> Callable[[int, str], tuple[int, dict]]:
+    """Build the per-question answer function for backend ``gen`` (see module docstring).
+
+    ``profile`` (SOT-2528): when supplied, the production ``investigator`` backend threads this ONE
+    shared :class:`CorpusProfile` through every question so passwords/aliases/formats discovered on one
+    question are reused on the next instead of being re-derived (opt-in run-wide sharing; see
+    :func:`src.rag.tools.profile.share_enabled`). ``None`` keeps the historical per-question fresh
+    profile — byte-identical champion behaviour.
+    """
     if gen == "investigator":
         from src.rag.agent import investigator
 
         def work(idx: int, q: str) -> tuple[int, dict]:
-            return idx, _agent_result(investigator.answer_question(q).to_dict())
+            return idx, _agent_result(investigator.answer_question(q, profile=profile).to_dict())
     elif gen == "resolve":
         from src.rag.agent import tiebreak
 
@@ -112,7 +120,18 @@ def run(split: str, out: Path, limit: int | None, workers: int, hard: bool,
     if limit:
         questions = questions[:limit]
     results: dict[int, dict] = {}
-    work = make_worker(gen, hard)
+
+    # Run-wide corpus profile (SOT-2528): opt-in via RAG_SHARE_CORPUS_PROFILE. When enabled, load the
+    # persisted profile once, share the single instance across every question so discovered
+    # passwords/aliases/formats are reused (not re-derived), then save it back after the pool joins.
+    # Only the production ``investigator`` backend consumes it. Default OFF ⇒ per-question fresh profile.
+    shared_profile = None
+    if gen == "investigator":
+        from src.rag.tools import profile as _profile
+
+        if _profile.share_enabled():
+            shared_profile = _profile.CorpusProfile.load()
+    work = make_worker(gen, hard, profile=shared_profile)
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [ex.submit(work, idx, q) for idx, q in questions]
@@ -121,6 +140,9 @@ def run(split: str, out: Path, limit: int | None, workers: int, hard: bool,
             results[idx] = res
             print(f"[{n}/{len(questions)}] idx={idx} conf={res['confidence']} "
                   f"imgs={res['used_images']} :: {res['answer'][:50]}")
+
+    if shared_profile is not None:
+        shared_profile.save()
 
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", encoding="utf-8", newline="") as f:

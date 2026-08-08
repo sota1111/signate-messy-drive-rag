@@ -1248,17 +1248,23 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
 def investigate_batch(model_factory: Callable[[str, Sequence[AgentTool]], Model],
                       questions: Sequence[str], *,
                       profile_factory: Callable[[], CorpusProfile] | None = None,
+                      shared_profile: CorpusProfile | None = None,
                       max_turns: int = DEFAULT_MAX_TURNS,
                       timeout_s: float = DEFAULT_TIMEOUT_S) -> list[Investigation]:
-    """Investigate each question with a fresh model + tools + profile; return one result per question.
+    """Investigate each question with a fresh model + tools; return one result per question.
 
-    Each question gets its own :class:`CorpusProfile` so a self-discovered secret never leaks the answer
-    across questions (移植性の担保).
+    Profile modes (SOT-2528):
+    - default / ``profile_factory``: each question gets its OWN :class:`CorpusProfile` (a fresh one, or
+      the factory's) so nothing carries across questions — the historical isolation behaviour.
+    - ``shared_profile``: every question reuses the SAME profile instance, so a password/alias/format
+      discovered on one question is reused on the next instead of being re-derived. These are corpus
+      facts (not per-question answers), so sharing only removes rediscovery cost — answers are unchanged.
+      ``shared_profile`` takes precedence over ``profile_factory`` when both are given.
     """
     prof = profile_factory or (lambda: CorpusProfile())
     out: list[Investigation] = []
     for q in questions:
-        tools = build_tools(prof())
+        tools = build_tools(shared_profile if shared_profile is not None else prof())
         model = model_factory(q, tools)
         out.append(investigate(model, q, tools, max_turns=max_turns, timeout_s=timeout_s))
     return out

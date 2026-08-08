@@ -45,7 +45,7 @@ def test_run_defaults_to_investigator_and_never_calls_claude(monkeypatch, tmp_pa
 
     seen: list[str] = []
 
-    def fake_answer_question(q: str):
+    def fake_answer_question(q: str, profile=None):
         seen.append(q)
         return _FakeInvestigation(f"ans-{q}")
 
@@ -70,7 +70,7 @@ def test_investigator_abstain_is_written_as_abstain(monkeypatch, tmp_path):
     monkeypatch.setattr(run, "load_questions", lambda split: [(7, "hard-q")])
     from src.rag.agent import investigator
     monkeypatch.setattr(investigator, "answer_question",
-                        lambda q: _FakeInvestigation(settings.ABSTAIN, confidence=0.0))
+                        lambda q, profile=None: _FakeInvestigation(settings.ABSTAIN, confidence=0.0))
 
     out = tmp_path / "predictions.csv"
     run.run("valid", out, limit=None, workers=1, hard=False)
@@ -82,7 +82,8 @@ def test_make_worker_selects_backend(monkeypatch):
     from src.rag.agent import investigator, tiebreak
     from src.rag import generate, opus_gen
 
-    monkeypatch.setattr(investigator, "answer_question", lambda q: _FakeInvestigation("inv"))
+    monkeypatch.setattr(investigator, "answer_question",
+                        lambda q, profile=None: _FakeInvestigation("inv"))
     monkeypatch.setattr(tiebreak, "resolve_question", lambda q: _FakeInvestigation("res"))
     monkeypatch.setattr(generate, "answer_question",
                         lambda q, hard=False: {"answer": "gem", "confidence": "high", "used_images": 0})
@@ -98,3 +99,64 @@ def test_make_worker_selects_backend(monkeypatch):
 
     with pytest.raises(ValueError):
         run.make_worker("mystery", False)
+
+
+# --------------------------------------------------------------------------- SOT-2528 run-wide profile
+def test_run_shares_one_persisted_profile_across_questions_when_enabled(monkeypatch, tmp_path):
+    """RAG_SHARE_CORPUS_PROFILE on ⇒ ONE loaded profile is threaded through every question and saved."""
+    from src.rag.tools import profile as _profile
+
+    monkeypatch.setenv("RAG_SHARE_CORPUS_PROFILE", "1")
+    profile_path = tmp_path / "corpus_profile.json"
+    # seed an on-disk profile so we can prove ``run`` loads it (a prior run's discovery)
+    _profile.CorpusProfile(passwords={"seed.docx": "pw0"}).save(profile_path)
+    monkeypatch.setattr(_profile, "DEFAULT_PROFILE_PATH", profile_path)
+
+    monkeypatch.setattr(run, "load_questions", lambda split: [(1, "q1"), (2, "q2"), (3, "q3")])
+    seen_profiles: list[object] = []
+
+    def fake_answer_question(q: str, profile=None):
+        seen_profiles.append(profile)
+        # simulate a per-question discovery landing on the shared instance
+        profile.set_password(f"{q}.docx", f"pw-{q}")
+        return _FakeInvestigation(f"ans-{q}")
+
+    from src.rag.agent import investigator
+    monkeypatch.setattr(investigator, "answer_question", fake_answer_question)
+
+    out = tmp_path / "predictions.csv"
+    run.run("test", out, limit=None, workers=1, hard=False)
+
+    # every question saw the SAME non-None shared instance, seeded from disk
+    assert all(p is not None for p in seen_profiles)
+    assert len({id(p) for p in seen_profiles}) == 1
+    assert seen_profiles[0].get_password("seed.docx") == "pw0"
+    # discoveries were persisted back after the pool joined
+    reloaded = _profile.CorpusProfile.load(profile_path)
+    assert reloaded.get_password("seed.docx") == "pw0"
+    assert {reloaded.get_password(f"q{i}.docx") for i in (1, 2, 3)} == {"pw-q1", "pw-q2", "pw-q3"}
+
+
+def test_run_uses_fresh_per_question_profile_when_disabled(monkeypatch, tmp_path):
+    """Default (flag OFF) ⇒ investigator gets ``profile=None`` (historical per-question fresh profile)."""
+    from src.rag.tools import profile as _profile
+
+    monkeypatch.delenv("RAG_SHARE_CORPUS_PROFILE", raising=False)
+    # ensure no stray profile is written to the real artifacts dir
+    monkeypatch.setattr(_profile, "DEFAULT_PROFILE_PATH", tmp_path / "corpus_profile.json")
+    monkeypatch.setattr(run, "load_questions", lambda split: [(1, "q1"), (2, "q2")])
+
+    seen_profiles: list[object] = []
+
+    def fake_answer_question(q: str, profile=None):
+        seen_profiles.append(profile)
+        return _FakeInvestigation(f"ans-{q}")
+
+    from src.rag.agent import investigator
+    monkeypatch.setattr(investigator, "answer_question", fake_answer_question)
+
+    out = tmp_path / "predictions.csv"
+    run.run("test", out, limit=None, workers=1, hard=False)
+
+    assert seen_profiles == [None, None]
+    assert not (tmp_path / "corpus_profile.json").exists()  # nothing saved when disabled
