@@ -196,7 +196,8 @@ def test_version_diff_tool_wraps_solver_answer_in_contract(monkeypatch):
     tools = {t.name: t for t in build_tools(CorpusProfile())}
     out = dispatch(tools, "version_diff", {"question": "旧版と最新版を比較して変更点を教えて。"})
     assert out["value"] == "QAレビューア：池田 直哉 → 小林 直樹"
-    assert out["evidence"] == {"applicable": True, "resolved": True}
+    assert out["evidence"] == {
+        "applicable": True, "resolved": True, "coverage": "all-slides/all-sheets"}
     assert out["method"]["engine"] == "diffpair"
 
 
@@ -209,7 +210,8 @@ def test_version_diff_tool_returns_none_value_when_solver_abstains(monkeypatch):
     tools = {t.name: t for t in build_tools(CorpusProfile())}
     out = dispatch(tools, "version_diff", {"question": "幻の資料の旧版と最新版を比較して変更点を。"})
     assert out["value"] is None
-    assert out["evidence"] == {"applicable": True, "resolved": False}
+    assert out["evidence"] == {
+        "applicable": True, "resolved": False, "coverage": "all-slides/all-sheets"}
 
 
 def test_version_diff_tool_reproduces_idx9_through_agent_path():
@@ -243,7 +245,8 @@ def test_version_diff_tool_answers_adjacent_pair_but_abstains_on_gapped_pair():
     out_v3 = dispatch(tools, "version_diff", {"question": q_v3})
     assert out_v2["value"] and "藤田 彩" in out_v2["value"] and "井上 里奈" in out_v2["value"]
     assert out_v3["value"] is None  # non-adjacent v1→v3 → abstain (precision 1.0 維持)
-    assert out_v3["evidence"] == {"applicable": True, "resolved": False}
+    assert out_v3["evidence"] == {
+        "applicable": True, "resolved": False, "coverage": "all-slides/all-sheets"}
 
 
 def test_dispatch_truncates_long_strings():
@@ -453,6 +456,132 @@ def test_idx44_and_idx86_use_closed_deterministic_paths_without_gemini(monkeypat
     assert staff.answer.answer == "19"
     assert staff.contract == "cross_aggregate" and staff.model == "deterministic"
     assert seating.usage.total_tokens == staff.usage.total_tokens == 0
+
+
+def test_version_diff_contract_requires_tool_and_exact_deterministic_value():
+    expected = "スライド6 追加：4.1 データ理解 / 4.2 前処理"
+    diff_tool = AgentTool(
+        "version_diff", "d", {"type": "object", "properties": {}},
+        lambda **kw: {"value": expected,
+                      "evidence": {"resolved": True, "coverage": "all-slides/all-sheets"},
+                      "method": {"engine": "diffpair"}},
+    )
+    model = ScriptedModel([
+        _submit("費用が変更された"),                 # mandatory tool not run
+        Step(function_calls=(Call("version_diff", {"question": "q"}),)),
+        _submit("4.1と4.2が追加された"),             # paraphrase is not the tool value
+        _submit(expected),
+    ])
+    result = investigate(
+        model, "旧版から新版への変更を比較してください。",
+        [diff_tool, inv.SUBMIT_ANSWER_TOOL], contract="version_diff", max_turns=6)
+    assert result.answer.answer == expected
+    delivered = [r.response for turn in model.calls_seen if turn for r in turn
+                 if r.name == SUBMIT_ANSWER]
+    assert sum(bool(r.get("answer_rejected")) for r in delivered) == 1
+    assert result.tool_calls.count("version_diff") == 1
+
+
+def test_resolved_version_diff_rejects_abstain_and_commits_exact_value():
+    expected = "スライド6 追加：4.1 データ理解"
+    diff_tool = AgentTool(
+        "version_diff", "d", {"type": "object", "properties": {}},
+        lambda **kw: {"value": expected,
+                      "evidence": {"resolved": True, "coverage": "all-slides/all-sheets"},
+                      "method": {"engine": "diffpair"}},
+    )
+    model = ScriptedModel([
+        Step(function_calls=(Call("version_diff", {"question": "q"}),)),
+        _submit(inv.ABSTAIN),
+        _submit(expected),
+    ])
+    result = investigate(
+        model, "旧版から新版への変更を比較してください。",
+        [diff_tool, inv.SUBMIT_ANSWER_TOOL], contract="version_diff", max_turns=5)
+    assert result.answer.answer == expected
+    assert result.tool_calls == ["version_diff"]
+
+
+def test_literal_contract_rejects_candidate_without_same_fragment_evidence():
+    lookup = AgentTool(
+        "read_office", "d", {"type": "object", "properties": {}},
+        lambda **kw: {"value": [
+            {"item": "データ移行支援", "condition": "本契約内"},
+            {"item": "監視ダッシュボード構築", "condition": "別契約"},
+        ], "evidence": {"file": "proposal.pptx"}, "method": {"engine": "office"}},
+    )
+    q = "データアステル側の役割として「別契約」と明記されたものを抽出してください。"
+    model = ScriptedModel([
+        Step(function_calls=(Call("read_office", {"file": "proposal.pptx"}),)),
+        _submit("データ移行支援"),
+        _submit("監視ダッシュボード構築"),
+    ])
+    result = investigate(model, q, [lookup, inv.SUBMIT_ANSWER_TOOL],
+                         contract="simple_lookup", max_turns=5)
+    assert result.answer.answer == "監視ダッシュボード構築"
+    delivered = [r.response for turn in model.calls_seen if turn for r in turn
+                 if r.name == SUBMIT_ANSWER]
+    assert any(r.get("answer_rejected") and "literal" in r.get("reason", "")
+               for r in delivered)
+
+
+def test_single_strict_literal_vision_candidate_commits_without_model_reselection():
+    vision = AgentTool(
+        "caption_image", "d", {"type": "object", "properties": {}},
+        lambda **kw: {
+            "value": [{
+                "page": 8,
+                "scope": "データクラフト",
+                "candidate": "監視ダッシュボード構築",
+                "condition": "別契約",
+                "source": "モデル再現コード提供、バッチ設計\n監視ダッシュボード構築（別契約）",
+                "conditioned_text": "監視ダッシュボード構築（別契約）",
+                "same_visual_line": True,
+            }],
+            "evidence": {"file": "report.pdf", "question_specific": True},
+            "method": {"engine": "vision"},
+        },
+    )
+    q = "データアステル側の役割として『別契約』と明記されたものを抽出してください。"
+    model = ScriptedModel([
+        Step(function_calls=(Call("caption_image", {"file": "report.pdf", "question": q}),)),
+        _submit("隣接する誤候補"),
+    ])
+    result = investigate(model, q, [vision, inv.SUBMIT_ANSWER_TOOL],
+                         contract="simple_lookup", max_turns=4)
+    assert result.answer.answer == "監視ダッシュボード構築"
+    assert result.answer.confidence == 1.0
+    assert result.tool_calls == ["caption_image"]
+    assert len(model.calls_seen) == 1
+
+
+def test_simple_lookup_empty_first_turn_gets_one_bounded_tool_retry():
+    lookup = AgentTool(
+        "read_office", "d", {"type": "object", "properties": {}},
+        lambda **kw: {"value": "フェーズNo6 | T27 | 最終報告", "method": {"engine": "office"}},
+    )
+    model = ScriptedModel([
+        Step(function_calls=(), final_text="", usage=Usage(1, 0)),
+        Step(function_calls=(Call("read_office", {"file": "schedule.xlsx"}),)),
+        _submit("最終報告"),
+    ])
+    result = investigate(model, "スケジュール.xlsxの最後のタスクは何ですか。",
+                         [lookup, inv.SUBMIT_ANSWER_TOOL],
+                         contract="simple_lookup", max_turns=4)
+    assert result.answer.answer == "最終報告"
+    assert result.tool_calls == ["read_office", SUBMIT_ANSWER]
+    assert model.calls_seen[1] and model.calls_seen[1][0].name == inv.DIRECTIVE_MESSAGE
+
+
+def test_simple_lookup_empty_retry_is_not_repeated():
+    model = ScriptedModel([
+        Step(function_calls=(), final_text="", usage=Usage(1, 0)),
+        Step(function_calls=(), final_text="", usage=Usage(1, 0)),
+    ])
+    result = investigate(model, "対象ファイルの値は何ですか。", [inv.SUBMIT_ANSWER_TOOL],
+                         contract="simple_lookup", max_turns=4)
+    assert result.answer.answer == ABSTAIN
+    assert len(model.calls_seen) == 2
 
 
 # --------------------------------------------------------------------------- batch loop (acceptance)

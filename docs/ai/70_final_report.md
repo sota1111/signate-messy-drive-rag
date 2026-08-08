@@ -1,58 +1,70 @@
-# SOT-2510 Final Report
+# SOT-2509 Final Report
 
 ## Summary
 
-Implemented fail-closed enumeration closure for occupant-relative seating sides and the all-project
-DA staffing population. Seating left/right now derives an inward-facing frame from the reviewed,
-pixel-hash-pinned 2x2 pod rather than treating screen coordinates as the occupant's perspective.
-The cross-corpus aggregate selects one canonical PP, contract, PLAN, and FR for every project,
-extracts only role-bound DA people, normalizes typographic identity variants, and deduplicates the
-complete union. Both paths emit the four closure conditions and answer deterministically only when
-the authoritative population is complete.
+参照選択を質問契約と実ファイル構造から決定する経路へ変更した。版差分は `version_diff` による
+全スライド/全シート比較を必須化し、解決値をモデルの再選択・言い換え・再送に依存せず直接確定する。
+「明記」質問は引用条件と候補の同一セル/文証拠を commit gate で検証し、画像のみ PDF は質問別の
+Gemini Vision 構造抽出へ送る。xlsx はフェーズ等のグルーピング列だけを保守的に前方補完し、通常の
+空欄から担当者等を作らない。
+
+## Improvement Cycles
+
+| Cycle | idx0 | idx52 | idx89 | Decision |
+| --- | --- | --- | --- | --- |
+| 1 | スライド6追記へ到達（契約分類要修正） | 検索 timeout | T23（生 xlsx 空欄） | 分類・画像PDF・compute 正規化を修正 |
+| 2 | 通信上の棄権 | `監視ダッシュボード構築（別契約）` の原文へ到達 | T27 正答 | 解決済み版差分の棄権禁止、Vision の役割限定を強化 |
+| 3 | 差分解決後の再送 error | 対象原文へ到達（隣接項目を含む） | T27 正答 | 版差分を直接確定、Vision を最小候補の構造出力へ変更 |
+| 4（再開後に許可） | 意味相当の決定論出力だが judge は Incorrect | 隣接項目を含み Incorrect | 初手の空応答を安全棄権 | 0 match / 1 abstain / 2 wrong、追加実行上限に到達 |
+| 5（再度許可） | 共通見出しを含む追記表面へ正規化して match | Vision は正しい単一候補を返したが再探索が上限到達 | 空初手再誘導後に T27 正答 | 2 match / 1 abstain / 0 wrong、後続で単一候補直接 commit を追加 |
+
+当初上限3 cycle後、Linear の明示指示で cycle 4 と cycle 5 を各1回追加した。生成済み回答の正式 focused 採点は cycle 1 が
+match 0 / abstain 1 / wrong 2、cycle 2・3 がそれぞれ match 1 / abstain 1 / wrong 1 であり、
+cycle 4 は match 0 / abstain 1 / wrong 2、cycle 5 は match 2 / abstain 1 / wrong 0 だった。cycle 5 では idx0 と
+idx89 が match。idx52 は Vision ツールが正しい単一候補を返した後もモデルが再探索を続け、max_turns=12 の
+`BUDGET_EXHAUSTED` で棄権した。この原因に対する単一 strict literal 候補の直接 commit は追加しオフライン回帰を
+通したが、明示された追加 cycle 上限を越える有料 focused 再生成は未承認のため行っていない。
 
 ## Changed Files
 
-- `src/rag/tools/seating_chart.py` — occupant-relative right/left relations, multi-result name/seat
-  fields, authoritative population evidence, and closure metadata.
-- `src/rag/tools/corpus_aggregate.py`, `src/rag/tools/__init__.py` — canonical four-document roster
-  selection, role-bound name extraction, identity normalization, population union/count, and export.
-- `src/rag/agent/question_contract.py`, `src/rag/agent/investigator.py` — cross-aggregate recognition,
-  tool schemas/prompts, and deterministic fail-closed answer paths.
-- `scoring/test_seating_chart.py`, `scoring/test_corpus_aggregate.py`,
-  `tests/test_question_contract.py`, `tests/test_investigator.py` — perspective, closure, routing,
-  deterministic-answer, and existing opposite-seat regression coverage.
-- `artifacts/gold_100_review.{csv,md}`, `docs/gold_offline_history.jsonl`,
-  `docs/ai/experiment_ledger.jsonl` — full-run review, history, and promoted experiment evidence.
+- `src/rag/agent/{investigator,obligations,question_contract,routing}.py` — 必須版差分、literal証拠義務、空初手再誘導、単一 strict literal 直接 commit、画像PDF優先ルーティング。
+- `src/rag/{archetype,diffpair}.py` — attached `old` 名の分類、全版構造比較、追加セクションの構造要約。
+- `src/rag/extract/office.py`, `src/rag/tools/{compute_sandbox,extract_tools}.py` — xlsxグループ列補完と同一視覚行境界を持つ質問別Gemini Vision PDF抽出。
+- `scoring/test_{compute,diffpair,tool_contract}.py`, `tests/test_{investigator,obligations,routing,office_xlsx}.py` — 決定論・誤選択防止・実コーパス回帰テスト。
+- `docs/ai/experiment_ledger.jsonl` — `deterministic-reference-selection` 軸の cycle 3/4/5 inconclusive 結果。
 
 ## Verification
 
-- Focused live cycle 1: idx44=`鈴木、藤田`, idx86=`19`; 2 match / 0 wrong / 0 abstain / cost $0.
-- Full `gold_offline`: 21 match / 6 wrong / 73 abstain; required match≥18 and wrong≤13 passed.
-- SOT-2511 reconciled baseline comparison: existing match→wrong = 0.
-- Existing enum-set matches idx19 and idx26 remain matches; idx44 improved from wrong to match;
-  current enum-set class is 3 match / 0 wrong / 6 abstain.
-- Full pytest: 766 passed, 8 non-fatal openpyxl WMF warnings.
+- Focused contract/regression tests after cycle 5 fix: 107 passed.
+- Formal focused scoring: cycle 1 = 0/1/2、cycle 2 = 1/1/1、cycle 3 = 1/1/1
+  cycle 4 = 0/1/2、cycle 5 = 2/1/0（match / abstain / wrong、受け入れ条件未達）。
+- Full pytest after cycle 5 fix: 781 passed, 7 non-fatal openpyxl WMF warnings.
 - Python compile check (`src`, `scoring`, `backend`, `tests`): PASS.
-- Import/real-corpus closure smoke: 19 people from 40 canonical files, no missing/unreadable source.
-- `git diff --check` excluding the generated CRLF CSV: PASS; generated CSV reviewed separately.
-- npm lint/typecheck/test/e2e: N/A (Python repository; no `package.json`).
+- `git diff --check`: PASS.
+- npm lint/typecheck/test/e2e: N/A（Python repository、`package.json` なし）。
+- Gold-100 investigator run: match 18 / wrong 4 / abstain 78 / cost $4.5951.
+- Gate: match >= 18 PASS、wrong <= 13 PASS、SOT-2508 baseline の既存 match→wrong = 0 PASS。
 
 ## Acceptance Criteria
 
-- [x] idx44 and idx86 both match in one focused cycle (within the three-cycle cap).
-- [x] Full gold-offline meets match≥18, wrong≤13, and baseline match→wrong=0.
-- [x] Both pre-existing enum-set matches are preserved.
-- [x] Seat-orientation, opposite-seat non-regression, roster population, and closure tests pass.
-- [x] The promoted experiment ledger records the evaluated axis and evidence.
-- [x] No issue-specific answer branch or corpus answer value was hard-coded; incomplete closure abstains.
+- [x] 版差分質問は回答確定前に全スライド/全シートの決定論比較を実行し、解決値をそのまま確定する。
+- [x] 「明記」は条件語と候補が同一箇所に literal 共起しない候補を拒否する。
+- [x] xlsx の結合/空欄グループ列を前方補完し、通常列の空欄から値を捏造しない。
+- [x] idx0/52/89 の誤選択原因へ一般則を実装し、特定回答を production code にハードコードしていない。
+- [x] Gemini-only investigator 経路を維持した。
+- [x] Gold-100 品質閾値と既存 match 非誤答化を満たした。
+- [ ] idx0/52/89 が同一 focused cycle で全件 match（3 cycle以内）。
 
 ## Remaining Issues
 
-None for SOT-2510. Unrelated full-suite abstentions and six pre-existing wrong answers remain outside
-this issue's scope and are explicitly preserved in the generated review artifact.
+cycle 5 でも3問同時 focused 条件は満たせなかった。3つの一般修正に加え、cycle 5 で露呈した
+「Vision が厳密な単一 literal 候補を返した後の再選択」を直接 commit へ置き換え、回帰は green である。
+ただしこの後続修正を実APIで確認するには、明示された cycle 5 を越える追加 focused cycle の許可が必要。
+PR #73 はクローズ済みで、最新 `main` へ rebase したローカルブランチを保持している。受け入れ未達のため
+push・PR再作成・merge・full gold_offline 再実行は行っていない。
 
 ## Linear Report: POSTED
 
-## Acceptance: PASS
+## Acceptance: FAIL
 
-## Next Action: READY_FOR_REVIEW
+## Next Action: NEEDS_USER_INPUT

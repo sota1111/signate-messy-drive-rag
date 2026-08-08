@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.rag import corpus, diffpair
+from src.rag import archetype, corpus, diffpair
 
 # The tests below read the SIGNATE corpus; skip cleanly when it is absent (e.g. lean CI image).
 _CORPUS_PRESENT = bool(corpus.walk())
@@ -27,6 +27,12 @@ def test_is_diff_question_true_for_version_diff():
         "京橋の提案書の旧版と最新版を比較して変更点を教えてください。") is True
 
 
+def test_attached_old_filename_is_classified_as_version_diff():
+    q = "株式会社ノースサンド様向けAI利活用提案書old.pptxと最新版の更新点は何ですか。"
+    assert diffpair.is_diff_question(q)
+    assert archetype.classify(q) == "version_diff"
+
+
 def test_is_diff_question_false_for_ordinary_questions():
     # ordinary retrieval questions must NOT be routed to the differ
     assert diffpair.is_diff_question("京橋信用ソリューションズの契約金額（税込）はいくらですか。") is False
@@ -41,6 +47,22 @@ def test_idx9_reports_qa_reviewer_change():
     assert ans is not None
     assert "池田 直哉" in ans and "小林 直樹" in ans and "→" in ans
     assert "QAレビューア" in ans
+
+
+@_needs_corpus
+def test_idx0_attached_old_filename_reports_exhaustive_slide6_addition():
+    q = ("白峰信用リスク評価の提案書old.pptxから提案書.pptxへの更新内容のうち、"
+         "案件遂行に関連する実質的な変更を挙げてください。")
+    pair = diffpair.resolve_pair(q)
+    assert pair is not None and pair.old.name == "提案書old.pptx" and pair.new.name == "提案書.pptx"
+    answer = diffpair.answer_question_agent(q)
+    assert answer is not None
+    assert "スライド6" in answer and "追記" in answer
+    assert "4. 分析アプローチ 全体像" in answer
+    assert "追記された" in answer
+    assert "4.1" in answer and "4.5" in answer
+    assert "各フェーズの作業内容" in answer
+    assert "7,480,000" not in answer and "8,250,000" not in answer
 
 
 @_needs_corpus

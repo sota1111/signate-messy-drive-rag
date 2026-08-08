@@ -189,10 +189,19 @@ def _read_xlsx(path: Path, sheet: int | str | None) -> tuple[pd.DataFrame, str, 
     width = max((i + 1 for i, c in enumerate(header) if c is not None), default=len(header))
     columns = [nfc(str(c)) if c is not None else f"col_{i}" for i, c in enumerate(header[:width])]
     body = [(r[:width] + [None] * (width - len(r)))[:width] for r in rows[1:]]
-    df, coerced = _coerce_numeric(pd.DataFrame(body, columns=columns))
+    df = pd.DataFrame(body, columns=columns)
+    from src.rag.extract.office import is_grouping_header
+
+    grouping_columns = [column for column in df.columns if is_grouping_header(column)]
+    if grouping_columns:
+        df[grouping_columns] = df[grouping_columns].ffill()
+    df, coerced = _coerce_numeric(df)
+    normalization = (["forward_fill_grouping_columns: " + ", ".join(map(str, grouping_columns))]
+                     if grouping_columns else [])
     trace = _norm_trace(df, coerced, excluded_rows=dropped_leading,
-                        extra_rules=([f"dropped_leading_empty_rows: {dropped_leading}"]
-                                     if dropped_leading else []))
+                        extra_rules=(
+                            ([f"dropped_leading_empty_rows: {dropped_leading}"]
+                             if dropped_leading else []) + normalization))
     return df, title, trace
 
 

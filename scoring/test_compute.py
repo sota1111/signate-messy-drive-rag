@@ -162,6 +162,21 @@ def test_compute_sandbox_reads_xlsx_data_only_and_picks_data_sheet():
         assert out["value"] == len(pd.read_csv(csv[0].path))
 
 
+def test_compute_sandbox_forward_fills_schedule_group_headers():
+    """Merged/blank phase cells remain attached to every task row in deterministic compute."""
+    refs = [r for r in walk() if r.ext == "xlsx" and "京橋信用ソリューションズ" in r.project
+            and "スケジュール" in r.name]
+    if not refs:
+        pytest.skip("京橋 schedule xlsx not present")
+    out = compute_sandbox.run(
+        refs[0],
+        "df[df['フェーズNo.'] == 6].sort_values('開始日').iloc[-1]['タスク名']",
+    )
+    assert out["value"] == "最終報告・成果物提出・検収会"
+    assert any("forward_fill_grouping_columns" in rule
+               for rule in out["method"]["trace"]["normalization"])
+
+
 @pytest.mark.parametrize("expr", [
     "__import__('os').system('echo hi')",
     "open('/etc/passwd').read()",

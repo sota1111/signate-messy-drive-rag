@@ -160,6 +160,64 @@ def test_caption_figure_returns_contract(monkeypatch):
     assert out["value"] == "[図] スタブ説明"
 
 
+def test_caption_figure_reads_all_image_pdf_pages_with_original_question(monkeypatch):
+    pdf = next((r for r in walk() if r.ext == "pdf"), None)
+    if pdf is None:
+        pytest.skip("no PDF in corpus")
+    seen: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        _vision, "pdf_page_images",
+        lambda path: [(b"page-one", "image/jpeg"), (b"page-two", "image/jpeg")],
+    )
+
+    def fake_generate(prompt, *, images, **kwargs):
+        seen.append((prompt, len(images)))
+        return json.dumps({"matches": [{
+            "page": 2,
+            "scope": "データアステル側の役割",
+            "candidate": "監視ダッシュボード構築",
+            "condition": "別契約",
+            "source": "監視ダッシュボード構築（別契約）",
+            "conditioned_text": "監視ダッシュボード構築（別契約）",
+            "same_visual_line": True,
+        }]}, ensure_ascii=False)
+
+    monkeypatch.setattr("src.rag.llm.generate", fake_generate)
+    question = "『別契約』と明記されている役務は何ですか。"
+    out = caption_figure(pdf, question=question)
+    assert is_contract(out) and out["method"]["engine"] == "vision"
+    assert out["value"][0]["candidate"] == "監視ダッシュボード構築"
+    assert out["value"][0]["condition"] == "別契約"
+    assert out["evidence"]["pages_attached"] == 2
+    assert seen and question in seen[0][0] and seen[0][1] == 2
+
+
+def test_caption_figure_literal_filter_rejects_adjacent_cell_item(monkeypatch):
+    pdf = next((r for r in walk() if r.ext == "pdf"), None)
+    if pdf is None:
+        pytest.skip("no PDF in corpus")
+    monkeypatch.setattr(
+        _vision, "pdf_page_images", lambda path: [(b"page", "image/jpeg")])
+
+    def fake_generate(prompt, *, images, **kwargs):
+        return json.dumps({"matches": [
+            {
+                "page": 1, "scope": "role", "candidate": "モデル再現コード提供",
+                "condition": "別契約", "source": "モデル再現コード提供、監視ダッシュボード構築（別契約）",
+                "conditioned_text": "モデル再現コード提供", "same_visual_line": False,
+            },
+            {
+                "page": 1, "scope": "role", "candidate": "監視ダッシュボード構築",
+                "condition": "別契約", "source": "モデル再現コード提供、監視ダッシュボード構築（別契約）",
+                "conditioned_text": "監視ダッシュボード構築（別契約）", "same_visual_line": True,
+            },
+        ]}, ensure_ascii=False)
+
+    monkeypatch.setattr("src.rag.llm.generate", fake_generate)
+    out = caption_figure(pdf, question="『別契約』と明記された役務は何ですか。")
+    assert [item["candidate"] for item in out["value"]] == ["監視ダッシュボード構築"]
+
+
 # --------------------------------------------------------------------------- passwords tool + no-secret invariant
 def test_decrypt_returns_contract_without_leaking_password():
     ref = _first_encrypted()
