@@ -6,16 +6,21 @@ question-specific answers: it records reusable tokens and formatting facts with 
 from __future__ import annotations
 
 import json
+import os
 import re
 import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, Iterable
 
 from config import settings
 from src.rag.corpus import FileRef, nfc
 
 SCHEMA = "typed-evidence-index"
 SCHEMA_VERSION = 1
+
+_ON = {"1", "true", "yes", "on"}
+_SNIPPET_MAX = 300
 
 _SHEET = re.compile(r"^\[シート:\s*(?P<name>[^]]+)\]")
 _SLIDE = re.compile(r"^\[スライド(?P<num>\d+)\]")
@@ -162,6 +167,137 @@ def build_only(*, out: Path | None = None, caption_images: bool = False) -> dict
         except Exception:
             continue
     return write_index(entries, out)
+
+
+# --------------------------------------------------------------------------- runtime read / lookup
+#
+# The build half above is unconditional (the artifact is always regenerated at index time). This
+# read half is the SOT-2532 / 事前処理 #4b addition: it lets ``file_grep`` consult the typed index
+# at question time to answer discovery queries by lookup instead of extracting every corpus file.
+#
+# Design invariants (mirroring the structure-store, SOT-2533):
+#   * Opt-in at serve time — :func:`enabled` (``RAG_EVIDENCE_INDEX``) gates *runtime consultation*
+#     only; with the flag unset the champion serve path is byte-identical (file_grep full scan).
+#   * Zero-regression fallback — a missing / unreadable / schema-mismatched index yields ``[]`` so
+#     the caller falls through to the live scan; a query the typed index does not cover is a miss,
+#     which also falls back to the full scan (index is a *fast path*, never a truncation of truth).
+#   * Deterministic & answer-preserving — a hit returns the entry's own recorded provenance
+#     (file / sheet / cell / paragraph); no question-specific answer or hard-coded location.
+
+_INDEX_CACHE: dict[str, list[dict[str, str]]] = {}
+
+
+def enabled() -> bool:
+    """True when runtime tools should consult the persisted evidence index (default OFF — opt-in).
+
+    Mirrors the ``RAG_STRUCTURE_STORE`` / ``RAG_FACT_INDEX`` conventions: the artifact is always
+    (re)built at index time, but *runtime consultation* is gated so the champion serve path stays
+    byte-identical unless the flag is set.
+    """
+    return os.getenv("RAG_EVIDENCE_INDEX", "0").strip().lower() in _ON
+
+
+def reset_cache() -> None:
+    """Drop the in-process load cache (used by the build path and tests)."""
+    _INDEX_CACHE.clear()
+
+
+def load(path: Path | None = None) -> list[dict[str, str]]:
+    """Load the index entry rows (memoized per path).
+
+    Returns ``[]`` when the index is absent, unreadable, or its schema/version header does not match
+    — the caller then falls back to the live scan (回帰ゼロ). The schema header line is validated and
+    dropped; only entry rows are returned.
+    """
+    out = path or default_out_path()
+    key = str(out)
+    if key in _INDEX_CACHE:
+        return _INDEX_CACHE[key]
+    entries: list[dict[str, str]] = []
+    try:
+        with open(out, encoding="utf-8") as handle:
+            header = handle.readline()
+            meta = json.loads(header) if header.strip() else {}
+            if isinstance(meta, dict) and meta.get("schema") == SCHEMA \
+                    and meta.get("version") == SCHEMA_VERSION:
+                for line in handle:
+                    line = line.strip()
+                    if line:
+                        entries.append(json.loads(line))
+    except Exception:
+        entries = []
+    _INDEX_CACHE[key] = entries
+    return entries
+
+
+def _rel_ext(rel: str, file: str) -> str:
+    name = rel or file
+    return name.rsplit(".", 1)[-1].lower() if "." in name else ""
+
+
+def _lookup_where(cell: str, sheet: str, paragraph: str) -> str:
+    """Most-specific locator for an index hit, mirroring ``file_grep._where`` shapes."""
+    if cell:
+        return f"cell:{cell}" + (f"@sheet:{sheet}" if sheet else "")
+    if sheet:
+        return f"sheet:{sheet}"
+    if paragraph:
+        return paragraph  # already a "line:N" / "slide:N" locator
+    return "index"
+
+
+def lookup(pattern: "re.Pattern[str]", *, ext: str | Iterable[str] | None = None,
+           project: str | None = None, max_hits_per_file: int = 50, limit: int = 500,
+           path: Path | None = None) -> list[dict[str, Any]]:
+    """Return ``file_grep``-shaped hit records for entries whose value/key matches ``pattern``.
+
+    ``pattern`` is a pre-compiled :class:`re.Pattern` (the caller applies the same literal/regex,
+    ignore-case and NFC handling used for the live scan, so matching semantics stay identical). A
+    hit is index-derived: ``line`` is ``None`` and ``where`` is the stored cell/sheet/paragraph
+    locator. Returns ``[]`` when disabled or on any miss so the caller falls back to the live scan.
+    """
+    if not enabled():
+        return []
+    entries = load(path)
+    if not entries:
+        return []
+    items = [ext] if isinstance(ext, str) else list(ext or [])
+    exts = {e.lower().lstrip(".") for e in items if e} or None
+    proj = nfc(project) if project else None
+
+    hits: list[dict[str, Any]] = []
+    per_file: dict[str, int] = {}
+    seen: set[tuple[str, str, str]] = set()
+    for entry in entries:
+        rel = entry.get("rel") or entry.get("file") or ""
+        if proj is not None and nfc(entry.get("project", "")) != proj:
+            continue
+        entry_ext = _rel_ext(rel, entry.get("file", ""))
+        if exts is not None and entry_ext not in exts:
+            continue
+        value = entry.get("value", "")
+        key = entry.get("key", "")
+        if not (pattern.search(nfc(value)) or (key and pattern.search(key))):
+            continue
+        where = _lookup_where(entry.get("cell", ""), entry.get("sheet", ""),
+                              entry.get("paragraph", ""))
+        snippet = value if len(value) <= _SNIPPET_MAX else value[:_SNIPPET_MAX] + "…"
+        dedup = (rel, where, snippet)
+        if dedup in seen or per_file.get(rel, 0) >= max_hits_per_file:
+            continue
+        seen.add(dedup)
+        per_file[rel] = per_file.get(rel, 0) + 1
+        hits.append({
+            "file": rel,
+            "project": entry.get("project", ""),
+            "ext": entry_ext,
+            "line": None,
+            "where": where,
+            "snippet": snippet,
+        })
+        if len(hits) >= limit:
+            break
+    return hits
 
 
 if __name__ == "__main__":

@@ -156,6 +156,37 @@ def file_grep(query: str, *, regex: bool = False, ext: str | Iterable[str] | Non
     exts = _norm_exts(ext)
     proj = nfc(project) if project else None
 
+    # Fast path (SOT-2532 / #4b): when the typed evidence index is enabled, answer discovery
+    # queries by index lookup — returning the recorded (file, sheet, cell/paragraph) locations
+    # directly — instead of extracting every corpus file. A miss (query the typed index does not
+    # cover) or a disabled/absent index falls through to the full scan below, so correctness is
+    # unchanged and only the slow path shrinks. Default OFF ⇒ champion serve path byte-identical.
+    from src.rag.index import evidence_index
+
+    if evidence_index.enabled():
+        index_hits = evidence_index.lookup(
+            pattern, ext=ext, project=project,
+            max_hits_per_file=max_hits_per_file, limit=limit)
+        if index_hits:
+            returned = index_hits[:limit]
+            return contract.make(
+                returned,
+                engine="file_grep",
+                evidence={
+                    "files_scanned": 0,
+                    "files_matched": len({h["file"] for h in returned}),
+                    "total_hits": len(index_hits),
+                    "returned": len(returned),
+                    "truncated": len(index_hits) >= limit,
+                    "source": "evidence_index",
+                },
+                query=query,
+                regex=regex,
+                ignore_case=ignore_case,
+                source="evidence_index",
+                filters={"ext": sorted(exts) if exts else None, "project": proj},
+            )
+
     refs = walk(Path(corpus_dir)) if corpus_dir is not None else walk()
     all_hits: list[dict[str, Any]] = []
     files_scanned = 0
