@@ -15,13 +15,13 @@ Gemini Vision 構造抽出へ送る。xlsx はフェーズ等のグルーピン�
 | 1 | スライド6追記へ到達（契約分類要修正） | 検索 timeout | T23（生 xlsx 空欄） | 分類・画像PDF・compute 正規化を修正 |
 | 2 | 通信上の棄権 | `監視ダッシュボード構築（別契約）` の原文へ到達 | T27 正答 | 解決済み版差分の棄権禁止、Vision の役割限定を強化 |
 | 3 | 差分解決後の再送 error | 対象原文へ到達（隣接項目を含む） | T27 正答 | 版差分を直接確定、Vision を最小候補の構造出力へ変更 |
+| 4（再開後に許可） | 意味相当の決定論出力だが judge は Incorrect | 隣接項目を含み Incorrect | 初手の空応答を安全棄権 | 0 match / 1 abstain / 2 wrong、追加実行上限に到達 |
 
-上限3 cycleで探索を終了した。生成済み回答の正式 focused 採点は cycle 1 が
+当初上限3 cycle後、Linear の明示指示で cycle 4 を1回追加した。生成済み回答の正式 focused 採点は cycle 1 が
 match 0 / abstain 1 / wrong 2、cycle 2・3 がそれぞれ match 1 / abstain 1 / wrong 1 であり、
-3問同時 match の受け入れ条件は未達だった。cycle 3 後の最終決定論出力は idx0 が
-`スライド6 追加：4.1 データ理解・品質確認〜4.5 ガバナンス・監査対応 の各フェーズの作業内容を追加`
-となり、idx89 は実 xlsx の phase 6 最終開始タスク `最終報告・成果物提出・検収会` を返すが、
-上限を超える cycle 4 は実行していない。
+cycle 4 は match 0 / abstain 1 / wrong 2 だった。idx0 はスライド6の4.1〜4.5作業内容追記を決定論出力したが
+judge が Incorrect、idx52 は Vision の同一行から隣接項目を含めて Incorrect、idx89 は初手の空応答を
+NOT_RETRIEVED として安全棄権した。3問同時 match の受け入れ条件は未達で、再度の focused 実行は未承認のため行っていない。
 
 ## Changed Files
 
@@ -29,15 +29,15 @@ match 0 / abstain 1 / wrong 2、cycle 2・3 がそれぞれ match 1 / abstain 1 
 - `src/rag/{archetype,diffpair}.py` — attached `old` 名の分類、全版構造比較、追加セクションの構造要約。
 - `src/rag/extract/office.py`, `src/rag/tools/{compute_sandbox,extract_tools}.py` — xlsxグループ列補完と質問別Gemini Vision PDF抽出。
 - `scoring/test_{compute,diffpair,tool_contract}.py`, `tests/test_{investigator,obligations,routing,office_xlsx}.py` — 決定論・誤選択防止・実コーパス回帰テスト。
-- `docs/ai/experiment_ledger.jsonl` — `deterministic-reference-selection` 軸の採用結果。
+- `docs/ai/experiment_ledger.jsonl` — `deterministic-reference-selection` 軸の cycle 3/4 inconclusive 結果。
 
 ## Verification
 
-- Focused contract/regression tests: 134 passed.
+- Focused contract/regression tests after rebase: 148 passed.
 - Formal focused scoring: cycle 1 = 0/1/2、cycle 2 = 1/1/1、cycle 3 = 1/1/1
-  （match / abstain / wrong、受け入れ条件未達）。
-- Full pytest: 748 passed, 7 non-fatal openpyxl WMF warnings.
-- Python compile check (`src`, `scoring`, `tests`): PASS.
+  cycle 4 = 0/1/2（match / abstain / wrong、受け入れ条件未達）。
+- Full pytest after rebase: 777 passed, 7 non-fatal openpyxl WMF warnings.
+- Python compile check (`src`, `scoring`, `backend`, `tests`): PASS.
 - `git diff --check`: PASS.
 - npm lint/typecheck/test/e2e: N/A（Python repository、`package.json` なし）。
 - Gold-100 investigator run: match 18 / wrong 4 / abstain 78 / cost $4.5951.
@@ -55,10 +55,11 @@ match 0 / abstain 1 / wrong 2、cycle 2・3 がそれぞれ match 1 / abstain 1 
 
 ## Remaining Issues
 
-Gold-100 の idx52 は全件並列時に broad search が timeout して安全棄権した。最終変更では literal 質問を
-`find_files → caption_image` 優先へ変更したが、focused 上限到達後のため再生成・再採点していない。
-PR #73 は受け入れ未達のためマージせずクローズし、ブランチを保持する。次へ進むには、追加 focused cycle を
-許可するか、全体 Gold 閾値通過をもって受け入れるかの人判断が必要。
+cycle 4 でも focused 条件を満たせなかった。必要な次の修正は、(1) literal Vision 行を項目境界で構造化して
+`別契約` が修飾する単一項目だけを採用すること、(2) simple lookup の空 first-turn を一度だけ必須ツールへ
+再誘導すること、(3) version diff の正規化表面を judge 契約へ合わせること。PR #73 は受け入れ未達のため
+クローズ済みで、最新 `main` へ rebase したローカルブランチを保持している。次へ進むには、これらを直した後の
+追加 focused cycle を許可するか、既存 Gold-100 全体閾値通過をもって受け入れるかの人判断が必要。
 
 ## Linear Report: POSTED
 
