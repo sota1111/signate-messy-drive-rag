@@ -406,7 +406,8 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
         ),
         AgentTool(
             "file_grep",
-            "コーパス全体を全文/セル/ファイル名でgrepし、一致箇所(ファイル・行・抜粋)を返す。",
+            "コーパス全体を全文/セル/ファイル名でgrepし、一致箇所(ファイル・行・抜粋)を返す。"
+            "逆引き索引が有効な場合は所在(ファイル・シート・セル/段落)を即答し、未ヒット時のみ全走査にフォールバックする。",
             _obj({"query": _STR, "ext": _STR, "project": _STR, "regex": _BOOL}, ["query"]),
             lambda query, ext=None, project=None, regex=False: file_grep(
                 query, regex=bool(regex), ext=ext, project=project),
