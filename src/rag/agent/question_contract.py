@@ -178,6 +178,12 @@ _FORMAT_RE = re.compile(
 _MULTIHOP_RE = re.compile(
     r"(もっとも|最も|一番|最大|最高|最多).{0,24}(人|担当者|案件|案件名|プロジェクト|会社|社|ファイル)"
     r".{0,20}(の|が担当).{0,16}(内線|ext|担当|案件|金額|着手金|報酬|期間|日付|番号|値)")
+_STAFF_POPULATION_RE = re.compile(
+    r"(?:各案件|全案件|全プロジェクト).{0,40}"
+    r"(?:PP|提案書).{0,16}(?:契約書|契約).{0,16}(?:PLAN|計画|スケジュール).{0,16}"
+    r"(?:FR|最終報告).{0,48}(?:役割付き|実施体制|担当体制).{0,32}(?:何人|人数|全部で)",
+    re.I,
+)
 
 # Archetypes the backbone maps to the NUMERIC contract (derivation / computed values).
 _NUMERIC_ARCH = frozenset({
@@ -265,6 +271,11 @@ def is_regulation_content_question(question: str) -> bool:
 def is_gantt_week_question(question: str) -> bool:
     """Whether a question asks for an activity's week range on a schedule/Gantt visual."""
     return bool(_GANTT_RE.search(nfc(question or "")))
+
+
+def is_staff_population_question(question: str) -> bool:
+    """Whether a question asks for the unique DA roster across PP/contract/PLAN/FR for all projects."""
+    return bool(_STAFF_POPULATION_RE.search(nfc(question or "")))
 
 
 def completion_conditions(question: str, contract: str) -> tuple[str, ...]:
@@ -527,6 +538,9 @@ def _deterministic(q: str, arch: str) -> tuple[str, float, str] | None:
     # Authoritative structural contracts (version diff / enumeration / cross-aggregate) win outright.
     if base in (VERSION_DIFF, FULL_ENUMERATION, CROSS_AGGREGATE):
         return base, _CONF_SPECIFIC, f"archetype={arch}"
+
+    if is_staff_population_question(q):
+        return CROSS_AGGREGATE, _CONF_SPECIFIC, "all-project PP/contract/PLAN/FR staff population"
 
     # New-dimension refinements apply only to lookup/derivation bases.
     if _SPATIAL_GEOM_RE.search(q):

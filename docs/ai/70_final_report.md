@@ -1,51 +1,55 @@
-# SOT-2511 Final Report
+# SOT-2510 Final Report
 
 ## Summary
 
-Implemented complete fallback-rule answers and deterministic PPTX Gantt week-grid reading. Negative
-special-rule answers now require rate/tax treatment, billing unit/rounding, settlement cycle, and cap.
-Native Gantt shapes are mapped to calibrated half-open week cells, with ambiguous geometry failing
-closed. When the authoritative file and requested activity/rule are unique, a generic deterministic
-path returns the extracted result without relying on model phrasing or vision.
-
-## Improvement Cycles
-
-| Cycle | Result | Decision |
-| --- | --- | --- |
-| 1–3 | idx51 remained match; idx78 incomplete/wrong or safely abstained | Added negative-wording guard; initial run stopped at the original cap |
-| 4 | Both Missing due Gemini role error / timeout | Normalize model history and separate Gantt from numeric-chart routing |
-| 5 | idx51 Missing; idx78 incomplete free text | Add fail-closed deterministic paths and apply completeness guard to free text |
-| 6 | idx51 Perfect; idx78 semantic match judged Incorrect on surface form | Normalize the generic regulation answer template |
-| 7 | idx51 Perfect; idx78 Perfect | Focused gate PASS (2/2 match, 0 wrong) |
-| 8 | Full-run-only idx4 regression restored to `bmi` via mandatory compute evidence | Reconciled non-regression gate PASS |
+Implemented fail-closed enumeration closure for occupant-relative seating sides and the all-project
+DA staffing population. Seating left/right now derives an inward-facing frame from the reviewed,
+pixel-hash-pinned 2x2 pod rather than treating screen coordinates as the occupant's perspective.
+The cross-corpus aggregate selects one canonical PP, contract, PLAN, and FR for every project,
+extracts only role-bound DA people, normalizes typographic identity variants, and deduplicates the
+complete union. Both paths emit the four closure conditions and answer deterministically only when
+the authoritative population is complete.
 
 ## Changed Files
 
-- `src/rag/agent/question_contract.py`, `obligations.py`, `routing.py` — regulation/Gantt completion
-  contracts, evidence obligations, routing, and numeric compute-evidence requirement.
-- `src/rag/agent/investigator.py` — complete-answer guards, plain-user retry directives, normalized Gemini
-  history, bounded timeout, and generic fail-closed deterministic resolution.
-- `src/rag/extract/office.py` — week-header calibration and bar-to-week overlap extraction.
-- `tests/test_question_contract.py`, `test_obligations.py`, `test_routing.py`, `test_investigator.py`,
-  `test_pptx_gantt.py` — contract, transport, real-corpus, geometry, boundary, and ambiguity regressions.
-- `docs/ai/experiment_ledger.jsonl` — inconclusive and promoted experiment records.
+- `src/rag/tools/seating_chart.py` — occupant-relative right/left relations, multi-result name/seat
+  fields, authoritative population evidence, and closure metadata.
+- `src/rag/tools/corpus_aggregate.py`, `src/rag/tools/__init__.py` — canonical four-document roster
+  selection, role-bound name extraction, identity normalization, population union/count, and export.
+- `src/rag/agent/question_contract.py`, `src/rag/agent/investigator.py` — cross-aggregate recognition,
+  tool schemas/prompts, and deterministic fail-closed answer paths.
+- `scoring/test_seating_chart.py`, `scoring/test_corpus_aggregate.py`,
+  `tests/test_question_contract.py`, `tests/test_investigator.py` — perspective, closure, routing,
+  deterministic-answer, and existing opposite-seat regression coverage.
+- `artifacts/gold_100_review.{csv,md}`, `docs/gold_offline_history.jsonl`,
+  `docs/ai/experiment_ledger.jsonl` — full-run review, history, and promoted experiment evidence.
 
 ## Verification
 
-- Focused idx51/78 cycle 7: 2 match / 0 wrong / 0 abstain; both `Perfect`.
-- Full gold-offline reconciled: match 23 / wrong 6 / abstain 71; baseline match→wrong 0.
-- Full pytest: 762 passed, 7 non-fatal openpyxl WMF warnings.
-- Focused suite after final fix: 113 passed.
-- Python compile check (`src`, `scoring`, `tests`, `backend`): PASS.
-- `git diff --check`: PASS.
+- Focused live cycle 1: idx44=`鈴木、藤田`, idx86=`19`; 2 match / 0 wrong / 0 abstain / cost $0.
+- Full `gold_offline`: 21 match / 6 wrong / 73 abstain; required match≥18 and wrong≤13 passed.
+- SOT-2511 reconciled baseline comparison: existing match→wrong = 0.
+- Existing enum-set matches idx19 and idx26 remain matches; idx44 improved from wrong to match;
+  current enum-set class is 3 match / 0 wrong / 6 abstain.
+- Full pytest: 766 passed, 8 non-fatal openpyxl WMF warnings.
+- Python compile check (`src`, `scoring`, `backend`, `tests`): PASS.
+- Import/real-corpus closure smoke: 19 people from 40 canonical files, no missing/unreadable source.
+- `git diff --check` excluding the generated CRLF CSV: PASS; generated CSV reviewed separately.
 - npm lint/typecheck/test/e2e: N/A (Python repository; no `package.json`).
 
-## Acceptance
+## Acceptance Criteria
 
-- [x] idx78 and idx51 are both focused matches.
+- [x] idx44 and idx86 both match in one focused cycle (within the three-cycle cap).
 - [x] Full gold-offline meets match≥18, wrong≤13, and baseline match→wrong=0.
-- [x] Week-grid boundary and ambiguity tests pass.
-- [x] Ledger attribution is promoted and no corpus answer value is hard-coded.
+- [x] Both pre-existing enum-set matches are preserved.
+- [x] Seat-orientation, opposite-seat non-regression, roster population, and closure tests pass.
+- [x] The promoted experiment ledger records the evaluated axis and evidence.
+- [x] No issue-specific answer branch or corpus answer value was hard-coded; incomplete closure abstains.
+
+## Remaining Issues
+
+None for SOT-2510. Unrelated full-suite abstentions and six pre-existing wrong answers remain outside
+this issue's scope and are explicitly preserved in the generated review artifact.
 
 ## Linear Report: POSTED
 

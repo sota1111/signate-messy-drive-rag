@@ -32,6 +32,8 @@ def test_canonical_relation_maps_noisy_wording():
     assert sc.canonical_relation("となりの席") == "adjacent"
     assert sc.canonical_relation("隣に座っている方") == "adjacent"
     assert sc.canonical_relation("同じ列の人") == "same_column"
+    assert sc.canonical_relation("佐藤さんから見て右側") == "right_side"
+    assert sc.canonical_relation("左手に座っている人") == "left_side"
     assert sc.canonical_relation("契約金額はいくら") is None
     assert sc.canonical_relation(None) is None
 
@@ -102,6 +104,18 @@ def test_spatial_adjacent_and_same_column():
     # 井上(POD2, row1,col1): 隣(同行隣列) = 斎藤(7104); 同列(対面) = 伊藤(7102)
     assert sc.seating_lookup(name="井上", relation="隣")["value"] == "7104"
     assert sc.seating_lookup(name="井上", relation="同じ列")["value"] == "7102"
+
+
+@_needs_corpus
+def test_idx44_occupant_relative_right_left_and_opposite_frame():
+    right = sc.seating_lookup(name="佐藤さん", relation="右側", field="name")
+    assert right["value"] == ["鈴木", "藤田"]
+    assert right["method"]["field"] == "name"
+    assert right["evidence"]["closure"]["enumeration_count"] == 2
+    assert right["evidence"]["closure"]["aggregate_count"] == 2
+    assert sc.seating_lookup(name="佐藤", relation="左側", field="name")["value"] == ["池田", "藤田"]
+    # The separately reviewed face-to-face pairing remains stable (idx58 non-regression).
+    assert sc.seating_lookup(name="井上", relation="向かい")["value"] == "7102"
 
 
 @_needs_corpus

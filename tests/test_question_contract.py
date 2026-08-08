@@ -94,6 +94,13 @@ def test_classification_is_deterministic() -> None:
     assert classify(q).contract == classify(q).contract == CROSS_AGGREGATE
 
 
+def test_four_document_staff_population_is_cross_aggregate() -> None:
+    q = "各案件のPP・契約書・PLAN・FRにおいて、DA側の実施体制として役割付きで記載されている人物は全部で何人ですか。"
+    result = classify(q)
+    assert result.contract == CROSS_AGGREGATE
+    assert qc.is_staff_population_question(q)
+
+
 def test_idx30_quantity_contract_pins_denominator_unit_and_rounding() -> None:
     q = ("青葉与信マネジメントの分析対象データにおいて、標準化されたloan_amntが0未満の行のうち、"
          "purpose=credit_cardに該当し、かつloan_amntがpurpose=credit_card全体の平均を上回る行の"

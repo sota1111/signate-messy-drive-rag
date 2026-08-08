@@ -90,16 +90,20 @@ SYSTEM_PROMPT = (
     "5. 旧版(old版)と最新版の比較・変更点を問う質問は、grepで手作業比較せず version_diff ツールに質問文を"
     "そのまま渡す。決定論の構造diffが『変更前 → 変更後』を返すので、その value をそのまま回答にする。value が"
     "null のときのみ他手段(grep等)を検討する。\n"
-    "6a. 内線番号/EXT/座席/『向かい・隣・同じ列』を問う質問は seating_lookup ツールを使う(座席表は画像1枚で"
+    "6a. 内線番号/EXT/座席/『向かい・隣・同じ列・Xから見て右側/左側』を問う質問は seating_lookup "
+    "ツールを使う(座席表は画像1枚で"
     "grep/office抽出では読めない)。多段(案件→担当者→内線)では先に担当者の氏名を他ツールで特定し、その氏名を"
-    "seating_lookup(name=…)に渡す。『Aさんの向かいの人のEXT』は seating_lookup(name='A', relation='向かい')。\n"
+    "seating_lookup(name=…)に渡す。『Aさんの向かいの人のEXT』は seating_lookup(name='A', relation='向かい')。"
+    "『Aさんから見て右側の人の名前をすべて』は seating_lookup(name='A', relation='右側', field='name')。\n"
     "6b. 『全体で/横断で/全案件で/最も〜な案件・人』のように複数案件をまたいで集計・比較する質問は"
     "corpus_aggregate ツールを使う(単一案件の compute では同名ファイルが複数で解けない)。例: 『最も多く案件に"
     "関わる人』=corpus_aggregate(metric='staff', op='count') の top、『着手金が最も高い案件』="
     "corpus_aggregate(metric='deposit', op='max')、『固定金額契約で1行あたり契約金額が最も高い案件』="
     "corpus_aggregate(metric='amount_per_row', op='max', fixed_only=true, round_up=true)、『契約期間が"
     "2025-08-15〜09-07 に重なり40日超の案件を主略称で』=corpus_aggregate(metric='period_days', op='filter', "
-    "overlap_start='2025-08-15', overlap_end='2025-09-07', min_days=40)。案件特定後の多段(その案件の担当者→"
+    "overlap_start='2025-08-15', overlap_end='2025-09-07', min_days=40)、『全案件のPP・契約書・PLAN・FRに"
+    "役割付きで記載されたDA人物のユニオン人数』=corpus_aggregate(metric='staff_population', op='count')。"
+    "案件特定後の多段(その案件の担当者→"
     "内線 等)は返り値 staff(ES/PM…)の氏名を seating_lookup に渡して解決する。\n"
     "6c. グラフの数値を問う場合は read_chart_values を必ず使う。系列/列名を column に、ヒストグラムの"
     "最多カウントなら operation='histogram_max_count' を渡す。numCacheが無い画像グラフも元データ列から"
@@ -414,26 +418,31 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
         ),
         AgentTool(
             "seating_lookup",
-            "座席表(フロアマップ)から 氏名⇄内線(EXT)⇄座席 を引く。内線/EXT/座席/『向かい・隣・同じ列』を"
+            "座席表(フロアマップ)から 氏名⇄内線(EXT)⇄座席 を引く。内線/EXT/座席/『向かい・隣・同じ列・"
+            "Xから見て右側/左側』を"
             "問う質問に使う(座席図は画像1枚で他ツールでは読めない)。name=氏名(『〜さん』可)を渡すとその人の"
             "EXTを返す。relation に『向かい/隣/同じ列/同じ行』を渡すとその隣人のEXTを返す(例: 井上さんの"
-            "向かいの人のEXT)。ext=内線から人物を、role=役割(Exec/PM/DS/BA/DE/QA)+pod で EXT を引くこともできる。"
+            "向かいの人のEXT)。右側/左側は着席向き基準の複数候補を返す。名前が必要なら field='name'、"
+            "座席レコードなら field='seat'、既定は field='ext'。ext=内線から人物を、"
+            "role=役割(Exec/PM/DS/BA/DE/QA)+pod で EXT を引くこともできる。"
             "多段質問(案件→担当者→内線)では、先に担当者の氏名を他ツールで特定し、その氏名を name で渡す。"
             "該当なし/曖昧なときは value=null(棄権)を返す。",
-            _obj({"name": _STR, "ext": _STR, "role": _STR, "relation": _STR, "pod": _NUM}),
-            lambda name=None, ext=None, role=None, relation=None, pod=None: seating_lookup(
+            _obj({"name": _STR, "ext": _STR, "role": _STR, "relation": _STR, "pod": _NUM,
+                  "field": _STR}),
+            lambda name=None, ext=None, role=None, relation=None, pod=None, field="ext": seating_lookup(
                 name=name, ext=ext, role=role, relation=relation,
-                pod=int(pod) if isinstance(pod, (int, float)) else None),
+                pod=int(pod) if isinstance(pod, (int, float)) else None, field=field),
         ),
         AgentTool(
             "corpus_aggregate",
             "全プロジェクトを横断して契約情報を集約する決定論ツール。単一案件のcompute/read_officeでは"
             "解けない『全体で/横断で/最も〜な案件・人』を扱う(train.xlsx/契約書は案件ごとに同名複数のため)。"
             "metric: contract_amount(契約金額税込)/deposit(着手金税込)/train_rows(学習データ行数)/"
-            "amount_per_row(契約金額税込÷train行数)/period_days(契約期間日数)/staff(乙=データアステル担当者)。"
+            "amount_per_row(契約金額税込÷train行数)/period_days(契約期間日数)/staff(契約書の乙担当者)/"
+            "staff_population(PP・契約書・PLAN・FR×全案件の役割付きDA人物union)。"
             "op: max/min(数値metricの極値案件を主略称abbrev+valueで返す。staff情報も同梱するので『最大案件のES』は"
             "その staff.ES を seating_lookup(name=…) に渡す)/count(staffの案件横断出現回数→最頻top=『最も多く"
-            "案件に関わる人』)/filter(契約期間フィルタ)/list。"
+            "案件に関わる人』、staff_population は count で閉包済み人数+人物union)/filter(契約期間フィルタ)/list。"
             "固定金額契約に絞るときは fixed_only=true。円単位で切り上げるときは round_up=true。"
             "契約期間フィルタは overlap_start/overlap_end(YYYY-MM-DD)で重なる案件、min_days でその日数超"
             "(『40日を超える』→min_days=40)に絞り、主略称の配列を返す。値は決定論(推測なし)、"
@@ -509,6 +518,65 @@ def _normalized_activity(text: str) -> str:
     from src.rag.corpus import nfc
 
     return re.sub(r"[^0-9A-Za-z\u3040-\u30ff\u3400-\u9fff]+", "", nfc(text)).replace("の", "")
+
+
+def _closure_satisfied(evidence: Mapping[str, Any]) -> bool:
+    """Validate the four machine-readable closure conditions shared by enum/count fast paths."""
+    closure = evidence.get("closure")
+    return bool(
+        isinstance(closure, Mapping)
+        and closure.get("authoritative_population_resolved")
+        and closure.get("inclusion_exclusion_recorded")
+        and not closure.get("second_path_novel_candidates")
+        and closure.get("enumeration_count") == closure.get("aggregate_count")
+    )
+
+
+def _deterministic_seating_side_answer(question: str) -> Answer | None:
+    """Resolve occupant-relative left/right name enumerations from the hash-pinned seat frame."""
+    if not (re.search(r"(?:右側|右手|左側|左手)", question)
+            and re.search(r"名前|人物|人", question)
+            and re.search(r"すべて|全て|全部", question)):
+        return None
+    subject = re.search(r"([一-龯々]{1,6})(?:さん|氏|様)?から見て", question)
+    relation = re.search(r"(右側|右手|左側|左手)", question)
+    if not subject or not relation:
+        return None
+    result = seating_lookup(name=subject.group(1), relation=relation.group(1), field="name")
+    if not _contract.is_contract(result) or not _closure_satisfied(result.get("evidence") or {}):
+        return None
+    values = result.get("value")
+    if not isinstance(values, list) or not values or not all(isinstance(v, str) for v in values):
+        return None
+    evidence = result["evidence"]
+    return Answer(
+        answer="、".join(values), confidence=1.0,
+        evidence=(f"{evidence.get('file')} pixel_sha={evidence.get('pixel_sha')} / "
+                  f"subject={subject.group(1)} / relation={relation.group(1)} / "
+                  f"closure={len(values)}件一致"),
+        method="pixel-hash pin済み座席アンカーを着席者の向きフレームへ変換し、右左半平面を完全列挙",
+    )
+
+
+def _deterministic_staff_population_answer(question: str) -> Answer | None:
+    """Count the closed union of role-bound DA people across canonical PP/contract/PLAN/FR files."""
+    from src.rag.agent import question_contract as _question_contract
+
+    if not _question_contract.is_staff_population_question(question):
+        return None
+    result = corpus_aggregate("staff_population", op="count")
+    if not _contract.is_contract(result) or not _closure_satisfied(result.get("evidence") or {}):
+        return None
+    value = result.get("value")
+    if not isinstance(value, Mapping) or not isinstance(value.get("count"), int):
+        return None
+    evidence = result["evidence"]
+    return Answer(
+        answer=str(value["count"]), confidence=1.0,
+        evidence=(f"PP/契約書/PLAN/FR canonical files={len(evidence.get('selected_files') or [])}; "
+                  f"projects={len(evidence.get('projects') or [])}; union={value['count']}"),
+        method="全案件×4文書型の正本列挙→役割付きDA人物抽出→表記正規化・重複解決→列挙件数と集計件数照合",
+    )
 
 
 def _deterministic_gantt_answer(question: str, profile: CorpusProfile) -> Answer | None:
@@ -1085,7 +1153,13 @@ def answer_question(question: str, *, model: str | None = None,
         started = time.monotonic()
         deterministic: Answer | None = None
         deterministic_tools: list[str] = []
-        if contract == "chart_read" and _question_contract.is_gantt_week_question(question):
+        deterministic = _deterministic_seating_side_answer(question)
+        if deterministic is not None:
+            deterministic_tools = ["seating_lookup", "enumeration_closure"]
+        elif _question_contract.is_staff_population_question(question):
+            deterministic = _deterministic_staff_population_answer(question)
+            deterministic_tools = ["corpus_aggregate", "enumeration_closure"]
+        elif contract == "chart_read" and _question_contract.is_gantt_week_question(question):
             deterministic = _deterministic_gantt_answer(question, profile_obj)
             deterministic_tools = ["canonical_route", "find_files", "read_office"]
         elif (contract == "simple_lookup"

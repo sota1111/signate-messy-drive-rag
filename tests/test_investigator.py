@@ -438,6 +438,23 @@ def test_real_focused_questions_resolve_deterministically_without_hardcoded_valu
     assert "30分単位" in regulation.answer and "月次" in regulation.answer and "上限なし" in regulation.answer
 
 
+def test_idx44_and_idx86_use_closed_deterministic_paths_without_gemini(monkeypatch):
+    from src.rag import corpus
+
+    if not corpus.walk():
+        pytest.skip("corpus not present")
+    monkeypatch.setattr(inv, "gemini_model_factory", lambda *_a, **_k: pytest.fail("Gemini not needed"))
+    seating = inv.answer_question(
+        "IMにあるFMにおいて、佐藤さんから見て右側に座っている人の名前をすべて挙げてください。")
+    staff = inv.answer_question(
+        "各案件のPP・契約書・PLAN・FRにおいて、DA側の実施体制として役割付きで記載されている人物は全部で何人ですか。")
+    assert seating.answer.answer == "鈴木、藤田"
+    assert seating.contract == "full_enumeration" and seating.model == "deterministic"
+    assert staff.answer.answer == "19"
+    assert staff.contract == "cross_aggregate" and staff.model == "deterministic"
+    assert seating.usage.total_tokens == staff.usage.total_tokens == 0
+
+
 # --------------------------------------------------------------------------- batch loop (acceptance)
 def _factory_for(answers: dict[str, str]):
     """A model factory that answers each question in one turn via submit_answer."""
