@@ -17,10 +17,12 @@ from src.rag.agent import abstain_ledger as al
 from src.rag.agent.investigator import (
     ABSTAIN,
     SUBMIT_ANSWER,
+    Answer,
     AgentTool,
     Call,
     Step,
     Usage,
+    _budget_boundary_directive,
     investigate,
     is_abstain,
 )
@@ -223,3 +225,105 @@ def test_classify_research_terminal_precedence():
     assert al.classify(s) == al.UNANSWERABLE
     # empty terminal → unchanged legacy behaviour (nothing succeeded → NOT_RETRIEVED)
     assert al.classify(al.AbstainSignals()) == al.NOT_RETRIEVED
+
+
+# --------------------------------------------------------------------------- SOT-2524 budget-boundary hook
+def _call(name, **args):
+    """A model step that invokes one non-terminal tool (burns a turn without committing/abstaining)."""
+    return Step(function_calls=(Call(name, args),), usage=Usage(2, 2))
+
+
+def _inert_tool(name="chunk_search"):
+    """A tool whose name is absent from ``_TOOL_KINDS`` so its result discharges no obligation kind."""
+    return _tool(name, {"hits": []})
+
+
+def test_review_at_boundary_tags_round():
+    """SOT-2524: a boundary-triggered review tags its round so the ledger can attribute it."""
+    d = ResearchDirector("q", decompose=_decompose_two)
+    assert d.review(at_boundary=True) is not None
+    assert d.rounds[0].boundary is True
+    assert d.rounds[0].to_dict()["boundary"] is True
+    # a plain (deliberate-abstain) review stays untagged
+    d2 = ResearchDirector("q", decompose=_decompose_two)
+    d2.review()
+    assert d2.rounds[0].boundary is False
+
+
+def test_budget_boundary_directive_helper_gating():
+    """The helper only asks the director when enabled, active, and the pending answer is an abstain."""
+    d = ResearchDirector("q", decompose=_decompose_two)
+    abstain = Answer(answer=ABSTAIN, confidence=0.0)
+    committed = Answer(answer="42", confidence=0.7)
+    assert _budget_boundary_directive(None, True, [], abstain) is None          # no director
+    assert _budget_boundary_directive(d, False, [], abstain) is None            # disabled
+    assert _budget_boundary_directive(d, True, [], committed) is None           # not an abstain
+    assert not d.rounds                                                         # none of the above searched
+    directive = _budget_boundary_directive(d, True, ["chunk_search"], abstain)  # enabled + abstain + unmet
+    assert directive is not None
+    assert d.rounds and d.rounds[0].boundary is True
+
+
+def test_budget_boundary_hook_researches_at_max_turns_then_answers():
+    """A model that wanders out of turns (never a deliberate abstain) still gets one bounded re-search
+    push at the max_turns boundary, and a grounded answer found there is committed."""
+    import src.rag.agent.research_loop as rlmod
+    from unittest import mock
+
+    def fake_director(question, **kw):
+        return ResearchDirector(question, budget=kw.get("budget"), decompose=_decompose_two)
+
+    with mock.patch.object(rlmod, "ResearchDirector", fake_director):
+        model = ScriptedModel([
+            _call("chunk_search"), _call("chunk_search"), _call("chunk_search"),  # burn all 3 turns
+            _submit("契約書は総務部フォルダにあります", confidence=0.8, evidence="find_files"),
+        ])
+        res = investigate(model, "q", [_inert_tool()], max_turns=3,
+                          research={"max_rounds": 2}, budget_boundary=True)
+    assert res.stop_reason == "answered"
+    assert res.answer.answer == "契約書は総務部フォルダにあります"
+    delivered = [tr for turn in model.calls_seen if turn for tr in turn]
+    assert any(tr.name == SUBMIT_ANSWER and isinstance(tr.response, dict)
+               and tr.response.get("abstain_rejected") for tr in delivered)
+
+
+def test_budget_boundary_disabled_finalizes_abstain_at_max_turns():
+    """Non-regression: with the hook off (default), max_turns exhaustion finalizes the abstain in exactly
+    max_turns model turns — no boundary directive, byte-identical to the pre-hook loop."""
+    model = ScriptedModel([_call("chunk_search")] * 3 + [_submit("late")])
+    res = investigate(model, "q", [_inert_tool()], max_turns=3, research=True)  # budget_boundary defaults off
+    assert res.stop_reason == "max_turns"
+    assert is_abstain(res.answer.answer)
+    assert len(model.calls_seen) == 3
+
+
+def test_budget_boundary_hook_inert_without_research():
+    """The hook is a no-op when the re-search director is off: no directive, plain max_turns abstain."""
+    model = ScriptedModel([_call("chunk_search")] * 3 + [_submit("late")])
+    res = investigate(model, "q", [_inert_tool()], max_turns=3, budget_boundary=True)  # research off
+    assert res.stop_reason == "max_turns"
+    assert is_abstain(res.answer.answer)
+    assert len(model.calls_seen) == 3
+
+
+def test_budget_boundary_records_boundary_round_in_ledger(tmp_path: Path):
+    """A boundary re-search that still fails records a boundary-tagged round and a coded abstain."""
+    import src.rag.agent.research_loop as rlmod
+    from unittest import mock
+
+    ledger = tmp_path / "abstain.jsonl"
+
+    def fake_director(question, **kw):
+        return ResearchDirector(question, budget=kw.get("budget"), decompose=_decompose_two)
+
+    with mock.patch.object(rlmod, "ResearchDirector", fake_director):
+        model = ScriptedModel([_call("chunk_search")] * 3 + [_submit(ABSTAIN)] * 4)
+        res = investigate(model, "q", [_inert_tool()], max_turns=3, ledger=str(ledger),
+                          research={"max_rounds": 2}, budget_boundary=True)
+    assert is_abstain(res.answer.answer)
+    rec = json.loads(ledger.read_text(encoding="utf-8").strip())
+    al.validate(rec)
+    assert rec["research"], "the boundary re-search must be recorded on the abstain"
+    assert any(r.get("boundary") for r in rec["research"]), "a round must be attributed to the boundary hook"
+    assert rec["research_terminal"] in ("budget", "unanswerable")
+    assert rec["state_code"] in (al.BUDGET_EXHAUSTED, al.UNANSWERABLE)

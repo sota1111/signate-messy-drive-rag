@@ -89,6 +89,19 @@ FIRST_MOVE_ROUTING = _bool_env("RAG_FIRST_MOVE_ROUTING", False)
 # SOT-2527 run before any default flip.
 UNANSWERABLE_FALLBACK = _bool_env("RAG_UNANSWERABLE_FALLBACK", False)
 
+# SOT-2524 — whether :func:`answer_question` wires the budget-exhaustion boundary hook (see
+# :func:`investigate`'s ``budget_boundary``). The obligation-driven local re-search director (SOT-2502)
+# already fires on a *deliberate* abstain, but the dominant BUDGET_EXHAUSTED cause is the non-deliberate
+# boundary — the model wanders through tools until ``max_turns``/``timeout_s`` is reached without ever
+# committing or abstaining, so the director never runs. This hook gives it a bounded last push at the
+# still-unmet obligations *at that boundary*, before the abstain is finalized. **Default ON**: it only
+# extends the already-default-ON director to where most BUDGET abstains actually land, and it is EV-safe
+# (the commit threshold is untouched — it only turns a would-be BUDGET abstain into either a grounded
+# answer or a coded, history-bearing abstain). Set ``RAG_BUDGET_BOUNDARY_RESEARCH=0`` to restore the
+# pre-hook boundary (abstain finalized immediately). Bounded by the director's ``max_rounds`` and by the
+# existing ``timeout_s`` (a timeout-triggered boundary adds no model turns — it only records terminal).
+BUDGET_BOUNDARY_RESEARCH = _bool_env("RAG_BUDGET_BOUNDARY_RESEARCH", True)
+
 # Vertex Gemini list price (USD per 1M tokens), (input, output) — estimates for cost bookkeeping only.
 PRICING: dict[str, tuple[float, float]] = {
     "gemini-2.5-pro": (1.25, 10.0),
@@ -596,6 +609,24 @@ def _first_move_useful(out: Any) -> bool:
     return out not in (None, "")
 
 
+def _budget_boundary_directive(director: Any, enabled: bool, tool_calls: Sequence[str],
+                               answer: "Answer") -> str | None:
+    """SOT-2524 — the re-search directive to emit at the max_turns budget boundary, or ``None`` to finalize.
+
+    Returns ``None`` (finalize the abstain unchanged) when the boundary hook is disabled, no re-search
+    director is active, or the pending answer is already a commit. Otherwise it asks the director — using
+    the evidence it has already folded in via :meth:`ResearchDirector.observe` over the run's tool
+    results — for the next targeted directive; the director returns one (keep searching) or ``None`` after
+    recording its terminal (:data:`BUDGET`/:data:`UNANSWERABLE`) for the abstain ledger. It never inspects
+    or changes the commit threshold — it only grows *search* at the boundary.
+    """
+    if not (enabled and director is not None and is_abstain(answer.answer)):
+        return None
+    evidence = " ".join(t for t in (answer.evidence, answer.method) if t).strip()
+    non_submit = sum(1 for c in tool_calls if c != SUBMIT_ANSWER)
+    return director.review(evidence, non_submit, at_boundary=True)
+
+
 def _first_move_directive(name: str, out: Any) -> str:
     """The seed user-message describing a deterministic first-move result (SOT-2521).
 
@@ -807,7 +838,8 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 enumeration: "bool | Mapping[str, Any] | object | None" = None,
                 contract: "str | None" = None,
                 first_move: "tuple[str, Mapping[str, Any]] | None" = None,
-                fallback: "object | None" = None) -> Investigation:
+                fallback: "object | None" = None,
+                budget_boundary: bool = False) -> Investigation:
     """Drive ``model`` through tool-calling until it submits a structured answer.
 
     The loop ends on the first of: the model calls ``submit_answer`` (→ ``answered``); ``max_turns`` is
@@ -880,6 +912,16 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     tool reaches nothing, the abstain stands unchanged (従来の安全動作を維持). It is one-shot so a still-
     abstaining model cannot loop, and injects no corpus fact, so the answer path is byte-identical when it
     is ``None`` (default). The gate is built in :func:`answer_question` behind ``RAG_UNANSWERABLE_FALLBACK``.
+
+    ``budget_boundary`` (SOT-2524) enables the budget-exhaustion boundary hook, effective only together
+    with ``research``. Without it the re-search director fires solely on a *deliberate* abstain; with it,
+    when the loop is about to finalize a non-committed abstain because ``max_turns`` (or ``timeout_s``)
+    was reached, the director gets a bounded last push at the still-unmet obligations: it emits one
+    targeted re-search directive and up to ``budget.max_rounds`` extra model turns are granted to answer
+    it — still inside ``timeout_s`` (so a timeout-triggered boundary grants no turns and only records the
+    director's terminal). The commit threshold is untouched, so it only turns a would-be BUDGET abstain
+    into either a grounded answer or a coded, history-bearing abstain. ``False`` by default so existing
+    callers are byte-identical; :func:`answer_question` wires it from ``RAG_BUDGET_BOUNDARY_RESEARCH``.
     """
     record_enabled = ledger not in (None, False)
     if record_enabled:
@@ -951,7 +993,33 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 iterations += 1
                 responses = [ToolResponse(DIRECTIVE_MESSAGE, _first_move_directive(fm_name, fm_out))]
 
-    for _turn in range(max_turns):
+    # SOT-2524 — the model-turn cap is a mutable `turn_limit` (not a fixed range) so the budget-exhaustion
+    # boundary hook can grant a bounded number of extra turns exactly once, when the cap is reached without
+    # a committed answer. Each granted turn still passes the wall-clock check below, so a boundary that is
+    # simultaneously past `timeout_s` runs no extra turn.
+    turn = 0
+    turn_limit = max_turns
+    boundary_tried = False
+    submitted = False
+    while True:
+        if turn >= turn_limit:
+            # Turn budget exhausted. Give the re-search director one bounded targeted push at the still-
+            # unmet obligations before finalizing the abstain; on a directive, extend the turn budget by
+            # the director's max_rounds and run the re-search through the same commit gate below.
+            if boundary_tried or submitted:
+                break
+            boundary_tried = True
+            boundary_directive = _budget_boundary_directive(
+                director, budget_boundary, tool_calls, answer)
+            if boundary_directive is None:
+                break
+            responses = [ToolResponse(SUBMIT_ANSWER, {
+                "abstain_rejected": True,
+                "reason": "反復上限に達しました。棄権を確定する前に、未充足の証拠義務『だけ』を局所再探索してください。",
+                "directive": boundary_directive,
+            })]
+            turn_limit += director.budget.max_rounds
+        turn += 1
         if clock() - start > timeout_s:
             stop_reason = "timeout"
             error = f"timeout_s={timeout_s} exceeded"
@@ -1256,7 +1324,7 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
             iterations += 1
         if submitted:
             break
-    else:
+    if not submitted and stop_reason == "max_turns":
         error = error or f"max_turns={max_turns} reached without a final answer"
 
     model_name = getattr(model, "model_name", settings.GEN_MODEL_HARD)
@@ -1422,7 +1490,10 @@ def answer_question(question: str, *, model: str | None = None,
     is likewise **on by default** so every committed numeric answer records its typed calculation証跡
     (``artifacts/calc_ledger.jsonl``). The obligation-driven local re-search loop (SOT-2502) is **on by
     default** so a deliberate abstain re-searches its unmet evidence obligations before it is accepted
-    (即棄権が構造上不可能). The full-enumeration closure protocol (SOT-2500) is **on by default** so a
+    (即棄権が構造上不可能). The budget-exhaustion boundary hook (SOT-2524) is likewise **on by default**
+    (``RAG_BUDGET_BOUNDARY_RESEARCH``) so that re-search also fires at the ``max_turns``/``timeout``
+    boundary — where the model wandered out of turns without ever deliberately abstaining, the dominant
+    BUDGET_EXHAUSTED cause. The full-enumeration closure protocol (SOT-2500) is **on by default** so a
     ``full_enumeration`` question proves its completeness (権威的母集団の特定 + 閉包条件) before it may
     abstain. Pass ``ledger``/``calc_ledger``/``research``/``enumeration`` ``=False``/``None`` to disable,
     or a path (ledgers) / budget mapping (research) to configure.
@@ -1506,4 +1577,4 @@ def answer_question(question: str, *, model: str | None = None,
     return investigate(model_obj, question, tools, max_turns=max_turns, timeout_s=timeout_s,
                        ledger=ledger, calc_ledger=calc_ledger, research=research,
                        enumeration=enumeration, contract=contract, first_move=first_move,
-                       fallback=fallback)
+                       fallback=fallback, budget_boundary=BUDGET_BOUNDARY_RESEARCH)
