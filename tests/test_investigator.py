@@ -685,3 +685,142 @@ def test_gemini_model_normalizes_missing_candidate_role(monkeypatch):
 
     assert step.final_text == "done"
     assert model._contents[-1].role == "model"
+
+
+# --------------------------------------------------------------------------- SOT-2523 adaptive budget
+def _stub_investigate_capturing(monkeypatch, captured):
+    """Replace ``inv.investigate`` with a stub that records the budget it was handed and returns an
+    abstain Investigation, so ``answer_question``'s budget adaptation can be asserted offline."""
+    def fake_investigate(model, question, tools, **kw):
+        captured["max_turns"] = kw.get("max_turns")
+        captured["timeout_s"] = kw.get("timeout_s")
+        return Investigation(
+            question=question, answer=Answer(ABSTAIN, 0.0), iterations=0, tool_calls=[],
+            usage=Usage(), model="stub", elapsed_s=0.0, stop_reason="answered",
+            contract=kw.get("contract"))
+    monkeypatch.setattr(inv, "investigate", fake_investigate)
+    monkeypatch.setattr(inv, "gemini_model_factory", lambda *a, **k: object())
+
+
+def _force_contract(monkeypatch, contract):
+    from src.rag.agent import routing as _routing
+    monkeypatch.setattr(_routing, "classify_for_routing",
+                        lambda q, flash=None: SimpleNamespace(contract=contract))
+    monkeypatch.setattr(_routing, "routed_system_prompt", lambda base, qc, q: base)
+
+
+@pytest.mark.parametrize("contract", ["numeric", "multi_hop", "cross_aggregate", "full_enumeration"])
+def test_multistage_contract_lifts_budget(monkeypatch, contract):
+    captured = {}
+    _stub_investigate_capturing(monkeypatch, captured)
+    _force_contract(monkeypatch, contract)
+    inv.answer_question("この案件の集計に関する多段の質問です")
+    assert captured["max_turns"] == inv.ADAPTIVE_MAX_TURNS == 18
+    assert captured["timeout_s"] == inv.ADAPTIVE_TIMEOUT_S == 240.0
+
+
+@pytest.mark.parametrize("contract", ["simple_lookup", "spatial", "format_check", "version_diff"])
+def test_single_stage_contract_keeps_flat_budget(monkeypatch, contract):
+    captured = {}
+    _stub_investigate_capturing(monkeypatch, captured)
+    _force_contract(monkeypatch, contract)
+    inv.answer_question("ある値を1つ引くだけの単純な質問です")
+    assert captured["max_turns"] == inv.DEFAULT_MAX_TURNS == 12
+    assert captured["timeout_s"] == inv.DEFAULT_TIMEOUT_S == 180.0
+
+
+def test_multistage_ratio_composes_with_lift(monkeypatch):
+    captured = {}
+    _stub_investigate_capturing(monkeypatch, captured)
+    _force_contract(monkeypatch, "numeric")
+    from src.rag.agent import question_contract as _qc
+    monkeypatch.setattr(_qc, "numeric_requirements",
+                        lambda q: SimpleNamespace(ratio=True))
+    inv.answer_question("AのうちBの割合は何%ですか")
+    # 12 -> 18 (multi-stage) -> +4 (ratio needs separate num/denom + validation) = 22, bounded.
+    assert captured["max_turns"] == inv.ADAPTIVE_MAX_TURNS + 4 == 22
+    assert captured["timeout_s"] == inv.ADAPTIVE_TIMEOUT_S == 240.0
+
+
+def test_adaptive_budget_env_off_restores_flat_budget(monkeypatch):
+    captured = {}
+    _stub_investigate_capturing(monkeypatch, captured)
+    _force_contract(monkeypatch, "cross_aggregate")
+    monkeypatch.setattr(inv, "ADAPTIVE_BUDGET", False)
+    inv.answer_question("全案件を横断した集計の質問です")
+    assert captured["max_turns"] == 12 and captured["timeout_s"] == 180.0
+
+
+def test_explicit_caller_budget_is_never_shrunk_or_lifted(monkeypatch):
+    captured = {}
+    _stub_investigate_capturing(monkeypatch, captured)
+    _force_contract(monkeypatch, "cross_aggregate")
+    # A caller that pins a non-default budget keeps it verbatim (adaptation only lifts the default).
+    inv.answer_question("全案件を横断した集計の質問です", max_turns=30, timeout_s=90.0)
+    assert captured["max_turns"] == 30 and captured["timeout_s"] == 90.0
+
+
+# --------------------------------------------------------------------------- SOT-2523 evidence cache
+def _counting_tool(sink, *, name="compute", result=None):
+    payload = result if result is not None else {"value": 20, "evidence": {}, "method": {}}
+
+    def fn(**kw):
+        sink.append(kw)
+        return payload
+    return AgentTool(name, "d", {"type": "object", "properties": {}}, fn)
+
+
+def test_evidence_cache_memoises_identical_tool_calls():
+    sink = []
+    tools = [_counting_tool(sink), inv.SUBMIT_ANSWER_TOOL]
+    args = {"file": "f", "expr": "df['b'].mean()"}
+    model = ScriptedModel([
+        Step(function_calls=(Call("compute", dict(args)),), usage=Usage(1, 1)),
+        Step(function_calls=(Call("compute", dict(args)),), usage=Usage(1, 1)),
+        _submit("平均は20です"),
+    ])
+    res = investigate(model, "…", tools, max_turns=6)
+    assert res.stop_reason == "answered"
+    # The identical second call is served from the intra-question cache: the tool ran exactly once,
+    # yet both tool rounds are still counted and both delivered the value to the model.
+    assert len(sink) == 1
+    assert res.tool_calls.count("compute") == 2 and res.iterations == 2
+
+
+def test_evidence_cache_distinguishes_different_args():
+    sink = []
+    tools = [_counting_tool(sink), inv.SUBMIT_ANSWER_TOOL]
+    model = ScriptedModel([
+        Step(function_calls=(Call("compute", {"file": "a"}),), usage=Usage(1, 1)),
+        Step(function_calls=(Call("compute", {"file": "b"}),), usage=Usage(1, 1)),
+        _submit("done"),
+    ])
+    investigate(model, "…", tools, max_turns=6)
+    assert len(sink) == 2  # different args are distinct cache keys → both execute
+
+
+def test_evidence_cache_never_caches_errors():
+    sink = []
+    tools = [_counting_tool(sink, result={"error": "boom"}), inv.SUBMIT_ANSWER_TOOL]
+    args = {"file": "f"}
+    model = ScriptedModel([
+        Step(function_calls=(Call("compute", dict(args)),), usage=Usage(1, 1)),
+        Step(function_calls=(Call("compute", dict(args)),), usage=Usage(1, 1)),
+        _submit("done"),
+    ])
+    investigate(model, "…", tools, max_turns=6)
+    assert len(sink) == 2  # an error result is retried, not cached
+
+
+def test_evidence_cache_env_off_reexecutes(monkeypatch):
+    monkeypatch.setattr(inv, "EVIDENCE_CACHE", False)
+    sink = []
+    tools = [_counting_tool(sink), inv.SUBMIT_ANSWER_TOOL]
+    args = {"file": "f", "expr": "x"}
+    model = ScriptedModel([
+        Step(function_calls=(Call("compute", dict(args)),), usage=Usage(1, 1)),
+        Step(function_calls=(Call("compute", dict(args)),), usage=Usage(1, 1)),
+        _submit("done"),
+    ])
+    investigate(model, "…", tools, max_turns=6)
+    assert len(sink) == 2  # cache disabled → identical call executes twice

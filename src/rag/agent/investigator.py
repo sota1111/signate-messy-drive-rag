@@ -28,6 +28,7 @@ this change is intentionally self-contained and leaves the green gate untouched.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -101,6 +102,34 @@ UNANSWERABLE_FALLBACK = _bool_env("RAG_UNANSWERABLE_FALLBACK", False)
 # pre-hook boundary (abstain finalized immediately). Bounded by the director's ``max_rounds`` and by the
 # existing ``timeout_s`` (a timeout-triggered boundary adds no model turns — it only records terminal).
 BUDGET_BOUNDARY_RESEARCH = _bool_env("RAG_BUDGET_BOUNDARY_RESEARCH", True)
+
+# SOT-2523 — the multi-stage contracts whose derivation runs through several bounded stages
+# (ファイル特定→復号→読込→計算→検証) and therefore most often exhausts the default 12-turn / 180s budget
+# (BUDGET_EXHAUSTED は棄権原因の最多). ``derived_calculation`` (→ ``numeric``/``multi_hop``), ``横断集計``
+# (→ ``cross_aggregate``) and ``enum_set`` (→ ``full_enumeration``) live here; single-stage 単純検索
+# (``simple_lookup``) と書式/座席/グラフ/版差分の専用決定論経路は据え置き(コスト線形増を避ける)。
+MULTISTAGE_CONTRACTS: frozenset[str] = frozenset({
+    "numeric", "multi_hop", "cross_aggregate", "full_enumeration",
+})
+# Bounded contract-adaptive budget for the multi-stage contracts above. Both are hard, finite upper
+# bounds (ハードコードの特定回答ではなく上限値のみ) and only lift the default — an explicit caller budget
+# is never shrunk, and the existing ratio (+4) / regulation・gantt (300s) adaptations still compose.
+ADAPTIVE_MAX_TURNS = 18           # 12 -> 18 for multi-stage derivations
+ADAPTIVE_TIMEOUT_S = 240.0        # 180 -> 240 for multi-stage derivations
+
+# SOT-2523 — whether :func:`answer_question` lifts the per-question budget for the multi-stage contracts
+# above. **Default ON**: it only *adds* bounded turns/time to the contracts that dominate BUDGET_EXHAUSTED
+# and can never make a previously-committed answer wrong (a question that already committed under 12 turns
+# is byte-identical; only a would-be budget abstain gets more room to reach a grounded answer). Set
+# ``RAG_ADAPTIVE_BUDGET=0`` to restore the flat 12/180 budget for every contract.
+ADAPTIVE_BUDGET = _bool_env("RAG_ADAPTIVE_BUDGET", True)
+
+# SOT-2523 — whether :func:`investigate` memoises deterministic tool evidence within one question (see the
+# intra-question ``evidence_cache`` below). **Default ON**: deterministic read/compute/decrypt tools return
+# the same value for the same args within a question, so re-issuing an identical call (common in multi-stage
+# 再導出) only wastes wall-clock re-deriving evidence already in hand. It is value-preserving (the model sees
+# the identical output, only faster) and caches nothing on error. Set ``RAG_EVIDENCE_CACHE=0`` to disable.
+EVIDENCE_CACHE = _bool_env("RAG_EVIDENCE_CACHE", True)
 
 # Vertex Gemini list price (USD per 1M tokens), (input, output) — estimates for cost bookkeeping only.
 PRICING: dict[str, tuple[float, float]] = {
@@ -954,6 +983,31 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
         enum_gate = None
 
     by_name = {t.name: t for t in tools}
+
+    # SOT-2523 — intra-question evidence cache. Deterministic read/compute/decrypt tools return the same
+    # value for identical args within one question, so re-issuing an identical call (特定→復号→読込→計算→
+    # 検証 の多段でよく起きる再導出) only burns wall-clock re-deriving evidence already in hand. Memoise
+    # (tool, canonical-args) → output for THIS question only; the map dies with the loop (1問スコープ),
+    # values are captured from real tool outputs at runtime (特定回答の埋め込みなし), and errors are never
+    # cached so a transient failure can still be retried. Value-preserving: the model sees the identical
+    # output, only faster — every observe/iteration/ledger path around the call runs unchanged.
+    evidence_cache: dict[str, Any] = {}
+
+    def cached_dispatch(name: str, args: Mapping[str, Any] | None) -> Any:
+        if not EVIDENCE_CACHE:
+            return dispatch(by_name, name, args)
+        try:
+            key = name + "\x00" + json.dumps(args or {}, sort_keys=True,
+                                             ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return dispatch(by_name, name, args)  # unserialisable args → skip the cache
+        if key in evidence_cache:
+            return evidence_cache[key]
+        out = dispatch(by_name, name, args)
+        if not (isinstance(out, Mapping) and "error" in out):
+            evidence_cache[key] = out
+        return out
+
     usage = Usage()
     tool_calls: list[str] = []
     iterations = 0
@@ -978,7 +1032,7 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     if first_move is not None:
         fm_name, fm_args = first_move
         if fm_name in by_name:
-            fm_out = dispatch(by_name, fm_name, dict(fm_args or {}))
+            fm_out = cached_dispatch(fm_name, dict(fm_args or {}))
             if _first_move_useful(fm_out):
                 tool_calls.append(fm_name)
                 tool_outputs.append(fm_out)
@@ -1222,7 +1276,7 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                     fb_plan = fallback.plan()
                     if fb_plan is not None and fb_plan[0] in by_name:
                         fb_name, fb_args = fb_plan
-                        fb_out = dispatch(by_name, fb_name, dict(fb_args or {}))
+                        fb_out = cached_dispatch(fb_name, dict(fb_args or {}))
                         tool_calls.append(fb_name)
                         tool_outputs.append(fb_out)
                         if fb_name == "version_diff" and isinstance(fb_out, Mapping):
@@ -1247,7 +1301,7 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 stop_reason = "answered"
                 submitted = True
                 break
-            out = dispatch(by_name, call.name, call.args)
+            out = cached_dispatch(call.name, call.args)
             if call.name == "read_chart_values" and _contract.is_contract(out):
                 method = out.get("method") or {}
                 strict_chart_evidence = (
@@ -1560,14 +1614,27 @@ def answer_question(question: str, *, model: str | None = None,
                 stop_reason="answered",
                 contract=contract,
             )
+        # Record whether the caller kept the defaults *before* any adaptation, so every adaptation below
+        # only lifts a default budget and never shrinks an explicit caller budget, and so they compose
+        # (the ratio +4 still applies on top of the multi-stage lift).
+        caller_default_turns = max_turns == DEFAULT_MAX_TURNS
+        caller_default_timeout = timeout_s == DEFAULT_TIMEOUT_S
+        # SOT-2523 — contract-adaptive budget for the multi-stage contracts (derived_calculation / 横断集計
+        # / enum_set): 「特定→復号→読込→計算→検証」の多段で 12ターン/180s を使い切りやすい(BUDGET_EXHAUSTED
+        # 最多)ため、多段型に限り bounded に拡張する。単純検索など単段型は据え置き(コスト線形増を避ける)。
+        if ADAPTIVE_BUDGET and contract in MULTISTAGE_CONTRACTS:
+            if caller_default_turns:
+                max_turns = ADAPTIVE_MAX_TURNS       # 12 -> 18
+            if caller_default_timeout:
+                timeout_s = ADAPTIVE_TIMEOUT_S       # 180 -> 240
         # Ratio contracts need separate numerator/denominator computations plus final unit/rounding
-        # validation.  Preserve the global cap for all other questions, but allow four bounded extra
-        # turns when the caller kept the default so a correct re-computation can finish after one
-        # rejected contract-violating submission (SOT-2508 focused cycle 1 root cause).
-        if (contract == "numeric" and max_turns == DEFAULT_MAX_TURNS
+        # validation.  Grant four bounded extra turns when the caller kept the default so a correct
+        # re-computation can finish after one rejected contract-violating submission (SOT-2508 focused
+        # cycle 1 root cause) — on top of the multi-stage lift above (18 -> 22) or the flat cap (12 -> 16).
+        if (contract == "numeric" and caller_default_turns
                 and _question_contract.numeric_requirements(question).ratio):
             max_turns += 4
-        if (timeout_s == DEFAULT_TIMEOUT_S and (
+        if (caller_default_timeout and (
                 _question_contract.is_regulation_content_question(question)
                 or _question_contract.is_gantt_week_question(question))):
             # A whole-section read / PPTX shape extraction plus guarded resubmission can exceed the
