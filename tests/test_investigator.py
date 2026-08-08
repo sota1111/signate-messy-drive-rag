@@ -622,6 +622,33 @@ def test_investigate_batch_uses_isolated_profile_per_question():
     assert len({id(p) for p in seen}) == 5
 
 
+def test_investigate_batch_shares_one_profile_when_requested():
+    """SOT-2528: shared_profile threads ONE instance through every question so discoveries carry over."""
+    shared = CorpusProfile()
+    factory_calls = []
+
+    def profile_factory():  # must NOT be consulted when shared_profile is given
+        p = CorpusProfile()
+        factory_calls.append(p)
+        return p
+
+    seen_profiles = []
+
+    def recording_factory(question: str, tools):
+        # the tools are bound to whichever profile investigate_batch chose for this question
+        seen_profiles.append(tools)
+        return ScriptedModel([_submit("x", confidence=0.8)])
+
+    questions = [f"q{i}" for i in range(4)]
+    # seed a discovery before the batch; every question must see it (reuse, not re-derive)
+    shared.set_password("かえで/train.xlsx", "pw")
+    investigate_batch(recording_factory, questions,
+                      profile_factory=profile_factory, shared_profile=shared, max_turns=2)
+
+    assert factory_calls == []  # shared_profile takes precedence over the per-question factory
+    assert shared.get_password("かえで/train.xlsx") == "pw"  # instance is the one we seeded
+
+
 # --------------------------------------------------------------------------- cost / live wiring
 def test_usage_cost_accounting():
     u = Usage(1_000_000, 1_000_000)
