@@ -362,7 +362,23 @@ def _summarize_added_block(lines: list[str]) -> str:
 
 
 def structural_diff(pair: VersionPair) -> list[Change] | None:
-    """Substantive changes old→new, or None if either side can't be read structurally."""
+    """Substantive changes old→new, or None if either side can't be read structurally.
+
+    Consults the deterministic structure pre-store (SOT-2533) first when enabled: a fresh cached
+    change list (both source files unchanged) is rehydrated verbatim, skipping the two structural
+    Office reads. A miss / stale entry / disabled flag falls through to the live diff (zero
+    regression) — the cached list is exactly what the live path produces, so the answer is unchanged.
+    """
+    from src.rag.index import structure_store
+
+    cached = structure_store.lookup_version_changes(pair.old, pair.new)
+    if cached is not None:
+        return [Change(c["label"], c["before"], c["after"], c["kind"]) for c in cached]
+    return _structural_diff_live(pair)
+
+
+def _structural_diff_live(pair: VersionPair) -> list[Change] | None:
+    """Live (store-bypassing) structural diff — the deterministic extraction core."""
     so, sn = _struct(pair.old), _struct(pair.new)
     if so is None or sn is None:
         return None

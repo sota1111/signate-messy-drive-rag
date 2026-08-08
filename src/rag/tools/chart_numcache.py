@@ -243,6 +243,22 @@ def chart_xml_members(office: str | Path | FileRef | bytes | bytearray) -> list[
 
 
 # --------------------------------------------------------------------------- public API
+def _store_ref(file: str | Path | FileRef | bytes | bytearray) -> FileRef | None:
+    """Resolve a file-like input to a corpus :class:`FileRef` for a structure-store lookup, else None.
+
+    Only a real corpus file (with a ``rel``) can key the persisted store; raw chart-XML/zip bytes and
+    unresolvable paths return None so the caller extracts live.
+    """
+    if isinstance(file, (bytes, bytearray)):
+        return None
+    try:
+        from src.rag.tools.extract_tools import resolve_ref
+        ref = file if isinstance(file, FileRef) else resolve_ref(file)
+    except Exception:
+        return None
+    return ref if getattr(ref, "rel", None) else None
+
+
 def extract_chart_numcache(file: str | Path | FileRef | bytes | bytearray) -> dict[str, Any]:
     """Read every chart's ``numCache``/``strCache`` from an xlsx/pptx (or raw chart XML) → contract.
 
@@ -252,9 +268,22 @@ def extract_chart_numcache(file: str | Path | FileRef | bytes | bytearray) -> di
         Raw chart-XML ``bytes``, a whole ``.xlsx``/``.pptx`` (as zip ``bytes``, a path, a
         :class:`FileRef`, or an NFC corpus-relative reference).
 
-    ``value`` is ``{charts, n_charts, n_series}`` (see the module docstring). Raises
-    :class:`ContractError` when the input holds no readable chart series.
+    Consults the deterministic structure pre-store (SOT-2533) first when enabled: a fresh cached
+    contract is returned verbatim (byte-identical to a live read). Otherwise, and always for raw
+    bytes, it reads live. ``value`` is ``{charts, n_charts, n_series}`` (see the module docstring).
+    Raises :class:`ContractError` when the input holds no readable chart series.
     """
+    ref = _store_ref(file)
+    if ref is not None:
+        from src.rag.index import structure_store
+        cached = structure_store.lookup_chart_contract(ref)
+        if cached is not None:
+            return cached
+    return _extract_chart_numcache_live(file)
+
+
+def _extract_chart_numcache_live(file: str | Path | FileRef | bytes | bytearray) -> dict[str, Any]:
+    """Live (store-bypassing) chart numCache read — the deterministic extraction core."""
     data, label, is_office = _read_source(file)
 
     parts: list[tuple[str, bytes]] = (
