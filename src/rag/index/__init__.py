@@ -143,6 +143,22 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  structure store skipped: {type(e).__name__}: {e}")
 
+    # Canonical-route manifest (SOT-2530 / 事前処理 #3): precompute project→kind→ranked-rel once so
+    # canonical_route.discover is an O(1) lookup at run time instead of re-walking the corpus and
+    # running _matches_kind per call. Additive and fully guarded — a failure here can never corrupt
+    # the retrieval index, and runtime consultation is opt-in (RAG_CANONICAL_MANIFEST) so the champion
+    # serve path is byte-identical by default.
+    try:
+        from src.rag.index import canonical_manifest
+        cm_counts = canonical_manifest.build(refs)
+        if verbose:
+            print(f"  canonical manifest: {cm_counts['projects']} projects "
+                  f"({cm_counts['kind_entries']} kind entries, {cm_counts['files']} files) "
+                  f"-> {canonical_manifest.default_out_path()}")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  canonical manifest skipped: {type(e).__name__}: {e}")
+
     if verbose:
         print(f"embedding {len(chunks)} chunks...")
     texts = [c.text for c in chunks]
