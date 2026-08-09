@@ -689,6 +689,130 @@ def resolve_record_conflict(question: str, answer: str) -> ConflictResolution:
     return ConflictResolution(True)
 
 
+# --------------------------------------------------------------------------- numeric-feature literalism
+# SOT-2562 (review=human follow-up) — a 「相関が最も高い数値特徴量」 question fixes the candidate set to the
+# *natively numeric* columns (the notebook's own ``corr(numeric_only=True)``).  The failure mode (idx4:
+# ``smoker`` vs gold ``bmi``) is the model over-reasoning: it re-encodes a categorical column
+# (``sex``/``smoker`` → 0/1 via ``.map({...})``) and lets the encoded column outrank the top numeric
+# feature — violating both 「数値特徴量」 and 「(notebook)を確認して」.  This check is content-blind: it does
+# NOT name any column; it only detects, from the compute trail, that the correlation ranking was built on a
+# categorical→numeric re-encoding, and pushes ONE corrective round to recompute with ``numeric_only`` and no
+# ``.map`` so the top native-numeric feature is answered.  EV-safe (an abstain is never rejected) and
+# one-shot.  Default OFF via ``RAG_NUMERIC_FEATURE_CORR`` — the production answer path stays byte-identical.
+_NUMERIC_FEATURE_RE = re.compile(r"数値特徴量|数値の特徴量|数値特徴|数値列|numeric.{0,4}feature", re.I)
+_CORRELATION_RE = re.compile(r"相関|correlation|corr\b", re.I)
+# categorical→numeric re-encoding inside a correlation expression (``.map({'no':0,'yes':1})`` etc.)
+_MAP_ENCODE_RE = re.compile(r"\.map\s*\(\s*\{")
+
+
+@dataclass(frozen=True)
+class NumericFeatureValidation:
+    """Result of the 「相関が最も高い数値特徴量」 literalism check (SOT-2562)."""
+
+    passed: bool
+    issues: tuple[str, ...] = ()
+    directive: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"passed": self.passed, "issues": list(self.issues), "directive": self.directive}
+
+
+def _corr_map_encoding_seen(tool_outputs: Sequence[Any]) -> bool:
+    """True when a compute expression in the trail ranks correlation over a categorical re-encoding."""
+    for frag in _granularity_fragments(tool_outputs):
+        s = str(frag)
+        if _MAP_ENCODE_RE.search(s) and _CORRELATION_RE.search(s):
+            return True
+    return False
+
+
+def validate_numeric_feature_correlation(question: str, answer: str,
+                                         tool_outputs: Sequence[Any] = ()) -> NumericFeatureValidation:
+    """Reject a most-correlated-*numeric-feature* answer derived from a categorical re-encoding.
+
+    Fires only when (a) the question explicitly asks for the most-correlated 数値特徴量 (native numeric
+    feature) and (b) the compute trail ranked correlation over a ``.map({...})`` categorical encoding.
+    Content-blind, EV-safe (abstain passes), one-shot.
+    """
+    q = nfc(question or "")
+    a = nfc(str(answer or "")).strip()
+    if not a or a.lower() in ("わかりません", "分かりません", "不明"):
+        return NumericFeatureValidation(True)
+    if not (_NUMERIC_FEATURE_RE.search(q) and _CORRELATION_RE.search(q)):
+        return NumericFeatureValidation(True)
+    if not _corr_map_encoding_seen(tool_outputs):
+        return NumericFeatureValidation(True)
+    return NumericFeatureValidation(
+        False,
+        ("相関ランキングがカテゴリ列の数値エンコード(.map)で作られており、"
+         "『数値特徴量』の指定に反します",),
+        directive=(
+            "質問は『相関が最も高い数値特徴量』を求めています。カテゴリ列(sex/smoker/性別/喫煙 等)を"
+            "0/1 等へ変換(.map)して相関に含めてはいけません。resources の notebook と同様に、"
+            "元から数値の列だけで corr(numeric_only=True) を再計算し、目的変数自身と id/index を除いた上で"
+            "相関の絶対値が最大の列を1つだけ submit_answer で答えてください。"
+            "数値特徴量として確定できない場合のみ従来どおり棄権してください。"),
+    )
+
+
+# --------------------------------------------------------------------------- relevance-filtered enumeration
+# SOT-2562 (review=human follow-up) — 「(aspect)に関連する変更を挙げてください」 over a version diff must list
+# ONLY the changes whose relevance to the named aspect is grounded; when none qualify the answer is 該当なし.
+# The failure mode (idx9: gold 該当なし) is the model surfacing real diffs (wording / recommendation-section
+# restructuring) and reporting them as 案件遂行-related though none are.  This check is content-blind — it
+# names no change — and only pushes ONE corrective round to re-filter by the aspect and fall back to 該当なし
+# when nothing is grounded.  One-shot; an already-該当なし / abstain answer passes unchanged.  Default OFF via
+# ``RAG_RELEVANCE_STRICT`` — production answer path byte-identical.
+_RELEVANCE_CHANGE_RE = re.compile(r"(?P<aspect>[^\s、。]{2,12})に(?:関連|関係|関わる|係る)する変更")
+_VERSION_CUE_RE = re.compile(r"最新版|修正されたもの|提案書|報告(?:資料|書)|_v\d|版")
+_ALREADY_NOMATCH_RE = re.compile(r"該当なし|該当する変更(?:は)?(?:あり|存在)ませ|見当たりませ")
+
+
+@dataclass(frozen=True)
+class RelevanceEnumValidation:
+    """Result of the relevance-filtered version-diff enumeration check (SOT-2562)."""
+
+    passed: bool
+    aspect: str = ""
+    issues: tuple[str, ...] = ()
+    directive: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"passed": self.passed, "aspect": self.aspect,
+                "issues": list(self.issues), "directive": self.directive}
+
+
+def validate_relevance_enumeration(question: str, answer: str) -> RelevanceEnumValidation:
+    """Push one corrective re-filter on a 「(aspect)に関連する変更を挙げて」 version-diff answer (SOT-2562).
+
+    Content-blind, one-shot, EV-safe: an already-該当なし / abstain answer passes; otherwise the model is
+    asked to keep only aspect-grounded changes and answer 該当なし when none qualify.
+    """
+    q = nfc(question or "")
+    a = nfc(str(answer or "")).strip()
+    if not a or a.lower() in ("わかりません", "分かりません", "不明"):
+        return RelevanceEnumValidation(True)
+    if _ALREADY_NOMATCH_RE.search(a):
+        return RelevanceEnumValidation(True)
+    m = _RELEVANCE_CHANGE_RE.search(q)
+    if not (m and _VERSION_CUE_RE.search(q)):
+        return RelevanceEnumValidation(True)
+    aspect = m.group("aspect")
+    return RelevanceEnumValidation(
+        False, aspect,
+        (f"『{aspect}』への関連が根拠から確認できない変更まで列挙している可能性があります",),
+        directive=(
+            f"挙げた各変更について、『{aspect}』に直接関係するか厳密に判定してください。"
+            f"『{aspect}』とは実務の遂行事項そのもの(担当割当・WBS・スケジュール日程・タスク定義・"
+            "進捗管理・成果物の納品/確定 等)を指します。次は『関係する変更』に含めてはいけません: "
+            "分析手法・モデリング手順・評価方法・ワークフロー/フロー図の説明、業務提言・示唆・推奨事項の"
+            "追記や並べ替え、章立て・文言整形・体裁の変更。これらしか差分に無い場合、"
+            f"『{aspect}に関連する変更』は存在しないので、推測で1つ選ばず『該当なし』と submit_answer で"
+            "答えてください。上記の遂行事項に該当する変更を根拠付きで残せた場合のみ、その項目だけを回答に"
+            "してください。判断がつかないときは推測せず『わかりません』としてください。"),
+    )
+
+
 # --------------------------------------------------------------------------- numeric quantity contract
 # Numeric questions frequently fail even after a correct file lookup because the model silently changes
 # *what quantity is being measured*.  In particular, Japanese ``X のうち Y の割合`` fixes X as the

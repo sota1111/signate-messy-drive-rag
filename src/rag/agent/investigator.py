@@ -168,6 +168,16 @@ GRANULARITY_NORMALIZATION = _bool_env("RAG_GRANULARITY_NORMALIZATION", False)
 # answer path stays byte-identical** (mirroring RAG_GRANULARITY_NORMALIZATION); its net gold-100 effect is
 # measured by the single integrated SOT-2550 run before any default flip.
 CONFLICT_RESOLUTION = _bool_env("RAG_CONFLICT_RESOLUTION", False)
+
+# SOT-2562 (review=human follow-up) — two residual over-reasoning precision gates on the terminal commit,
+# each one corrective round.  NUMERIC_FEATURE_CORR: a 「相関が最も高い数値特徴量」 answer built on a
+# categorical→numeric re-encoding (.map) is rejected → recompute with numeric_only (idx4 smoker→bmi).
+# RELEVANCE_STRICT: a 「(aspect)に関連する変更を挙げて」 version-diff answer is re-filtered by the aspect,
+# falling back to 該当なし when nothing is grounded (idx9).  Both content-blind (no corpus fact injected),
+# one-shot, EV-safe (an abstain is never rejected), and **Default OFF so the production answer path stays
+# byte-identical** (mirroring RAG_GRANULARITY_NORMALIZATION / RAG_CONFLICT_RESOLUTION).
+NUMERIC_FEATURE_CORR = _bool_env("RAG_NUMERIC_FEATURE_CORR", False)
+RELEVANCE_STRICT = _bool_env("RAG_RELEVANCE_STRICT", False)
 DEFAULT_SPIN_THRESHOLD = 3        # identical (tool, args) calls that mark a path a dead end
 # Deterministic routes offered as the reallocation target when a spin is cut off (names only, no fact).
 _DETERMINISTIC_ROUTES: tuple[str, ...] = (
@@ -1255,6 +1265,8 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     regulation_guidance_sent = False
     granularity_guidance_sent = False   # SOT-2545 — one-shot answer-granularity correction
     conflict_guidance_sent = False      # SOT-2549 — one-shot record-conflict resolution
+    numeric_feature_guidance_sent = False  # SOT-2562 — one-shot numeric-feature correlation literalism
+    relevance_guidance_sent = False        # SOT-2562 — one-shot relevance-filtered enumeration re-filter
     from src.rag.agent import question_contract as _question_contract
     gantt_question = contract == "chart_read" and _question_contract.is_gantt_week_question(question)
     tool_outputs: list[Any] = []
@@ -1523,6 +1535,43 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                             "directive": conflict_check.directive,
                         }))
                         conflict_guidance_sent = True
+                        dispatched_tool = True
+                        break
+                # SOT-2562 — numeric-feature correlation literalism (default OFF via RAG_NUMERIC_FEATURE_CORR).
+                # One corrective round: a 「相関が最も高い数値特徴量」 answer built by re-encoding a categorical
+                # column (.map) into the correlation ranking is rejected and re-derived with numeric_only.
+                # EV-safe (abstain passes), content-blind (no column named), one-shot.
+                if (NUMERIC_FEATURE_CORR and not numeric_feature_guidance_sent
+                        and not is_abstain(candidate.answer)):
+                    nf_check = _question_contract.validate_numeric_feature_correlation(
+                        question, candidate.answer, tool_outputs)
+                    if not nf_check.passed:
+                        responses.append(ToolResponse(SUBMIT_ANSWER, {
+                            "answer_rejected": True,
+                            "reason": "『数値特徴量』の指定に反し、カテゴリ列の数値エンコードで相関を作っています。",
+                            "issues": list(nf_check.issues),
+                            "directive": nf_check.directive,
+                        }))
+                        numeric_feature_guidance_sent = True
+                        dispatched_tool = True
+                        break
+                # SOT-2562 — relevance-filtered enumeration (default OFF via RAG_RELEVANCE_STRICT).
+                # One corrective round: a 「(aspect)に関連する変更を挙げて」 version-diff answer is re-filtered by
+                # the aspect, falling back to 該当なし when nothing is grounded.  An already-該当なし / abstain
+                # answer passes unchanged (EV-safe); content-blind; one-shot.
+                if (RELEVANCE_STRICT and not relevance_guidance_sent
+                        and not is_abstain(candidate.answer)):
+                    rel_check = _question_contract.validate_relevance_enumeration(
+                        question, candidate.answer)
+                    if not rel_check.passed:
+                        responses.append(ToolResponse(SUBMIT_ANSWER, {
+                            "answer_rejected": True,
+                            "reason": "指定した関連観点で根拠付けられない変更まで列挙している可能性があります。",
+                            "aspect": rel_check.aspect,
+                            "issues": list(rel_check.issues),
+                            "directive": rel_check.directive,
+                        }))
+                        relevance_guidance_sent = True
                         dispatched_tool = True
                         break
                 # SOT-2508 — a numeric answer is not complete merely because a number was computed.
