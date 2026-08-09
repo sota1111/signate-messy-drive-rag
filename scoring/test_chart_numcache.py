@@ -312,6 +312,30 @@ def test_real_corpus_idx10_raster_histogram_recomputes_958():
     assert out["method"]["vision_used"] is False
 
 
+def test_real_corpus_idx29_tp_third_bin_range_uses_truncated_width():
+    """Gold idx29: the 3rd-most-populated TP histogram bin is [6.088138, 6.288138].
+
+    The Scott width truncates (not rounds) to 0.200; rounding to 0.201 shifted the grid and produced the
+    wrong (6.102138, 6.303138] (SOT-2546).  The bin edges are ``min + k * width`` read from the range
+    label, matched to gold at six decimal places.
+    """
+    import re
+
+    from src.rag.corpus import walk
+    ref = next((r for r in walk() if r.ext == "xlsx" and r.path.name == "train.xlsx"
+                and "かえで総合病院" in r.rel), None)
+    if ref is None:
+        pytest.skip("idx29 corpus workbook not present")
+    out = read_chart_values(ref, column="TP", operation="histogram")
+    series = out["value"]["charts"][0]["series"][0]
+    assert series["bin_width"] == 0.200
+    counts = series["values"]
+    categories = series["categories"]
+    third_bin = sorted(range(len(counts)), key=lambda i: counts[i], reverse=True)[2]
+    left, right = (float(x) for x in re.findall(r"-?\d+\.?\d*", categories[third_bin]))
+    assert (round(left, 6), round(right, 6)) == (6.088138, 6.288138)
+
+
 def chart_xml_members_safe(ref) -> bool:
     try:
         return bool(chart_xml_members(ref))

@@ -287,16 +287,22 @@ class WeekCell:
 
 def week_range_for_span(left: int, width: int,
                         cells: list[WeekCell] | tuple[WeekCell, ...]) -> tuple[int, int] | None:
-    """Map a bar span to every week cell it positively overlaps.
+    """Map a bar span to every week cell it overlaps by more than a calibration tolerance.
 
-    Both bars and cells are half-open intervals.  Therefore a bar ending exactly at the W9 left edge
-    belongs through W8, while starting exactly at that edge belongs to W9.  Positive overlap—not a
-    visual centre-point guess—defines membership, making boundary ±epsilon behaviour deterministic.
+    Both bars and cells are half-open intervals.  A bar ending exactly at the W9 left edge belongs
+    through W8, while starting exactly at that edge belongs to W9.  Membership is defined by a *positive
+    overlap that exceeds a small grid-relative tolerance*, not a visual centre-point guess — so the rule
+    is deterministic AND symmetric at both ends: a hand-placed bar whose left/right pokes a sub-pixel
+    sliver past a cell boundary (SOT-2546 idx69: a 14151-EMU nudge, ~1.4% of a week cell, past the W6/W7
+    edge) does NOT over-read the extra week.  The tolerance mirrors the ``grid_span // 500`` calibration
+    used for label matching in :func:`extract_gantt_week_ranges`.
     """
     start, end = sorted((int(left), int(left) + int(width)))
     if start == end:
         return None
-    weeks = [cell.week for cell in cells if max(start, cell.left) < min(end, cell.right)]
+    tolerance = max(1, (int(cells[-1].right) - int(cells[0].left)) // 500) if cells else 1
+    weeks = [cell.week for cell in cells
+             if min(end, cell.right) - max(start, cell.left) > tolerance]
     return (weeks[0], weeks[-1]) if weeks else None
 
 
@@ -443,9 +449,41 @@ def _run_highlight(run) -> str | None:
     return None
 
 
+# A slide footer page number is a shape whose whole text is ``N / TOTAL`` (half/full-width slash). The
+# *displayed* page number (what a reader means by "何ページ") is this footer value, which excludes an
+# unnumbered cover, so it can differ from the 1-based physical slide index (SOT-2546 idx84: the F1-ranking
+# slide is physically the 6th but its footer reads "5 / 15", and the gold page number is 5).
+_PAGE_FOOTER_RE = re.compile(r"^\s*(\d+)\s*[/／]\s*(\d+)\s*$")
+
+
+def _slide_display_pages(prs: Presentation) -> dict[int, int]:
+    """Map 1-based physical slide index → the page number printed in that slide's ``N / TOTAL`` footer.
+
+    Only footers whose denominator equals the document-wide total (the modal denominator) are kept, so a
+    stray ``1 / 7``-style list numbering on a content slide is not mistaken for a page footer.  Returns
+    ``{}`` when no consistent footer scheme is present (callers then fall back to the physical index).
+    """
+    from collections import Counter
+
+    found: dict[int, tuple[int, int]] = {}
+    for si, slide in enumerate(prs.slides, 1):
+        for shape in slide.shapes:
+            if not getattr(shape, "has_text_frame", False):
+                continue
+            match = _PAGE_FOOTER_RE.match(nfc((shape.text or "").strip()))
+            if match:
+                found[si] = (int(match.group(1)), int(match.group(2)))
+                break
+    if not found:
+        return {}
+    total = Counter(tot for _num, tot in found.values()).most_common(1)[0][0]
+    return {si: num for si, (num, tot) in found.items() if tot == total}
+
+
 def extract_pptx(ref: FileRef, data: bytes | None) -> str:
     prs = Presentation(io.BytesIO(data) if data else str(ref.path))
     out: list[str] = []
+    display_pages = _slide_display_pages(prs)
     gantt = extract_gantt_week_ranges(prs)
     if gantt:
         out.append("【ガント週グリッド:決定論】")
@@ -464,7 +502,13 @@ def extract_pptx(ref: FileRef, data: bytes | None) -> str:
                     "決定論候補が競合するため回答確定不可")
         out.append("【/ガント週グリッド】")
     for si, slide in enumerate(prs.slides, 1):
-        out.append(f"[スライド{si}]")
+        page = display_pages.get(si)
+        if page is not None:
+            # Page questions ("何ページ") mean the printed footer number, which excludes an unnumbered
+            # cover — surface it so the answer is the document's page number, not the physical index.
+            out.append(f"[スライド{si}（文書に記載のページ番号: {page}）]")
+        else:
+            out.append(f"[スライド{si}]")
         # top-to-bottom, left-to-right ordering (per enumeration rules in the task)
         shapes = sorted(slide.shapes, key=lambda s: (int(getattr(s, "top", 0) or 0),
                                                      int(getattr(s, "left", 0) or 0)))
