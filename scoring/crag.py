@@ -115,9 +115,12 @@ def _structured_facts(value: str) -> dict[str, set[str]]:
     normalized = _norm(value)
     facts: dict[str, set[str]] = {}
 
+    # Subject + particle + value skeleton: accept the assignment copula (=), the topic
+    # particle (は) and the subject particle (が) so "1位のモデルが500" reads the same as
+    # "1位=500" (SOT-2544 sentence↔symbolic equivalence).
     patterns = (
-        rf"(?P<key>{_IDENTIFIER})\s*(?:=|は)\s*(?P<value>{_NUMBER})",
-        rf"(?P<rank>\d+)\s*位(?:\s*の\s*モデル)?\s*(?:=|は)\s*(?P<value>{_NUMBER})",
+        rf"(?P<key>{_IDENTIFIER})\s*(?:=|は|が)\s*(?P<value>{_NUMBER})",
+        rf"(?P<rank>\d+)\s*位(?:\s*の\s*モデル)?\s*(?:=|は|が)\s*(?P<value>{_NUMBER})",
     )
     for pattern in patterns:
         for match in re.finditer(pattern, normalized):
@@ -131,18 +134,53 @@ def _canonical_structured_text(value: str) -> str:
     """Normalize notation-only differences without paraphrasing arbitrary prose."""
     normalized = _norm(value)
     normalized = re.sub(
-        rf"(?P<key>{_IDENTIFIER})\s*(?:は|=)\s*(?P<value>{_NUMBER})",
+        rf"(?P<key>{_IDENTIFIER})\s*(?:は|が|=)\s*(?P<value>{_NUMBER})",
         lambda m: f"{m.group('key')}={_number_token(m.group('value'))}",
         normalized,
     )
     normalized = re.sub(
-        rf"(?P<rank>\d+)\s*位(?:\s*の\s*モデル)?\s*(?:は|=)\s*(?P<value>{_NUMBER})",
+        rf"(?P<rank>\d+)\s*位(?:\s*の\s*モデル)?\s*(?:は|が|=)\s*(?P<value>{_NUMBER})",
         lambda m: f"{m.group('rank')}位={_number_token(m.group('value'))}",
         normalized,
     )
     # Copula / punctuation differences after a structured value carry no semantics.
     normalized = re.sub(r"(?<=\d)(?:です|である)(?=[。.!?！？]|$)", "", normalized)
     return re.sub(r"[\s、,。．.!！?？;；:：()（）「」『』]", "", normalized)
+
+
+# Gold answers that assert "the set is empty / nothing applies" — a closed vocabulary.
+_EMPTY_SET_GOLDS = frozenset({
+    "該当なし", "該当無し", "なし", "無し", "対象なし", "特になし",
+    "存在しない", "存在しません",
+})
+# The answer's concluding clause states the same nonexistence (a paraphrase of 該当なし).
+# Kept to explicit nonexistence assertions so an answer that instead enumerates items — a
+# real wrong answer to a "該当なし" gold — is never rescued here (SOT-2544 empty-set path).
+_EMPTY_SET_ASSERTION = re.compile(
+    r"(?:該当(?:する[^。]*?)?(?:なし|ありません|ございません)"
+    r"|ありません|ございません|存在しません|存在しない"
+    r"|(?:項目|もの|対象|該当)(?:は|も)?(?:ない|なかった)"
+    r"|なかった)"
+)
+
+
+def _empty_set_equivalence(pred: str, truth: str) -> str | None:
+    """Gold expresses an empty set (該当なし/なし/存在しない…) and the answer's concluding
+    clause asserts the same nonexistence — a semantic paraphrase, not a different answer.
+
+    Deliberately narrow: the gold must be a pure empty-set phrase AND the LAST clause of
+    the answer must be a nonexistence assertion. An answer that enumerates concrete items
+    (the genuine wrong-answer case for a 該当なし gold) has a non-empty final clause and is
+    left to the LLM / set scorer instead of being promoted."""
+    gold_core = re.sub(r"[\s、,。．.!！?？;；:：()（）「」『』]", "", _norm(truth))
+    if gold_core not in _EMPTY_SET_GOLDS:
+        return None
+    clauses = [c for c in re.split(r"[。！？!?\n]", _norm(pred)) if c.strip()]
+    if not clauses:
+        return None
+    if _EMPTY_SET_ASSERTION.search(clauses[-1]):
+        return "Acceptable"  # verbose empty-set paraphrase: a match, but not a clean Perfect
+    return None
 
 
 def deterministic_equivalence(pred: str, truth: str) -> str | None:
@@ -155,6 +193,9 @@ def deterministic_equivalence(pred: str, truth: str) -> str | None:
     matching negation polarity. Free prose and partial facts remain unresolved for LLM
     review instead of being guessed from token overlap.
     """
+    empty = _empty_set_equivalence(pred, truth)
+    if empty is not None:
+        return empty
     canonical_pred = _canonical_structured_text(pred)
     canonical_truth = _canonical_structured_text(truth)
     pred_facts = _structured_facts(pred)

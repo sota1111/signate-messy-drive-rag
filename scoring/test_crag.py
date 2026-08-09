@@ -34,6 +34,35 @@ def test_structured_gold_containment_is_acceptable_without_llm():
     ) == "Acceptable"
 
 
+def test_subject_particle_ga_reads_as_symbolic_assignment():
+    # SOT-2544 idx62: the real answer uses が ("1位のモデルが500"), not は — the same ranked
+    # facts as the symbolic gold, only with explanation. Must resolve without the LLM.
+    assert crag.deterministic_judge(
+        "上位2モデルの設定差分は n_estimators の値です。"
+        "1位のモデルが500、2位のモデルが300に設定されています。",
+        "n_estimators（1位=500、2位=300）",
+    ) == "Acceptable"
+
+
+def test_empty_set_paraphrase_matches_gold_none():
+    # SOT-2544 idx85: gold "該当なし"; the answer concludes the same nonexistence in prose.
+    assert crag.deterministic_judge(
+        "青葉バイオメディカル機器の最終報告書によると、設定された6項目のKPIはすべて"
+        "「達成」と評価されており、未達成とされている項目はありません。",
+        "該当なし",
+    ) == "Acceptable"
+
+
+@pytest.mark.parametrize(("pred", "truth"), [
+    # An answer that enumerates concrete items for a 該当なし gold is a real wrong answer.
+    ("未達成項目は、売上目標とコスト削減の2項目です。", "該当なし"),
+    # A positive existence claim is never an empty-set paraphrase.
+    ("対象は3件あります。", "なし"),
+])
+def test_empty_set_path_does_not_rescue_enumerated_wrong_answers(pred, truth):
+    assert crag.deterministic_judge(pred, truth) not in ("Perfect", "Acceptable")
+
+
 @pytest.mark.parametrize(("pred", "truth"), [
     ("n_estimatorsは500です。", "n_estimators=300"),
     ("1位のモデルは500です。", "n_estimators（1位=500、2位=300）"),

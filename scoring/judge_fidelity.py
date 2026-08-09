@@ -26,6 +26,13 @@ CASES = [
     ("A、B", "A、B、C", "Incorrect"),
     ("わかりません", "Recall", "Missing"),
     ("Precision", "Recall", "Incorrect"),
+    # SOT-2544 idx62: sentence-form ranked facts (が particle) == symbolic gold.
+    ("上位2モデルの設定差分は n_estimators の値です。"
+     "1位のモデルが500、2位のモデルが300に設定されています。",
+     "n_estimators（1位=500、2位=300）", "Acceptable"),
+    # SOT-2544 idx85: prose nonexistence conclusion == empty-set gold "該当なし".
+    ("設定された6項目のKPIはすべて「達成」と評価されており、未達成とされている項目はありません。",
+     "該当なし", "Acceptable"),
 ]
 
 # Observations recorded in SOT-2427 before this change.  Keeping these separate
