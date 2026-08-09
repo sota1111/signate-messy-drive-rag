@@ -32,18 +32,39 @@ from typing import Callable
 from src.rag.agent import obligations as _obligations
 from src.rag.agent import question_contract as _qc
 from src.rag.agent.question_contract import QuestionContract
+import importlib
+
 from src.rag.tools import font_emphasis as _font_emphasis
 from src.rag.tools.canonical_route import infer_kinds as _infer_kinds
+
+# ``src.rag.tools.__init__`` re-exports the ``highlight_extract`` *function*, shadowing the submodule
+# attribute — so ``from src.rag.tools import highlight_extract`` yields the function. Import the module
+# explicitly to reach its ``_extra_enabled`` flag helper (single source of truth for RAG_HIGHLIGHT_EXTRA).
+_highlight_extract = importlib.import_module("src.rag.tools.highlight_extract")
 
 # Font-decoration cue words in a question (SOT-2564). When the question asks for 太字/下線/イタリック
 # (bold/underline/italic) formatting, the ``font_emphasis`` tool — not the colour ``highlight_extract`` —
 # reaches the evidence. Pure vocabulary (no corpus fact).
 _FONT_DECORATION_RE = re.compile(r"太字|下線|アンダーライン|イタリック|斜体|bold|underline|italic", re.I)
 
+# Cell-highlight / fill-colour cue words (SOT-2564). Some highlight questions classify as ``numeric``
+# ("青色ハイライト部分の合計値") or reference a rule-based condition ("黄色ハイライトになっているセルの
+# 条件") and would route to canonical_route/compute, never reaching ``highlight_extract`` — so the
+# conditional-format / colour-family / pivot-ancestor evidence is never surfaced. Pure vocabulary.
+_HIGHLIGHT_COLOR_RE = re.compile(r"ハイライト|highlight|網掛け|塗りつぶし|セル.{0,4}色|マーカー", re.I)
+
 
 def references_font_decoration(question: str) -> bool:
     """True when ``question`` names a font decoration (太字/下線/イタリック) — a font_emphasis question."""
     return bool(_FONT_DECORATION_RE.search(question or ""))
+
+
+def references_highlight_color(question: str) -> bool:
+    """True when ``question`` names a cell highlight / fill colour.
+
+    The font-decoration route is checked first in :func:`first_tools_for`, so a question mentioning both
+    (太字 *and* ハイライト) still leads with ``font_emphasis``; this only decides the highlight fallback."""
+    return bool(_HIGHLIGHT_COLOR_RE.search(question or ""))
 
 # --------------------------------------------------------------------------- contract → first-move tools
 # Recommended first-move tool priority per contract. Only the *ordering* of already-exposed investigator
@@ -124,6 +145,11 @@ def first_tools_for(contract: QuestionContract, question: str) -> tuple[str, ...
             and references_font_decoration(question)):
         # 太字/下線/イタリックの複合書式条件は色ハイライトではなく font_emphasis が正本 (SOT-2564)。
         return ("font_emphasis", *(t for t in base if t != "font_emphasis"))
+    if _highlight_extract._extra_enabled() and references_highlight_color(question):
+        # ハイライト色/条件を問う質問 (「青色ハイライトの合計」idx25・「黄色ハイライトの条件」idx65) は
+        # numeric に分類され canonical_route/compute へ流れて highlight_extract に到達しないことがある。
+        # 条件付き書式・色ファミリ・ピボット祖先の証跡を確実に surface するため先頭に据える (SOT-2564)。
+        return ("highlight_extract", *(t for t in base if t != "highlight_extract"))
     if contract.contract == _qc.FORMAT_CHECK and (
             "ピボット" in question.lower() or (
                 ".pptx" in question.lower() and "ハイライト" in question
@@ -242,6 +268,15 @@ def route_hint(contract: QuestionContract, question: str) -> str:
             "require='太字,下線,イタリック' のように該当書式を列挙) を使い、要求された書式すべてに"
             "同時該当する箇所だけを回答する。色フィルタの highlight_extract では該当しない。"
             "対象ファイルが不明なら先に find_files で報告資料/対象文書を特定してから font_emphasis を呼ぶ。")
+    if (_highlight_extract._extra_enabled() and references_highlight_color(question)
+            and not (references_font_decoration(question) and _font_emphasis.enabled())):
+        lines.append(
+            "ハイライト色/条件を問う質問は highlight_extract(file=..., color=...) を先に使う。"
+            "色ハイライトはセル塗りだけでなく条件付き書式(ルール)由来のこともある。highlight_extract は "
+            "kind='conditional_format' の項目でその条件(operator/formula, 例『セルの値 < -0.99』)と該当セルを、"
+            "kind='cell' の項目で evidence.group にピボットの抽出条件(祖先グループ)を返す。"
+            "『条件』を問われたら conditional_format の condition を、『合計/個数』ならセル値や n_matched を"
+            "根拠に回答する。青は水色を含むなど色は同系色も対象。")
     if contract.contract == _qc.FORMAT_CHECK and first_tools and first_tools[0] == "pptx_pivot":
         lines.append(
             "ピボット回答では生ラベル(例: 8/2)やハイライト値だけを答えてはならない。pptx_pivot の "

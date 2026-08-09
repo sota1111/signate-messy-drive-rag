@@ -88,6 +88,32 @@ def test_route_hint_for_numeric_prefers_canonical_route():
     assert "一律" in hint or "chunk" in hint
 
 
+def test_highlight_color_question_routes_to_highlight_extract_when_enabled(monkeypatch):
+    # 「青色ハイライトの合計」は numeric に分類され、既定では canonical_route/compute へ流れる。
+    q = "白峰信用リスク評価のtrain.xlsxにおいて、青色ハイライト部分の合計値を求めてください。"
+    contract = qc.classify(q)
+    assert contract.contract == qc.NUMERIC
+
+    monkeypatch.setenv("RAG_HIGHLIGHT_EXTRA", "0")
+    assert routing.first_tools_for(contract, q)[0] == "canonical_route"
+
+    monkeypatch.setenv("RAG_HIGHLIGHT_EXTRA", "1")
+    tools = routing.first_tools_for(contract, q)
+    assert tools[0] == "highlight_extract"
+    assert "canonical_route" in tools  # compute path stays available for the sum
+    hint = routing.route_hint(contract, q)
+    assert "conditional_format" in hint and "highlight_extract" in hint
+
+
+def test_highlight_route_does_not_override_font_decoration(monkeypatch):
+    # 太字/下線/イタリック質問は font_emphasis が優先（ハイライト色ルートに奪われない）。
+    q = "報告資料の中で、太字、下線、イタリックのすべてに該当する箇所を抽出してください。"
+    contract = qc.classify(q)
+    monkeypatch.setenv("RAG_HIGHLIGHT_EXTRA", "1")
+    monkeypatch.setenv("RAG_FONT_EMPHASIS", "1")
+    assert routing.first_tools_for(contract, q)[0] == "font_emphasis"
+
+
 def test_chart_route_forbids_vision_numeric_evidence():
     q = "AG_ratioのヒストグラムで最も多いカウント数はいくつですか。"
     contract = qc.classify(q)
