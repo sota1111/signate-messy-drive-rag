@@ -374,3 +374,75 @@ def test_granularity_abstain_answer_passes() -> None:
     v = qc.validate_answer_granularity(q, "わかりません")
     # abstain text is non-empty but carries no items/body; the guard must not fire a truncation on it.
     assert v.passed or v.kind != "over_enumeration"
+
+
+# --------------------------------------------------------------------------- SOT-2549 conflict resolution
+def test_conflict_resolves_confirmed_single_over_range() -> None:
+    """idx75 shape: a coarse range + a confirmed single that refines it ⇒ prefer the single (第4週)."""
+    q = "MINAMINOのPP内のPL案において、モデル構築は第何週に実施することになっていますか。"
+    ans = ("提案書のスケジュール案において、「第3週目から第5週目」と「第4週目」という2つの記載が"
+           "競合しており、特定できません。")
+    v = qc.resolve_record_conflict(q, ans)
+    assert not v.passed and v.rule == "range_vs_confirmed"
+    assert v.resolved == "第4週"
+    assert "第4週" in v.directive
+
+
+def test_conflict_single_outside_range_stays_abstained() -> None:
+    """A single value outside the range is not reconcilable ⇒ abstain preserved (rule c, EV-safe)."""
+    v = qc.resolve_record_conflict("q", "「第3週目から第5週目」と「第7週目」が競合し特定できません。")
+    assert v.passed
+
+
+def test_conflict_multiple_in_range_singles_stays_abstained() -> None:
+    """Two distinct in-range singles are genuinely ambiguous ⇒ abstain preserved."""
+    v = qc.resolve_record_conflict(
+        "q", "「第1週目から第5週目」の中で第2週目と第4週目が競合し特定できません。")
+    assert v.passed
+
+
+def test_conflict_prefers_latest_confirmed_version() -> None:
+    """Rule (a): two version-labelled records ⇒ prefer the one marked 最新/確定."""
+    v = qc.resolve_record_conflict("q", "初版では第2章、最新版では第4章と記載が競合しており特定できません。")
+    assert not v.passed and v.rule == "version_latest"
+    assert v.resolved == "第4章"
+
+
+def test_conflict_correct_answer_not_touched() -> None:
+    """A committed correct answer (range + the specific week, no refusal) must never be rewritten."""
+    v = qc.resolve_record_conflict("q", "第3週から第5週のうち、モデル構築は第4週です。")
+    assert v.passed
+
+
+def test_conflict_empty_abstain_not_touched() -> None:
+    """A plain abstain with no surfaced records is left alone (no false resolution)."""
+    assert qc.resolve_record_conflict("q", "わかりません").passed
+    assert qc.resolve_record_conflict("q", "").passed
+
+
+def test_conflict_ambiguous_version_without_label_stays_abstained() -> None:
+    """Two version values but no 最新/確定 label ⇒ cannot pick authoritatively ⇒ abstain preserved."""
+    v = qc.resolve_record_conflict("q", "ある版では第2章、別の版では第4章と競合し特定できません。")
+    assert v.passed
+
+
+def test_conflict_single_ordinal_question_fires_without_refusal_word() -> None:
+    """run-d shape: a 「第何週」 question whose answer surfaces range+in-range single but was truncated
+    before it could word the refusal ⇒ still resolves to the refining single (第4週)."""
+    q = "MINAMINOのPP内のPL案において、モデル構築は第何週に実施することになっていますか。"
+    ans = "モデル構築の実施期間は第3週から第5週、または第4週と記載があり、情報が"
+    v = qc.resolve_record_conflict(q, ans)
+    assert not v.passed and v.rule == "range_vs_confirmed" and v.resolved == "第4週"
+
+
+def test_conflict_single_ordinal_correct_single_answer_untouched() -> None:
+    """A 「第何週」 question already answered with the single week (no range) is never rewritten."""
+    q = "モデル構築は第何週に実施しますか。"
+    assert qc.resolve_record_conflict(q, "第4週です。").passed
+
+
+def test_conflict_general_question_nonrefusal_range_not_resolved() -> None:
+    """A general (non single-ordinal) question with a range answer that merely mentions a sub-week is
+    left alone unless the model explicitly refuses — gold there may legitimately be the range."""
+    v = qc.resolve_record_conflict("実施期間はいつですか。", "第3週から第5週（第4週に中間報告）")
+    assert v.passed

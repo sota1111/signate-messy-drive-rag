@@ -155,6 +155,17 @@ SPIN_DETECTION = _bool_env("RAG_SPIN_DETECTION", False)
 # by the single integrated SOT-2550 run before any default flip.  EV-safe — it never turns an abstain into
 # a wrong answer, and it is one-shot (a still-mismatched re-submission is accepted, never looped).
 GRANULARITY_NORMALIZATION = _bool_env("RAG_GRANULARITY_NORMALIZATION", False)
+
+# SOT-2549 — record-conflict resolution (誤答E, idx75). One corrective round on the terminal commit:
+# when the model surfaces conflicting records and refuses ("『第3週目から第5週目』と『第4週目』が競合し
+# 特定できません" vs gold「第4週」), apply a general precedence rule — a confirmed single record refining a
+# coarse range, or the latest/confirmed version — and feed the resolved single value back as a directive so
+# the model commits it instead of abstaining.  Content-blind (the value fed back is one the model already
+# wrote; no corpus fact injected) and EV-safe: an irreducible conflict stays abstained, and the guard is
+# one-shot (a still-refusing re-submission is accepted, never looped).  **Default OFF so the production
+# answer path stays byte-identical** (mirroring RAG_GRANULARITY_NORMALIZATION); its net gold-100 effect is
+# measured by the single integrated SOT-2550 run before any default flip.
+CONFLICT_RESOLUTION = _bool_env("RAG_CONFLICT_RESOLUTION", False)
 DEFAULT_SPIN_THRESHOLD = 3        # identical (tool, args) calls that mark a path a dead end
 # Deterministic routes offered as the reallocation target when a spin is cut off (names only, no fact).
 _DETERMINISTIC_ROUTES: tuple[str, ...] = (
@@ -1221,6 +1232,7 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     simple_lookup_guidance_sent = False
     regulation_guidance_sent = False
     granularity_guidance_sent = False   # SOT-2545 — one-shot answer-granularity correction
+    conflict_guidance_sent = False      # SOT-2549 — one-shot record-conflict resolution
     from src.rag.agent import question_contract as _question_contract
     gantt_question = contract == "chart_read" and _question_contract.is_gantt_week_question(question)
     tool_outputs: list[Any] = []
@@ -1371,6 +1383,24 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                     granularity_guidance_sent = True
                     iterations += 1
                     continue
+            # SOT-2549 — record-conflict resolution on the fallback-text commit path (one-shot).
+            # No is_abstain guard: the target is exactly a "…が競合し特定できません" refusal that scored a
+            # wrong answer.  Only fires when a precedence rule reduces the surfaced records to one value.
+            if CONFLICT_RESOLUTION and not conflict_guidance_sent:
+                conflict_check = _question_contract.resolve_record_conflict(
+                    question, candidate.answer)
+                if not conflict_check.passed:
+                    responses = [ToolResponse(SUBMIT_ANSWER, {
+                        "answer_rejected": True,
+                        "reason": "競合する複数記載を棄権で逃げています。優先規則で単一解に決めてください。",
+                        "rule": conflict_check.rule,
+                        "issues": list(conflict_check.issues),
+                        "resolved": conflict_check.resolved,
+                        "directive": conflict_check.directive,
+                    })]
+                    conflict_guidance_sent = True
+                    iterations += 1
+                    continue
             answer = candidate
             stop_reason = "answered"
             break
@@ -1451,6 +1481,26 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                             payload["expected"] = gran_check.expected
                         responses.append(ToolResponse(SUBMIT_ANSWER, payload))
                         granularity_guidance_sent = True
+                        dispatched_tool = True
+                        break
+                # SOT-2549 — record-conflict resolution (default OFF via RAG_CONFLICT_RESOLUTION).
+                # One corrective round: reject a conflict-driven refusal ("…が競合し特定できません") when a
+                # general precedence rule (confirmed single refining a range / latest-confirmed version)
+                # decides it, and feed the resolved single value back.  No is_abstain guard — the refusal
+                # is a committed wrong answer, not an empty abstain; irreducible conflicts pass unchanged.
+                if CONFLICT_RESOLUTION and not conflict_guidance_sent:
+                    conflict_check = _question_contract.resolve_record_conflict(
+                        question, candidate.answer)
+                    if not conflict_check.passed:
+                        responses.append(ToolResponse(SUBMIT_ANSWER, {
+                            "answer_rejected": True,
+                            "reason": "競合する複数記載を棄権で逃げています。優先規則で単一解に決めてください。",
+                            "rule": conflict_check.rule,
+                            "issues": list(conflict_check.issues),
+                            "resolved": conflict_check.resolved,
+                            "directive": conflict_check.directive,
+                        }))
+                        conflict_guidance_sent = True
                         dispatched_tool = True
                         break
                 # SOT-2508 — a numeric answer is not complete merely because a number was computed.

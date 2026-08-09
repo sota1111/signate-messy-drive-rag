@@ -565,6 +565,130 @@ def validate_answer_granularity(question: str, answer: str,
     return GranularityValidation(True)
 
 
+# --------------------------------------------------------------------------- record-conflict resolution
+# SOT-2549 — 誤答E (idx75).  When the same item is described more than once and the records disagree, the
+# model sometimes surfaces every record and then refuses ("『第3週目から第5週目』と『第4週目』が競合し
+# 特定できません" vs gold「第4週」), scoring a *wrong* answer even though a general precedence rule decides
+# the case.  This validator is deterministic and content-blind: it reads ONLY the model's own committed
+# answer text (no corpus fact is embedded — the values it returns are the ones the model itself already
+# surfaced) and, when the surfaced records reconcile under a general rule, returns the single resolved
+# value so the commit gate can push one corrective re-answer instead of abstaining.  Precedence rules
+# (mirroring the Issue spec):
+#   (b) a coarse *range* record (第3週目から第5週目) and a *confirmed single* record (第4週目) coexist →
+#       prefer the confirmed single value when it lies within the range (the single refines the range);
+#   (a) two records carry differing *version / recency* labels → prefer the one marked 最新/確定/最終/final.
+# Only when a rule yields exactly ONE value does the check fail (→ resolve).  An irreducible conflict
+# (single outside the range, several distinct in-range singles, no authoritative label) passes unchanged
+# so the answer stays abstained — rule (c), EV-safe: a conflict is never turned into a guess.
+
+# The "gave up on a conflict" refusal marker — the precise trigger for this check.
+_CONFLICT_ABSTAIN_RE = re.compile(
+    r"特定でき(?:ません|ない|ず)|判断でき(?:ません|ない|ず)|確定でき(?:ません|ない|ず)|"
+    r"決められません|決まりません|一意に(?:定|決)|わかりません|分かりません|不明")
+# Generic ordinal unit used across the corpus (週/回/章/…); the resolved value re-uses the matched unit.
+_CONFLICT_UNIT = r"週|回|章|項|条|節|段階|ステップ|フェーズ|日|月|年|ページ|頁|巻|号|番"
+# A range record: 第X(unit)?(目)?  〜/から/-  第?Y(unit)(目)? — the unit is required on the far side.
+_CONFLICT_RANGE_RE = re.compile(
+    rf"第\s*(\d+)\s*(?:{_CONFLICT_UNIT})?\s*目?\s*(?:から|〜|～|~|-|–|—|ないし|乃至)\s*"
+    rf"第?\s*(\d+)\s*({_CONFLICT_UNIT})\s*目?")
+# A single ordinal record: 第Z(unit)(目)?.
+_CONFLICT_SINGLE_RE = re.compile(rf"第\s*(\d+)\s*({_CONFLICT_UNIT})\s*目?")
+# Version / recency qualifiers that make one record authoritative over another (rule a).
+_LATEST_QUALIFIER_RE = re.compile(r"最新|確定|最終|改訂|final|latest|後の版|新しい方")
+
+
+@dataclass(frozen=True)
+class ConflictResolution:
+    """Result of the record-conflict resolution check (SOT-2549)."""
+
+    passed: bool
+    rule: str = ""                    # "" | "range_vs_confirmed" | "version_latest"
+    resolved: str = ""                # the single value to commit when a rule decided the conflict
+    issues: tuple[str, ...] = ()
+    directive: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return {"passed": self.passed, "rule": self.rule, "resolved": self.resolved,
+                "issues": list(self.issues), "directive": self.directive}
+
+
+def _span_inside(span: tuple[int, int], spans: Sequence[tuple[int, int]]) -> bool:
+    """True when ``span`` is fully contained in any of ``spans`` (e.g. a range endpoint token)."""
+    return any(span[0] >= s[0] and span[1] <= s[1] for s in spans)
+
+
+def resolve_record_conflict(question: str, answer: str) -> ConflictResolution:
+    """Resolve a conflict-driven refusal to a single value via a general precedence rule (SOT-2549).
+
+    Content-blind: every value returned is one the model already wrote in ``answer``; no corpus fact is
+    embedded.  Passes unchanged (``passed=True``) unless a precedence rule reduces the records the model
+    surfaced to exactly one value.  Two triggers, both EV-safe:
+
+    * an explicit conflict refusal ("…が競合し特定できません") — the classic 誤答E shape; OR
+    * the question asks for a *single ordinal* ("第何週" / "何回目") yet the answer surfaces a coarse range
+      **and** exactly one confirmed single inside it.  Because such a question's answer is by definition a
+      single unit, collapsing to the refining single is correct even when the generation was truncated
+      before it could word the refusal (idx75's conflict trajectory truncates at "…情報が").
+
+    Rule (a) (latest/confirmed version) stays gated on an explicit refusal, since a non-refusal answer to
+    a general question may legitimately carry two version values.
+    """
+    q = nfc(str(question or ""))
+    a = nfc(str(answer or "")).strip()
+    if not a:
+        return ConflictResolution(True)
+    has_refusal = bool(_CONFLICT_ABSTAIN_RE.search(a))
+    asks_single_ordinal = bool(
+        re.search(rf"第\s*何\s*(?:{_CONFLICT_UNIT})|何\s*(?:{_CONFLICT_UNIT})\s*目?", q))
+    if not (has_refusal or asks_single_ordinal):
+        return ConflictResolution(True)
+
+    ranges = [(int(m.group(1)), int(m.group(2)), m.group(3), m.span())
+              for m in _CONFLICT_RANGE_RE.finditer(a)]
+    range_spans = [r[3] for r in ranges]
+    # Single ordinal tokens that are NOT merely a range endpoint already counted inside a range span.
+    free_singles = [(int(m.group(1)), m.group(2), m.span())
+                    for m in _CONFLICT_SINGLE_RE.finditer(a)
+                    if not _span_inside(m.span(), range_spans)]
+
+    # ---- rule (b): a confirmed single refining a coarse range ----------------------------------
+    for lo, hi, runit, _span in ranges:
+        if lo > hi:
+            lo, hi = hi, lo
+        inside = sorted({val for val, unit, _sp in free_singles
+                         if unit == runit and lo <= val <= hi})
+        if len(inside) == 1:
+            resolved = f"第{inside[0]}{runit}"
+            return ConflictResolution(
+                False, "range_vs_confirmed", resolved,
+                (f"範囲記載(第{lo}{runit}〜第{hi}{runit})と確定記載({resolved})が併記されています",),
+                directive=(
+                    "複数記載が競合した場合、粗い範囲記載ではなく範囲を細分する確定記載(単一)を優先してください。"
+                    f"この項目では確定記載『{resolved}』を単一解として submit_answer で回答してください。"
+                    "競合を理由に棄権せず、確定記載が一意に定まらない場合のみ従来どおり棄権してください。"),
+            )
+
+    # ---- rule (a): a version/recency-labelled record over an unlabelled/older one --------------
+    # Gated on an explicit refusal: a non-refusal answer to a general question may legitimately list two
+    # version values, so only resolve when the model actually gave up on the conflict.
+    if has_refusal and len({val for val, _u, _sp in free_singles}) >= 2:
+        qualified = {(val, unit) for val, unit, sp in free_singles
+                     if _LATEST_QUALIFIER_RE.search(a[max(0, sp[0] - 14):sp[0]])}
+        if len(qualified) == 1:
+            val, unit = next(iter(qualified))
+            resolved = f"第{val}{unit}"
+            return ConflictResolution(
+                False, "version_latest", resolved,
+                (f"版の異なる複数記載が競合し、最新/確定版として『{resolved}』が明示されています",),
+                directive=(
+                    "版が異なる記載が競合した場合、最新版/確定版(最新・確定・最終と明示、または最新日付)の"
+                    f"記載を優先してください。この項目では『{resolved}』を単一解として submit_answer で回答して"
+                    "ください。競合を理由に棄権せず、最新/確定版を一意に特定できない場合のみ棄権してください。"),
+            )
+
+    return ConflictResolution(True)
+
+
 # --------------------------------------------------------------------------- numeric quantity contract
 # Numeric questions frequently fail even after a correct file lookup because the model silently changes
 # *what quantity is being measured*.  In particular, Japanese ``X のうち Y の割合`` fixes X as the
