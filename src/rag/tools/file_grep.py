@@ -124,6 +124,46 @@ def _scan_text(text: str, pattern: re.Pattern[str], ref: FileRef,
     return hits
 
 
+def _scan_refs(refs: Iterable[FileRef], pattern: re.Pattern[str], *, exts: set[str] | None,
+               proj: str | None, match_filename: bool, max_hits_per_file: int,
+               limit: int) -> tuple[list[dict[str, Any]], int, set[str]]:
+    """Scan an iterable of file refs (filename + extracted content), returning
+    ``(all_hits, files_scanned, matched_files)``. Shared by the full corpus scan and the bounded
+    candidate-set fallback so both paths locate hits identically."""
+    all_hits: list[dict[str, Any]] = []
+    files_scanned = 0
+    matched_files: set[str] = set()
+    for ref in refs:
+        if exts is not None and ref.ext not in exts:
+            continue
+        if proj is not None and nfc(ref.project) != proj:
+            continue
+        files_scanned += 1
+        file_hits: list[dict[str, Any]] = []
+
+        if match_filename and pattern.search(nfc(ref.rel)):
+            file_hits.append({
+                "file": ref.rel or ref.name,
+                "project": ref.project,
+                "ext": ref.ext,
+                "line": None,
+                "where": "filename",
+                "snippet": ref.rel or ref.name,
+            })
+
+        if ref.ext in SEARCHABLE_EXT and len(file_hits) < max_hits_per_file:
+            doc = _extract(ref)
+            if doc.text:
+                file_hits.extend(
+                    _scan_text(doc.text, pattern, ref,
+                               max_hits=max_hits_per_file - len(file_hits)))
+
+        if file_hits:
+            matched_files.add(ref.rel or ref.name)
+            all_hits.extend(file_hits)
+    return all_hits, files_scanned, matched_files
+
+
 def file_grep(query: str, *, regex: bool = False, ext: str | Iterable[str] | None = None,
               project: str | None = None, ignore_case: bool = True,
               match_filename: bool = True, max_hits_per_file: int = 50,
@@ -187,40 +227,46 @@ def file_grep(query: str, *, regex: bool = False, ext: str | Iterable[str] | Non
                 filters={"ext": sorted(exts) if exts else None, "project": proj},
             )
 
+    # Bounded candidate fallback (SOT-2562 事前処理): when the typed index is consulted but MISSED,
+    # avoid extracting every corpus file. Derive a small candidate set cheaply (filenames + already
+    # indexed tokens, no extraction) and scan only those. This keeps a single file_grep call inside
+    # the per-question time budget where the full scan (300–658s) would blow it. Opt-in on top of
+    # RAG_EVIDENCE_INDEX, so the champion serve path (flags unset) is byte-identical.
+    if evidence_index.enabled() and evidence_index.candidate_fallback_enabled():
+        candidates = evidence_index.candidate_files(
+            query, ext=ext, project=project,
+            limit=evidence_index.max_candidates(), corpus_dir=corpus_dir)
+        cand_set = set(candidates)
+        cand_refs = [r for r in (walk(Path(corpus_dir)) if corpus_dir is not None else walk())
+                     if (r.rel or r.name) in cand_set]
+        all_hits, files_scanned, matched_files = _scan_refs(
+            cand_refs, pattern, exts=exts, proj=proj, match_filename=match_filename,
+            max_hits_per_file=max_hits_per_file, limit=limit)
+        total_hits = len(all_hits)
+        returned = all_hits[:limit]
+        return contract.make(
+            returned,
+            engine="file_grep",
+            evidence={
+                "files_scanned": files_scanned,
+                "files_matched": len(matched_files),
+                "total_hits": total_hits,
+                "returned": len(returned),
+                "truncated": total_hits > len(returned),
+                "source": "evidence_index_candidates",
+                "candidates_considered": len(candidates),
+            },
+            query=query,
+            regex=regex,
+            ignore_case=ignore_case,
+            source="evidence_index_candidates",
+            filters={"ext": sorted(exts) if exts else None, "project": proj},
+        )
+
     refs = walk(Path(corpus_dir)) if corpus_dir is not None else walk()
-    all_hits: list[dict[str, Any]] = []
-    files_scanned = 0
-    matched_files: set[str] = set()
-
-    for ref in refs:
-        if exts is not None and ref.ext not in exts:
-            continue
-        if proj is not None and nfc(ref.project) != proj:
-            continue
-        files_scanned += 1
-        file_hits: list[dict[str, Any]] = []
-
-        if match_filename and pattern.search(nfc(ref.rel)):
-            file_hits.append({
-                "file": ref.rel or ref.name,
-                "project": ref.project,
-                "ext": ref.ext,
-                "line": None,
-                "where": "filename",
-                "snippet": ref.rel or ref.name,
-            })
-
-        if ref.ext in SEARCHABLE_EXT and len(file_hits) < max_hits_per_file:
-            doc = _extract(ref)
-            if doc.text:
-                file_hits.extend(
-                    _scan_text(doc.text, pattern, ref,
-                               max_hits=max_hits_per_file - len(file_hits)))
-
-        if file_hits:
-            matched_files.add(ref.rel or ref.name)
-            all_hits.extend(file_hits)
-
+    all_hits, files_scanned, matched_files = _scan_refs(
+        refs, pattern, exts=exts, proj=proj, match_filename=match_filename,
+        max_hits_per_file=max_hits_per_file, limit=limit)
     total_hits = len(all_hits)
     returned = all_hits[:limit]
     return contract.make(
