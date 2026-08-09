@@ -213,9 +213,23 @@ def normalized_xlsx_rows(ws, *, max_rows: int = 400) -> list[NormalizedXlsxRow]:
 
 def extract_xlsx(ref: FileRef, data: bytes | None) -> str:
     wb = _xlsx_from(ref, data)
+    # SOT-2548: a sheet may hold a *picture* (e.g. an embedded PivotTable screenshot) instead of cells,
+    # so openpyxl reports it as empty. Note which sheets carry an embedded picture so the answer path
+    # does not conclude "the sheet is empty" and routes to highlight_extract instead (flag-gated).
+    from src.rag.tools import xlsx_embedded_image as _embedded_image  # lazy: avoid import cycle
+    image_sheets: set[str] = set()
+    if _embedded_image.enabled():
+        try:
+            image_sheets = {sheet for sheet, _n, _b
+                            in _embedded_image.embedded_sheet_images(ref, data)}
+        except Exception:  # noqa: BLE001 — the note is best-effort, never blocks extraction
+            image_sheets = set()
     out: list[str] = []
     for ws in wb.worksheets:
         out.append(f"[シート: {ws.title}]  範囲 {ws.dimensions}")
+        if ws.title in image_sheets:
+            out.append("【埋め込み画像あり（表のスクリーンショット等）: セルは空でも highlight_extract で"
+                       "ハイライトセルと抽出条件・集計内容を確認すること】")
         highlights: list[str] = []
         rows_repr: list[str] = []
         normalized = normalized_xlsx_rows(ws, max_rows=400)
