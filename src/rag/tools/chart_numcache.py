@@ -354,8 +354,12 @@ def series_values(file: str | Path | FileRef | bytes | bytearray, *,
 
 # --------------------------------------------------------------------------- raster-chart source fallback
 # Excel's automatic histogram bin width follows Scott's normal reference rule.  The source workbooks
-# persist the displayed interval width to three decimal places; using the unrounded NumPy ``bins=10``
-# default is a different chart and was the direct cause of SOT-2507 (1473 instead of the plotted 958).
+# persist the displayed interval width **truncated** (not rounded) to three decimal places, so the bin
+# grid is ``min + k*width`` with that truncated width.  Using the unrounded NumPy ``bins=10`` default is
+# a different chart and was the direct cause of SOT-2507 (1473 instead of the plotted 958).  Rounding the
+# third decimal instead of truncating shifted the whole grid and mis-read the plotted bin (SOT-2546
+# idx29: TP raw width 0.2008710 rounds to 0.201 → bin (6.102138, 6.303138] but the plotted width is the
+# truncated 0.200 → [6.088138, 6.288138]); truncation still reproduces AG_ratio's 0.053 / 958 (idx10).
 _ID_HEADERS = frozenset({"id", "index", "row_id", "record_id"})
 
 
@@ -491,9 +495,11 @@ def _scott_histogram(values: list[float]) -> tuple[list[int], list[str], float]:
     if len(clean) < 2 or min(clean) == max(clean):
         raise ContractError("histogram source column needs at least two distinct numeric values")
     raw_width = 3.5 * statistics.pstdev(clean) * (len(clean) ** (-1.0 / 3.0))
-    # The workbook chart generator stores automatic widths at three decimal places.  If a very small
-    # scale would round to zero, retain three significant digits instead of manufacturing an invalid bin.
-    width = round(raw_width, 3)
+    # The workbook chart generator stores automatic widths *truncated* to three decimal places (Excel
+    # ROUNDDOWN semantics), not rounded — rounding shifts the whole bin grid off by one (SOT-2546 idx29).
+    # The 1e-9 nudge guards against a float representation landing just under an exact third-decimal.
+    # If a very small scale would truncate to zero, retain three significant digits instead.
+    width = math.floor(raw_width * 1000.0 + 1e-9) / 1000.0
     if width <= 0:
         width = float(f"{raw_width:.3g}")
     start = min(clean)
