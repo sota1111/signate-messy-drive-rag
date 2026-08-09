@@ -106,6 +106,47 @@ def test_file_grep_falls_back_to_full_scan_on_index_miss(tmp_path: Path, monkeyp
     assert res["value"], "the term lives in the corpus, so the full-scan fallback finds it"
 
 
+def test_file_grep_candidate_fallback_bounds_the_scan(tmp_path: Path, monkeypatch) -> None:
+    """SOT-2562: on an index miss with RAG_FILE_GREP_INDEX_CANDIDATES=1, only candidate files are
+    extracted — never the whole corpus — so a single call stays inside the time budget."""
+    out = _write_index(tmp_path)
+    monkeypatch.setattr(evidence_index, "default_out_path", lambda: out)
+    monkeypatch.setenv("RAG_EVIDENCE_INDEX", "1")
+    monkeypatch.setenv("RAG_FILE_GREP_INDEX_CANDIDATES", "1")
+    monkeypatch.setenv("RAG_FILE_GREP_MAX_CANDIDATES", "2")
+    evidence_index.reset_cache()
+
+    corpus = tmp_path / "corpus"
+    (corpus / "プロジェクト/青葉").mkdir(parents=True)
+    # 顧客一覧.xlsx is the file the typed index knows about (via _write_index); the term "連絡先"
+    # is that file's indexed sheet-name/paragraph context but not a direct value hit for "連絡先メモ".
+    target = corpus / "プロジェクト/青葉/顧客一覧の連絡先メモ.txt"
+    target.write_text("固有語ZZZ はこの連絡先メモにだけ載る", encoding="utf-8")
+    for i in range(6):  # decoys that must NOT be extracted once the candidate cap is hit
+        (corpus / f"decoy_{i}.txt").write_text("無関係な本文", encoding="utf-8")
+
+    res = file_grep("連絡先メモ", corpus_dir=corpus)
+    assert res["method"].get("source") == "evidence_index_candidates"
+    assert res["evidence"]["files_scanned"] <= 2  # capped, not a full 7-file scan
+    assert res["evidence"]["candidates_considered"] >= 1
+
+
+def test_file_grep_candidate_fallback_off_still_full_scans(tmp_path: Path, monkeypatch) -> None:
+    """With the candidate flag unset, an index miss keeps the original full-scan fallback."""
+    out = _write_index(tmp_path)
+    monkeypatch.setattr(evidence_index, "default_out_path", lambda: out)
+    monkeypatch.setenv("RAG_EVIDENCE_INDEX", "1")
+    monkeypatch.delenv("RAG_FILE_GREP_INDEX_CANDIDATES", raising=False)
+    evidence_index.reset_cache()
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "note.txt").write_text("固有語ZZZが本文に登場する", encoding="utf-8")
+    res = file_grep("固有語ZZZ", corpus_dir=corpus)
+    assert res["method"].get("source") not in ("evidence_index", "evidence_index_candidates")
+    assert res["evidence"]["files_scanned"] >= 1  # full-scan fallback unchanged
+
+
 def test_file_grep_disabled_never_consults_index(tmp_path: Path, monkeypatch) -> None:
     out = _write_index(tmp_path)
     monkeypatch.setattr(evidence_index, "default_out_path", lambda: out)
