@@ -145,6 +145,16 @@ EVIDENCE_CACHE = _bool_env("RAG_EVIDENCE_CACHE", True)
 # and its net gold-100 effect is measured by the single integrated SOT-2527 run before any flip. No corpus
 # fact is ever injected (only tool names), so enabling it can never leak an answer.
 SPIN_DETECTION = _bool_env("RAG_SPIN_DETECTION", False)
+
+# SOT-2545 — answer granularity normalization (誤答A2). One corrective round on the terminal commit:
+# reject a *truncated* verbatim extract (「そのまま抜き出す」で見出しのみ = idx93) or an *over-enumerated*
+# single-item answer (「第N週の項目は何ですか」に日付範囲の全タスク列挙 = idx88) and feed a granularity
+# directive so the model re-answers at the question's granularity.  **Default OFF so the production answer
+# path stays byte-identical** (mirroring RAG_FIRST_MOVE_ROUTING / RAG_UNANSWERABLE_FALLBACK): the guard
+# feeds a directive that changes the model trajectory (nudge risk), so its net gold-100 effect is measured
+# by the single integrated SOT-2550 run before any default flip.  EV-safe — it never turns an abstain into
+# a wrong answer, and it is one-shot (a still-mismatched re-submission is accepted, never looped).
+GRANULARITY_NORMALIZATION = _bool_env("RAG_GRANULARITY_NORMALIZATION", False)
 DEFAULT_SPIN_THRESHOLD = 3        # identical (tool, args) calls that mark a path a dead end
 # Deterministic routes offered as the reallocation target when a spin is cut off (names only, no fact).
 _DETERMINISTIC_ROUTES: tuple[str, ...] = (
@@ -894,6 +904,54 @@ def _deterministic_literal_report_answer(question: str) -> Answer | None:
     return _strict_literal_vision_answer(question, result)
 
 
+def _deterministic_verbatim_action_answer(question: str) -> Answer | None:
+    """Resolve an exact action-ID ask to the fullest unique Action cell across meeting PDFs.
+
+    Historical minutes may repeat the same action after shortening its label or moving details into a
+    status column.  For an explicit ``そのまま`` content request, scan only the resolved project's
+    meeting PDFs, retain Vision rows that contain the requested ID on the same visual line, and choose
+    the longest candidate only when every shorter candidate is contained in it. Conflicting texts fail
+    closed to the ordinary agent path. No action value or project name is embedded here.
+    """
+    if not re.search(r"(?:そのまま|抜き出|全文)", question):
+        return None
+    action = re.search(r"(?:アクション)?ID\s*([A-Z]+\s*\d+)", question, re.I)
+    if action is None:
+        return None
+    action_id = re.sub(r"\s+", "", action.group(1)).upper()
+    route = canonical_route(question)
+    project = (route.get("evidence") or {}).get("project") if _contract.is_contract(route) else None
+    if not project:
+        return None
+    found = find_files(None, ext="pdf", project=str(project))
+    files = found.get("value") if _contract.is_contract(found) else None
+    meetings = [item for item in files or [] if isinstance(item, Mapping)
+                and item.get("category") == "meeting" and item.get("rel")]
+    candidates: list[tuple[str, str]] = []
+    for item in meetings:
+        try:
+            result = caption_figure(str(item["rel"]), question=question)
+        except Exception:
+            continue
+        value = result.get("value") if isinstance(result, Mapping) else None
+        for row in value if isinstance(value, list) else ():
+            if not isinstance(row, Mapping) or row.get("same_visual_line") is not True:
+                continue
+            line = re.sub(r"\s+", "", str(row.get("conditioned_text", ""))).upper()
+            candidate = str(row.get("candidate", "") or "").strip()
+            if action_id in line and candidate:
+                candidates.append((candidate, str(item["rel"])))
+    if not candidates:
+        return None
+    longest, source = max(candidates, key=lambda pair: len(pair[0]))
+    norm_longest = re.sub(r"[\s:：()（）]", "", longest).lower()
+    if any(re.sub(r"[\s:：()（）]", "", candidate).lower() not in norm_longest
+           for candidate, _ in candidates):
+        return None
+    return Answer(answer=longest, confidence=1.0, evidence=f"{source}: {action_id}",
+                  method="対象IDと同一視覚行のActionセル全文を履歴間で包含照合し、最長の原文を採用")
+
+
 def _deterministic_gantt_answer(question: str, profile: CorpusProfile) -> Answer | None:
     """Resolve a uniquely named PPTX activity from native Gantt geometry, without an LLM."""
     route = canonical_route(question)
@@ -1162,6 +1220,7 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     chart_guidance_sent = False
     simple_lookup_guidance_sent = False
     regulation_guidance_sent = False
+    granularity_guidance_sent = False   # SOT-2545 — one-shot answer-granularity correction
     from src.rag.agent import question_contract as _question_contract
     gantt_question = contract == "chart_read" and _question_contract.is_gantt_week_question(question)
     tool_outputs: list[Any] = []
@@ -1293,6 +1352,25 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 responses = [ToolResponse(SUBMIT_ANSWER, rejection)]
                 iterations += 1
                 continue
+            # SOT-2545 — answer granularity normalization on the fallback-text commit path (one-shot).
+            if (GRANULARITY_NORMALIZATION and not granularity_guidance_sent
+                    and not is_abstain(candidate.answer)):
+                gran_check = _question_contract.validate_answer_granularity(
+                    question, candidate.answer, tool_outputs)
+                if not gran_check.passed:
+                    payload: dict[str, Any] = {
+                        "answer_rejected": True,
+                        "reason": "回答の粒度が質問の要求と一致しません。",
+                        "kind": gran_check.kind,
+                        "issues": list(gran_check.issues),
+                        "directive": gran_check.directive,
+                    }
+                    if gran_check.expected:
+                        payload["expected"] = gran_check.expected
+                    responses = [ToolResponse(SUBMIT_ANSWER, payload)]
+                    granularity_guidance_sent = True
+                    iterations += 1
+                    continue
             answer = candidate
             stop_reason = "answered"
             break
@@ -1353,6 +1431,28 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                     responses.append(ToolResponse(SUBMIT_ANSWER, rejection))
                     dispatched_tool = True
                     break
+                # SOT-2545 — answer granularity normalization (default OFF via RAG_GRANULARITY_NORMALIZATION).
+                # One corrective round: reject a truncated verbatim extract / over-enumerated single-item
+                # answer and feed a granularity directive; a still-mismatched re-submission is accepted
+                # (never loop, never worse than baseline).  EV-safe — an abstain is never rejected here.
+                if (GRANULARITY_NORMALIZATION and not granularity_guidance_sent
+                        and not is_abstain(candidate.answer)):
+                    gran_check = _question_contract.validate_answer_granularity(
+                        question, candidate.answer, tool_outputs)
+                    if not gran_check.passed:
+                        payload: dict[str, Any] = {
+                            "answer_rejected": True,
+                            "reason": "回答の粒度が質問の要求と一致しません。",
+                            "kind": gran_check.kind,
+                            "issues": list(gran_check.issues),
+                            "directive": gran_check.directive,
+                        }
+                        if gran_check.expected:
+                            payload["expected"] = gran_check.expected
+                        responses.append(ToolResponse(SUBMIT_ANSWER, payload))
+                        granularity_guidance_sent = True
+                        dispatched_tool = True
+                        break
                 # SOT-2508 — a numeric answer is not complete merely because a number was computed.
                 # Enforce the question's quantity definition / unit / rounding contract against the
                 # observed compute trail *before* accepting the terminal answer.  This catches the
@@ -1756,7 +1856,12 @@ def answer_question(question: str, *, model: str | None = None,
             deterministic = _deterministic_staff_population_answer(question)
             deterministic_tools = ["corpus_aggregate", "enumeration_closure"]
         elif contract == "simple_lookup":
-            deterministic = _deterministic_literal_report_answer(question)
+            if GRANULARITY_NORMALIZATION:
+                deterministic = _deterministic_verbatim_action_answer(question)
+                if deterministic is not None:
+                    deterministic_tools = ["canonical_route", "find_files", "caption_image"]
+            if deterministic is None:
+                deterministic = _deterministic_literal_report_answer(question)
             if deterministic is not None:
                 deterministic_tools = ["canonical_route", "find_files", "caption_image"]
         elif contract == "chart_read" and _question_contract.is_gantt_week_question(question):

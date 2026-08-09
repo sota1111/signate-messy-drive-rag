@@ -364,6 +364,10 @@ class DeterministicFallbackGate:
 def completion_conditions(question: str, contract: str) -> tuple[str, ...]:
     """Return the static contract checklist plus question-specific completion promises."""
     base = CONTRACT_COMPLETION[contract]
+    if contract == SIMPLE_LOOKUP and _VERBATIM_EXTRACT_RE.search(nfc(question or "")):
+        return (*base,
+                "『そのまま/抜き出す』質問では、対象IDや見出しだけでなく該当セル・行・項目の本文全体を省略せず返す",
+                "探索手順・謝罪・推測を回答にせず、原文を確定できない場合だけ棄権する")
     if contract == SIMPLE_LOOKUP and is_regulation_content_question(question):
         return (*base, *_REGULATION_FALLBACK_COMPLETION)
     if contract == CHART_READ and is_gantt_week_question(question):
@@ -407,6 +411,150 @@ def validate_regulation_answer(question: str, answer: str) -> RegulationValidati
     )
     missing = tuple(label for label, pattern in checks if not pattern.search(text))
     return RegulationValidation(not missing, True, missing)
+
+
+# --------------------------------------------------------------------------- answer granularity contract
+# SOT-2545 — two document_extract failure shapes (誤答A2) where the evidence was reached but the committed
+# answer's *granularity* diverged from the question's promise:
+#   (1) truncation of a verbatim ("そのまま抜き出す") extract — only the head/title is returned while the
+#       source item carries a fuller body (idx93: 「前処理パイプライン」 vs the full action content);
+#   (2) over-enumeration of a single-item ask — a 「第N週の項目は何ですか」 singular question is answered
+#       with every task in a computed date range instead of the single designated item (idx88).
+# The validator is deterministic and content-blind: it embeds no answer values, only detecting the two
+# shapes from the question wording + the committed answer (+ tool evidence for the truncation target).
+_VERBATIM_EXTRACT_RE = re.compile(r"そのまま|抜き出|原文|全文|一字一句|逐語")
+# A verbatim extract that asks for the *content* (内容/本文/詳細/説明) of an item promises the whole body,
+# so a short title-only answer is a truncation even when no fuller fragment has been retrieved yet.
+_CONTENT_EXTRACT_RE = re.compile(r"内容|本文|詳細|説明|記載事項|全文")
+# Enumeration cues make a question genuinely multi-item; they suppress the over-enumeration guard.
+_ENUMERATION_CUE_RE = re.compile(r"すべて|全て|全部|列挙|挙げて|一覧|それぞれ|各(?:項目|案件|人|々)|漏れなく|網羅|複数")
+# A single-item selector pins the question to one unit (第N週/N番目/…): a list answer then over-enumerates.
+_SINGLE_SELECTOR_RE = re.compile(
+    r"第\s*\d+\s*(?:週|回|章|項|条|フェーズ|ステップ|段階|日)目?|\d+\s*(?:番目|つ目|個目|件目)")
+# List separators between parallel items — NOT 「・」/「／」, which are usually intra-item connectors
+# (e.g. a compound phase name joined by 「・」 is one item and must not be split).
+_ITEM_SEP_RE = re.compile(r"[、,，;；\n]+")
+_META_RESPONSE_RE = re.compile(
+    r"(?:i(?:'m| am) sorry|mistake|previous step|reasoning|should be looking|tool (?:output|call)|"
+    r"申し訳|誤り|前のステップ|推論|ツール(?:出力|呼び出し))",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class GranularityValidation:
+    """Result of the answer-granularity check (SOT-2545)."""
+
+    passed: bool
+    kind: str = ""                    # "" | "truncation" | "over_enumeration"
+    issues: tuple[str, ...] = ()
+    expected: str = ""                # deterministic full-text target when a fuller fragment is in evidence
+    directive: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return {"passed": self.passed, "kind": self.kind, "issues": list(self.issues),
+                "expected": self.expected, "directive": self.directive}
+
+
+def _granularity_fragments(tool_outputs: Sequence[Any]) -> list[str]:
+    """Flatten dispatched tool outputs to string fragments (self-contained; no obligations import)."""
+    frags: list[str] = []
+
+    def walk(v: Any) -> None:
+        if v is None or isinstance(v, bool):
+            return
+        if isinstance(v, Mapping):
+            for nested in v.values():
+                walk(nested)
+        elif isinstance(v, (list, tuple, set)):
+            for item in v:
+                walk(item)
+        else:
+            s = str(v).strip()
+            if s:
+                frags.append(s)
+
+    for out in tool_outputs or ():
+        walk(out)
+    return frags
+
+
+def validate_answer_granularity(question: str, answer: str,
+                                tool_outputs: Sequence[Any] = ()) -> GranularityValidation:
+    """Detect a truncated verbatim extract or an over-enumerated single-item answer (SOT-2545).
+
+    Content-blind: no answer values are embedded.  Truncation is proven either against a fuller
+    prefix-matching fragment already in the tool evidence (a deterministic target) or, for a
+    「内容をそのまま抜き出す」 ask, against a title-only body; over-enumeration fires only when a single-item
+    selector is present and no enumeration cue widens the ask.  A genuine enumeration question
+    (「すべて挙げて」) and an already-full or already-single answer all pass unchanged.
+    """
+    q = nfc(question or "")
+    a = nfc(str(answer or "")).strip()
+    if not a:
+        return GranularityValidation(True)
+    # Abstain is never a granularity error (EV-safe; the production caller also guards on this).
+    a_low0 = a.lower()
+    if any(tok in a_low0 for tok in ("わかりません", "分かりません", "不明")):
+        return GranularityValidation(True)
+
+    # (1) verbatim-extract truncation ------------------------------------------------------------
+    if _VERBATIM_EXTRACT_RE.search(q):
+        if _META_RESPONSE_RE.search(a):
+            return GranularityValidation(
+                False, "truncation",
+                ("回答が原文抽出ではなく、探索手順・謝罪などのメタ応答になっています",),
+                directive=(
+                    "探索手順や謝罪を回答にしないでください。対象IDを含む該当セル/行/項目を再確認し、"
+                    "その本文全体だけを省略せず submit_answer で返してください。"
+                    "原文を確定できない場合のみ従来どおり棄権してください。"),
+            )
+        a_low = a.lower()
+        for frag in _granularity_fragments(tool_outputs):
+            f = nfc(frag).strip()
+            fl = f.lower()
+            # ``a`` is the head of a materially longer contiguous fragment ⇒ the answer was truncated.
+            if len(f) >= len(a) + 8 and f != a and (fl.startswith(a_low) or a_low in fl):
+                return GranularityValidation(
+                    False, "truncation",
+                    (f"回答『{a}』は証拠中のより長い記載『{f[:80]}…』の一部に過ぎず全文になっていません",),
+                    expected=f,
+                    directive=(
+                        "『そのまま抜き出す』要求です。該当項目の全文を省略・要約せずそのまま返してください。"
+                        "見出しだけでなく本文/説明/続きを含め、証拠に存在する記載の全体を回答にしてください。"),
+                )
+        # No fuller fragment retrieved yet, but a 「内容をそのまま抜き出す」 ask answered with a short,
+        # title-like string (no body punctuation) is almost certainly a head-only truncation.
+        if (_CONTENT_EXTRACT_RE.search(q) and len(a) <= 25
+                and not re.search(r"[：:。（(、，,]", a)):
+            return GranularityValidation(
+                False, "truncation",
+                (f"回答『{a}』は見出しのみで、内容の本文が欠落しています",),
+                directive=(
+                    "『内容をそのまま抜き出す』要求です。見出し/IDだけで確定せず、該当項目のセル/行/段落の"
+                    "本文を省略せず全文抽出し、説明・続きを含めてそのまま回答してください。"
+                    "全文を確認できない場合のみ従来どおり棄権してください。"),
+            )
+
+    # (2) single-item over-enumeration -----------------------------------------------------------
+    selector = _SINGLE_SELECTOR_RE.search(q)
+    if selector is not None and not _ENUMERATION_CUE_RE.search(q):
+        # Count only "wordy" items — a comma inside a numeric interval (e.g. "(6.10, 6.30]") is not an
+        # enumeration, so items that are purely digits/punctuation are ignored to avoid false positives.
+        items = [p.strip() for p in _ITEM_SEP_RE.split(a)
+                 if p.strip() and re.search(r"[^\d.,，、()（）\[\]{}~〜\-–—:：/／%\s]", p)]
+        if len(items) >= 2:
+            sel = selector.group(0)
+            return GranularityValidation(
+                False, "over_enumeration",
+                (f"質問は単一の項目({sel})を尋ねていますが、回答が{len(items)}件を列挙しています",),
+                directive=(
+                    f"質問は{sel}に対応する単一の項目を尋ねています。日付範囲などから複数タスクを列挙せず、"
+                    "資料が当該単位に割り当てている単一の項目/フェーズ名だけを返してください。"
+                    "どの項目か一意に確定できない場合のみ従来どおり棄権してください。"),
+            )
+
+    return GranularityValidation(True)
 
 
 # --------------------------------------------------------------------------- numeric quantity contract

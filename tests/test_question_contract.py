@@ -260,3 +260,83 @@ def test_refinements_are_consistent_specialisations() -> None:
     for r in report.refinements:
         contract, gold = r["contract"], r["gold_archetype"]
         assert gold in CONTRACT_ARCHETYPES[contract] or gold == "unknown"
+
+
+# --------------------------------------------------------------------------- SOT-2545 granularity
+def test_granularity_flags_verbatim_truncation_against_fuller_fragment() -> None:
+    """idx93 shape: a 「そのまま抜き出す」 extract that returns only the head of a longer evidence fragment."""
+    q = "蒼樹会 みなみ野女性医療センターのアクションIDA10の内容をそのまま抜き出してください。"
+    full = "前処理パイプライン実装：0値を疑似欠損（NA）扱いにする処理と補完ロジック（中央値等）を実装・ドキュメント化"
+    v = qc.validate_answer_granularity(q, "前処理パイプライン", [{"result": f"A10 {full}"}])
+    assert not v.passed and v.kind == "truncation"
+    assert v.expected and "補完ロジック" in v.expected
+    assert v.directive
+
+
+def test_granularity_flags_titlelike_content_extract_without_fragment() -> None:
+    """A 「内容をそのまま抜き出す」 ask answered with a short title-only string is a truncation even with no fuller fragment in hand."""
+    q = "アクションIDA10の内容をそのまま抜き出してください。"
+    v = qc.validate_answer_granularity(q, "前処理パイプライン", tool_outputs=[])
+    assert not v.passed and v.kind == "truncation"
+
+
+def test_granularity_flags_meta_response_instead_of_verbatim_text() -> None:
+    """A process apology is not source text and must be sent back for one bounded correction."""
+    q = "アクションIDA10の内容をそのまま抜き出してください。"
+    v = qc.validate_answer_granularity(
+        q, "I'm sorry, I made a mistake in the previous step and should be looking elsewhere.")
+    assert not v.passed and v.kind == "truncation"
+    assert "探索手順" in v.directive
+
+
+def test_verbatim_completion_requires_full_source_item() -> None:
+    conditions = qc.completion_conditions(
+        "アクションIDA10の内容をそのまま抜き出してください。", qc.SIMPLE_LOOKUP)
+    assert any("本文全体" in condition for condition in conditions)
+
+
+def test_granularity_passes_full_verbatim_extract() -> None:
+    """A verbatim extract that already returns the full body (with descriptive punctuation) passes."""
+    q = "アクションIDA10の内容をそのまま抜き出してください。"
+    full = "前処理パイプライン実装：0値を疑似欠損（NA）扱いにする処理と補完ロジック（中央値等）を実装・ドキュメント化"
+    v = qc.validate_answer_granularity(q, full, [{"result": f"A10 {full}"}])
+    assert v.passed and v.kind == ""
+
+
+def test_granularity_flags_single_item_over_enumeration() -> None:
+    """idx88 shape: a 「第N週の項目は何ですか」 singular ask answered with several comma-listed tasks."""
+    q = "提案書内のスケジュール案において、第5週目に実施することになっている項目は何ですか。"
+    ans = "解釈分析・特徴量整理、業務活用示唆整理、最終報告書ドラフト作成"
+    v = qc.validate_answer_granularity(q, ans)
+    assert not v.passed and v.kind == "over_enumeration"
+    assert "第5週" in v.directive
+
+
+def test_granularity_single_item_answer_passes() -> None:
+    """A single-item selector answered with one item (・ is intra-item, not a list separator) passes."""
+    q = "第5週目に実施することになっている項目は何ですか。"
+    v = qc.validate_answer_granularity(q, "解釈・業務示唆整理")
+    assert v.passed
+
+
+def test_granularity_enumeration_question_not_flagged() -> None:
+    """An explicit enumeration ask (「すべて挙げて」) must never be trimmed by the single-item guard."""
+    q = "第5週目に実施することになっている項目をすべて挙げてください。"
+    ans = "解釈分析・特徴量整理、業務活用示唆整理、最終報告書ドラフト作成"
+    v = qc.validate_answer_granularity(q, ans)
+    assert v.passed
+
+
+def test_granularity_plain_multi_item_answer_without_selector_passes() -> None:
+    """No single-item selector ⇒ a multi-item answer is left alone (guard stays tight, avoids false positives)."""
+    q = "このプロジェクトの担当者は誰ですか。"
+    v = qc.validate_answer_granularity(q, "田中太郎、佐藤花子")
+    assert v.passed
+
+
+def test_granularity_abstain_answer_passes() -> None:
+    """An abstain is never rejected by the granularity guard (EV-safe)."""
+    q = "アクションIDA10の内容をそのまま抜き出してください。"
+    v = qc.validate_answer_granularity(q, "わかりません")
+    # abstain text is non-empty but carries no items/body; the guard must not fire a truncation on it.
+    assert v.passed or v.kind != "over_enumeration"
