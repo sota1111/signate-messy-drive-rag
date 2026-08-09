@@ -446,3 +446,60 @@ def test_conflict_general_question_nonrefusal_range_not_resolved() -> None:
     left alone unless the model explicitly refuses — gold there may legitimately be the range."""
     v = qc.resolve_record_conflict("実施期間はいつですか。", "第3週から第5週（第4週に中間報告）")
     assert v.passed
+
+
+# --------------------------------------------------------------------------- SOT-2562 numeric-feature corr
+def test_numeric_feature_corr_rejects_categorical_encoding() -> None:
+    """idx4 shape: 「相関が最も高い数値特徴量」 answered via a .map categorical re-encoding ⇒ reject."""
+    q = "01_eda.ipynbを確認して、目的変数と相関が最も高い数値特徴量を教えてください。"
+    trail = [{"value": ["charges", "smoker", "bmi"],
+              "method": {"code": "df.assign(smoker=df['smoker'].map({'no':0,'yes':1}))"
+                                 ".corr(numeric_only=True)['charges'].abs().sort_values().index.tolist()"}}]
+    v = qc.validate_numeric_feature_correlation(q, "smoker", trail)
+    assert not v.passed
+    assert "numeric_only" in v.directive and ".map" in v.directive
+
+
+def test_numeric_feature_corr_passes_plain_numeric_only() -> None:
+    """A correlation ranking with no categorical re-encoding in the trail passes unchanged."""
+    q = "目的変数と相関が最も高い数値特徴量を教えてください。"
+    trail = [{"method": {"code": "df.corr(numeric_only=True)['charges'].abs().sort_values().index[-1]"}}]
+    v = qc.validate_numeric_feature_correlation(q, "bmi", trail)
+    assert v.passed
+
+
+def test_numeric_feature_corr_passes_when_not_numeric_feature_question() -> None:
+    """No 「数値特徴量」 in the ask ⇒ the guard never fires even if a .map corr is in the trail."""
+    q = "目的変数と最も関係が深い特徴量は何ですか。"
+    trail = [{"method": {"code": "df.assign(x=df['x'].map({'a':0})).corr()['y']"}}]
+    assert qc.validate_numeric_feature_correlation(q, "smoker", trail).passed
+
+
+def test_numeric_feature_corr_abstain_passes() -> None:
+    q = "相関が最も高い数値特徴量を教えてください。"
+    trail = [{"method": {"code": "df.assign(s=df['s'].map({'no':0})).corr(numeric_only=True)['c']"}}]
+    assert qc.validate_numeric_feature_correlation(q, "わかりません", trail).passed
+
+
+# --------------------------------------------------------------------------- SOT-2562 relevance enumeration
+def test_relevance_enum_rejects_ungrounded_change_list() -> None:
+    """idx9 shape: 「案件遂行に関連する変更を挙げて」 answered with a change list ⇒ push a re-filter."""
+    q = "最終報告資料の最新版になる際に修正されたもののうち、案件遂行に関連する変更を挙げてください。"
+    v = qc.validate_relevance_enumeration(q, "業務提言がクイックウィンと中期に分けられた")
+    assert not v.passed and v.aspect == "案件遂行"
+    assert "該当なし" in v.directive
+
+
+def test_relevance_enum_already_nomatch_passes() -> None:
+    q = "提案書_v3.pptxに修正されたもののうち、案件遂行に関連する変更を挙げてください。"
+    assert qc.validate_relevance_enumeration(q, "該当なし").passed
+
+
+def test_relevance_enum_abstain_passes() -> None:
+    q = "最新版で修正されたもののうち、案件遂行に関連する変更を挙げてください。"
+    assert qc.validate_relevance_enumeration(q, "わかりません").passed
+
+
+def test_relevance_enum_non_change_question_passes() -> None:
+    """A plain lookup (no 「関連する変更」 + version cue) is never touched."""
+    assert qc.validate_relevance_enumeration("このプロジェクトの担当者は誰ですか。", "田中太郎").passed
