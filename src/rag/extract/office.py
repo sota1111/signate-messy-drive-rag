@@ -140,6 +140,7 @@ def extract_docx(ref: FileRef, data: bytes | None) -> str:
                 seen.add(b)
                 terms.append(b)
         lines.insert(0, "【太字箇所】" + " / ".join(terms))
+    lines.extend(_font_emphasis_lines(ref))
     return "\n".join(lines)
 
 
@@ -268,6 +269,7 @@ def extract_xlsx(ref: FileRef, data: bytes | None) -> str:
         if highlights:
             out.append("【ハイライトされたセル】")
             out.extend(f"  {h}" for h in highlights[:200])
+    out.extend(_font_emphasis_lines(ref))
     return "\n".join(out)
 
 
@@ -433,6 +435,34 @@ def _shape_fill_color(shape) -> str | None:
     return None
 
 
+def _font_emphasis_lines(ref: FileRef) -> list[str]:
+    """Best-effort ``【書式強調】`` annotations for the extract face (SOT-2564, gated by RAG_FONT_EMPHASIS).
+
+    Surfaces cells/runs carrying 太字/下線/イタリック so a font-decoration question ("太字かつ下線かつ
+    イタリックの箇所") is answerable from ``read_office`` output, not only from the ``font_emphasis`` tool.
+    Empty when the flag is off, so the champion serve face stays byte-identical. Never raises — a reader
+    error just yields no annotation (mirrors the embedded-image note).
+    """
+    from src.rag.tools import font_emphasis as _fe  # lazy: font_emphasis imports this module
+    if not _fe.enabled():
+        return []
+    try:
+        items = _fe.font_emphasis(ref)["value"]
+    except Exception:  # noqa: BLE001 — annotation is best-effort, never blocks extraction
+        return []
+    if not items:
+        return []
+    lines = ["【書式強調(太字/下線/イタリック)のある箇所】"]
+    for it in items[:200]:
+        m = it["method"]
+        deco = "∧".join(jp for d, jp in (("bold", "太字"), ("underline", "下線"),
+                                          ("italic", "イタリック")) if m.get(d))
+        loc = it["evidence"].get("cell") or it["evidence"].get("paragraph") \
+            or it["evidence"].get("slide") or it["evidence"].get("page")
+        lines.append(f"  [{deco}] {it['value']}" + (f" ({loc})" if loc is not None else ""))
+    return lines
+
+
 def _run_highlight(run) -> str | None:
     # python-pptx has no direct highlight API; inspect the run XML for a:highlight
     try:
@@ -531,4 +561,5 @@ def extract_pptx(ref: FileRef, data: bytes | None) -> str:
                 out.append("[表]")
                 for r in shape.table.rows:
                     out.append(" | ".join(c.text for c in r.cells))
+    out.extend(_font_emphasis_lines(ref))
     return "\n".join(out)

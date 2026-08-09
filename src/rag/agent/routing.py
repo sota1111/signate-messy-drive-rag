@@ -32,7 +32,18 @@ from typing import Callable
 from src.rag.agent import obligations as _obligations
 from src.rag.agent import question_contract as _qc
 from src.rag.agent.question_contract import QuestionContract
+from src.rag.tools import font_emphasis as _font_emphasis
 from src.rag.tools.canonical_route import infer_kinds as _infer_kinds
+
+# Font-decoration cue words in a question (SOT-2564). When the question asks for 太字/下線/イタリック
+# (bold/underline/italic) formatting, the ``font_emphasis`` tool — not the colour ``highlight_extract`` —
+# reaches the evidence. Pure vocabulary (no corpus fact).
+_FONT_DECORATION_RE = re.compile(r"太字|下線|アンダーライン|イタリック|斜体|bold|underline|italic", re.I)
+
+
+def references_font_decoration(question: str) -> bool:
+    """True when ``question`` names a font decoration (太字/下線/イタリック) — a font_emphasis question."""
+    return bool(_FONT_DECORATION_RE.search(question or ""))
 
 # --------------------------------------------------------------------------- contract → first-move tools
 # Recommended first-move tool priority per contract. Only the *ordering* of already-exposed investigator
@@ -109,6 +120,10 @@ def first_tools_for(contract: QuestionContract, question: str) -> tuple[str, ...
         # inspect it directly; a second broad BM25 pass can consume the whole question budget without
         # ever exposing the page image.
         return ("find_files", "caption_image", "read_office", "file_grep")
+    if (contract.contract == _qc.FORMAT_CHECK and _font_emphasis.enabled()
+            and references_font_decoration(question)):
+        # 太字/下線/イタリックの複合書式条件は色ハイライトではなく font_emphasis が正本 (SOT-2564)。
+        return ("font_emphasis", *(t for t in base if t != "font_emphasis"))
     if contract.contract == _qc.FORMAT_CHECK and (
             "ピボット" in question.lower() or (
                 ".pptx" in question.lower() and "ハイライト" in question
@@ -220,6 +235,13 @@ def route_hint(contract: QuestionContract, question: str) -> str:
                     f"単位={req.unit}" if req.unit else "",
                     f"小数第{req.decimal_places}位" if req.decimal_places is not None else "",
                 ) if x) + "。丸めは未丸め値の計算後、最後の一段だけで適用する。")
+    if (contract.contract == _qc.FORMAT_CHECK and _font_emphasis.enabled()
+            and references_font_decoration(question)):
+        lines.append(
+            "太字/下線/イタリックの書式条件は色ハイライトではない。font_emphasis(file=..., "
+            "require='太字,下線,イタリック' のように該当書式を列挙) を使い、要求された書式すべてに"
+            "同時該当する箇所だけを回答する。色フィルタの highlight_extract では該当しない。"
+            "対象ファイルが不明なら先に find_files で報告資料/対象文書を特定してから font_emphasis を呼ぶ。")
     if contract.contract == _qc.FORMAT_CHECK and first_tools and first_tools[0] == "pptx_pivot":
         lines.append(
             "ピボット回答では生ラベル(例: 8/2)やハイライト値だけを答えてはならない。pptx_pivot の "

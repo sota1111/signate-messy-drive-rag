@@ -50,6 +50,7 @@ from src.rag.tools.extract_tools import (
 )
 from src.rag.tools import call_budget
 from src.rag.tools.file_grep import file_grep
+from src.rag.tools import font_emphasis as _font_emphasis
 from src.rag.tools.highlight_extract import highlight_extract
 from src.rag.tools.pdf_faux_italic import emphasized_words
 from src.rag.tools.profile import CorpusProfile
@@ -491,7 +492,7 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
     ``profile`` carries self-discovered secrets (passwords/aliases) across a single question's tool
     calls; it is never seeded with corpus facts here (移植性の担保).
     """
-    return [
+    tools = [
         AgentTool(
             "find_files",
             "コーパス内のファイルを名前/拡張子/プロジェクトで検索し、該当ファイル一覧を返す。",
@@ -635,6 +636,20 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
                 min_days=int(min_days) if isinstance(min_days, (int, float)) else None),
         ),
     ]
+    # SOT-2564: font-decoration (太字/下線/イタリック) extract face. Additively exposed only when
+    # RAG_FONT_EMPHASIS is on, so the champion serve tool set / prompt stays byte-identical by default.
+    if _font_emphasis.enabled():
+        tools.append(AgentTool(
+            "font_emphasis",
+            "xlsx/docx/pptx/pdfで太字・下線・イタリックの書式が付いた箇所を文書順で列挙する。"
+            "requireに『太字』『下線』『イタリック』(複数はカンマ/＋区切り、英語bold/underline/italicも可)を"
+            "渡すと、指定した書式すべてに同時該当する箇所だけに絞る。『太字かつ下線かつイタリックの箇所』の"
+            "ような複合書式条件の抽出に使う(色ハイライトは highlight_extract を使う)。",
+            _obj({"file": _STR, "require": _STR}, ["file"]),
+            lambda file, require=None: _font_emphasis.font_emphasis(
+                file, require=require, profile=profile),
+        ))
+    return tools
 
 
 def build_tools(profile: CorpusProfile) -> list[AgentTool]:
