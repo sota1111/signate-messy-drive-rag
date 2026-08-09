@@ -24,12 +24,13 @@ so each hit carries a best-effort ``where`` locator (``page:2`` / ``sheet:train`
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from src.rag.corpus import FileRef, nfc, walk
 from src.rag.extract import extract as _extract
-from src.rag.tools import contract
+from src.rag.tools import call_budget, contract
 
 
 class FileGrepError(ValueError):
@@ -51,6 +52,25 @@ _SLIDE_RE = re.compile(r"^\[スライド\s*(?P<n>\d+)\]")          # extract.off
 _CELL_RE = re.compile(r"^\s*(?P<cell>[A-Z]{1,3}\d+)\s*[(:]")
 
 _SNIPPET_MAX = 300
+
+
+_DEADLINE_NOTE = (
+    "時間上限に達したため全走査を途中で打ち切りました（部分結果/未発見の可能性あり）。"
+    "この語での全文grepはこれ以上追わず、別ルート"
+    "（canonical_route・find_files・evidence_index/read_office 等）で対象ファイルを特定してください。"
+)
+
+
+def _annotate_deadline(evidence: dict[str, Any], deadline_hit: bool, total_hits: int) -> None:
+    """Record the per-call deadline outcome (SOT-2563) on a file_grep result's evidence.
+
+    Always stamps ``deadline_hit`` so callers can branch deterministically; when the scan was cut
+    short it also flags ``partial`` and adds a ``note`` steering the model to a cheaper route rather
+    than re-issuing the same budget-melting full grep."""
+    evidence["deadline_hit"] = deadline_hit
+    if deadline_hit:
+        evidence["partial"] = True
+        evidence["note"] = _DEADLINE_NOTE
 
 
 def _norm_exts(ext: str | Iterable[str] | None) -> set[str] | None:
@@ -126,18 +146,33 @@ def _scan_text(text: str, pattern: re.Pattern[str], ref: FileRef,
 
 def _scan_refs(refs: Iterable[FileRef], pattern: re.Pattern[str], *, exts: set[str] | None,
                proj: str | None, match_filename: bool, max_hits_per_file: int,
-               limit: int) -> tuple[list[dict[str, Any]], int, set[str]]:
+               limit: int, deadline: float | None = None,
+               clock: Callable[[], float] = time.monotonic,
+               ) -> tuple[list[dict[str, Any]], int, set[str], bool]:
     """Scan an iterable of file refs (filename + extracted content), returning
-    ``(all_hits, files_scanned, matched_files)``. Shared by the full corpus scan and the bounded
-    candidate-set fallback so both paths locate hits identically."""
+    ``(all_hits, files_scanned, matched_files, deadline_hit)``. Shared by the full corpus scan and
+    the bounded candidate-set fallback so both paths locate hits identically.
+
+    ``deadline`` (an absolute ``clock``-domain timestamp, SOT-2563) cooperatively bounds the scan:
+    before extracting each next file the elapsed wall-clock is checked, and once the deadline is
+    reached the loop stops early — returning the hits found so far plus ``deadline_hit=True`` — so a
+    single call can never melt the whole question budget on a full ``_extract`` pass. ``None`` keeps
+    the scan unbounded (byte-identical to the pre-guard behaviour)."""
     all_hits: list[dict[str, Any]] = []
     files_scanned = 0
     matched_files: set[str] = set()
+    deadline_hit = False
     for ref in refs:
         if exts is not None and ref.ext not in exts:
             continue
         if proj is not None and nfc(ref.project) != proj:
             continue
+        # Cooperative cancellation: stop *before* starting another (potentially slow: Office decrypt
+        # / PDF / OCR) extraction once the per-call deadline has passed. Files already scanned still
+        # contribute their hits; the caller sees deadline_hit and can switch to a cheaper route.
+        if deadline is not None and clock() >= deadline:
+            deadline_hit = True
+            break
         files_scanned += 1
         file_hits: list[dict[str, Any]] = []
 
@@ -161,13 +196,15 @@ def _scan_refs(refs: Iterable[FileRef], pattern: re.Pattern[str], *, exts: set[s
         if file_hits:
             matched_files.add(ref.rel or ref.name)
             all_hits.extend(file_hits)
-    return all_hits, files_scanned, matched_files
+    return all_hits, files_scanned, matched_files, deadline_hit
 
 
 def file_grep(query: str, *, regex: bool = False, ext: str | Iterable[str] | None = None,
               project: str | None = None, ignore_case: bool = True,
               match_filename: bool = True, max_hits_per_file: int = 50,
-              limit: int = 500, corpus_dir: str | Path | None = None) -> dict[str, Any]:
+              limit: int = 500, corpus_dir: str | Path | None = None,
+              deadline_s: float | None = None,
+              clock: Callable[[], float] = time.monotonic) -> dict[str, Any]:
     """Grep the corpus for ``query`` and return contract ``{value, evidence, method}``.
 
     Parameters
@@ -189,12 +226,20 @@ def file_grep(query: str, *, regex: bool = False, ext: str | Iterable[str] | Non
         Per-file and total caps on returned hits (``evidence.truncated`` flags an overflow).
     corpus_dir
         Override the corpus root (defaults to ``settings.CORPUS_DIR``); mainly for tests.
+    deadline_s
+        Absolute ``clock``-domain wall-clock deadline (SOT-2563) for the full/candidate scan. When
+        the scan reaches it, the loop stops early and the result carries ``evidence.deadline_hit``
+        so the caller can switch to a cheaper route instead of melting the whole budget in one call.
+        ``None`` (default) resolves the deadline from the propagated per-question budget and the
+        ``RAG_FILE_GREP_MAX_SCAN_S`` cap via :mod:`src.rag.tools.call_budget`; pass an explicit value
+        (or a past timestamp) to force a bound directly, mainly for tests.
 
     ``value`` is a list of hit records ``{file, project, ext, line, where, snippet}``.
     """
     pattern = _compile(query, regex=regex, ignore_case=ignore_case)
     exts = _norm_exts(ext)
     proj = nfc(project) if project else None
+    deadline = deadline_s if deadline_s is not None else call_budget.scan_deadline(clock)
 
     # Fast path (SOT-2532 / #4b): when the typed evidence index is enabled, answer discovery
     # queries by index lookup — returning the recorded (file, sheet, cell/paragraph) locations
@@ -239,23 +284,25 @@ def file_grep(query: str, *, regex: bool = False, ext: str | Iterable[str] | Non
         cand_set = set(candidates)
         cand_refs = [r for r in (walk(Path(corpus_dir)) if corpus_dir is not None else walk())
                      if (r.rel or r.name) in cand_set]
-        all_hits, files_scanned, matched_files = _scan_refs(
+        all_hits, files_scanned, matched_files, deadline_hit = _scan_refs(
             cand_refs, pattern, exts=exts, proj=proj, match_filename=match_filename,
-            max_hits_per_file=max_hits_per_file, limit=limit)
+            max_hits_per_file=max_hits_per_file, limit=limit, deadline=deadline, clock=clock)
         total_hits = len(all_hits)
         returned = all_hits[:limit]
+        evidence = {
+            "files_scanned": files_scanned,
+            "files_matched": len(matched_files),
+            "total_hits": total_hits,
+            "returned": len(returned),
+            "truncated": total_hits > len(returned),
+            "source": "evidence_index_candidates",
+            "candidates_considered": len(candidates),
+        }
+        _annotate_deadline(evidence, deadline_hit, total_hits)
         return contract.make(
             returned,
             engine="file_grep",
-            evidence={
-                "files_scanned": files_scanned,
-                "files_matched": len(matched_files),
-                "total_hits": total_hits,
-                "returned": len(returned),
-                "truncated": total_hits > len(returned),
-                "source": "evidence_index_candidates",
-                "candidates_considered": len(candidates),
-            },
+            evidence=evidence,
             query=query,
             regex=regex,
             ignore_case=ignore_case,
@@ -264,21 +311,23 @@ def file_grep(query: str, *, regex: bool = False, ext: str | Iterable[str] | Non
         )
 
     refs = walk(Path(corpus_dir)) if corpus_dir is not None else walk()
-    all_hits, files_scanned, matched_files = _scan_refs(
+    all_hits, files_scanned, matched_files, deadline_hit = _scan_refs(
         refs, pattern, exts=exts, proj=proj, match_filename=match_filename,
-        max_hits_per_file=max_hits_per_file, limit=limit)
+        max_hits_per_file=max_hits_per_file, limit=limit, deadline=deadline, clock=clock)
     total_hits = len(all_hits)
     returned = all_hits[:limit]
+    evidence = {
+        "files_scanned": files_scanned,
+        "files_matched": len(matched_files),
+        "total_hits": total_hits,
+        "returned": len(returned),
+        "truncated": total_hits > len(returned),
+    }
+    _annotate_deadline(evidence, deadline_hit, total_hits)
     return contract.make(
         returned,
         engine="file_grep",
-        evidence={
-            "files_scanned": files_scanned,
-            "files_matched": len(matched_files),
-            "total_hits": total_hits,
-            "returned": len(returned),
-            "truncated": total_hits > len(returned),
-        },
+        evidence=evidence,
         query=query,
         regex=regex,
         ignore_case=ignore_case,

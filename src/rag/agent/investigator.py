@@ -48,6 +48,7 @@ from src.rag.tools.extract_tools import (
     extract_office,
     find_files,
 )
+from src.rag.tools import call_budget
 from src.rag.tools.file_grep import file_grep
 from src.rag.tools.highlight_extract import highlight_extract
 from src.rag.tools.pdf_faux_italic import emphasized_words
@@ -1206,19 +1207,25 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     evidence_cache: dict[str, Any] = {}
 
     def cached_dispatch(name: str, args: Mapping[str, Any] | None) -> Any:
-        if not EVIDENCE_CACHE:
-            return dispatch(by_name, name, args)
-        try:
-            key = name + "\x00" + json.dumps(args or {}, sort_keys=True,
-                                             ensure_ascii=False, default=str)
-        except (TypeError, ValueError):
-            return dispatch(by_name, name, args)  # unserialisable args → skip the cache
-        if key in evidence_cache:
-            return evidence_cache[key]
-        out = dispatch(by_name, name, args)
-        if not (isinstance(out, Mapping) and "error" in out):
-            evidence_cache[key] = out
-        return out
+        # SOT-2563 — propagate the *remaining* wall-clock budget to the tool call so a scan tool
+        # (file_grep full scan) can derive a per-call deadline and cooperatively cancel instead of
+        # overrunning ``timeout_s`` (only checked between turns) by 1.5–3.6× in one synchronous call.
+        # Harmless for tools that ignore it. ``start`` is assigned before the first dispatch below.
+        remaining = timeout_s - (clock() - start)
+        with call_budget.remaining_budget(remaining):
+            if not EVIDENCE_CACHE:
+                return dispatch(by_name, name, args)
+            try:
+                key = name + "\x00" + json.dumps(args or {}, sort_keys=True,
+                                                 ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                return dispatch(by_name, name, args)  # unserialisable args → skip the cache
+            if key in evidence_cache:
+                return evidence_cache[key]
+            out = dispatch(by_name, name, args)
+            if not (isinstance(out, Mapping) and "error" in out):
+                evidence_cache[key] = out
+            return out
 
     usage = Usage()
     tool_calls: list[str] = []
