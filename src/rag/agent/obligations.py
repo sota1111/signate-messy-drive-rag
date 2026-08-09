@@ -120,7 +120,8 @@ CONTRACT_OBLIGATIONS: dict[str, tuple[tuple[str, str], ...]] = {
     ),
     qc.NUMERIC: (
         (SOURCE_LOCATION, "型付き入力(対象列/対象ファイル)を根拠から特定する"),
-        (VALUE_MAPPING, "数値/単位入力を根拠から確定する"),
+        (VALUE_MAPPING,
+         "質問が指す対象(どの列・どの行・どのID体系・差の定義)を一意に確定し、別対象/別定義を計算しない"),
         (QUANTITY_DEFINITION, "要求量を分子・分母・母集団で定義し、『〜のうち』直前の条件を分母に保持する"),
         (COMPUTATION, "再実行可能な式で決定論的に導出する"),
         (UNIT_NORMALIZATION, "計算結果の単位を質問の要求に合わせる"),

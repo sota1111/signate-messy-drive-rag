@@ -16,10 +16,12 @@ from __future__ import annotations
 from src.rag.agent.calc_ledger import CalcSignals, record_from_investigation, validate
 from src.rag.agent.exec_verifier import (
     EXEC_CONFLICT,
+    EXEC_CORRECTED,
     EXEC_MATCH,
     EXEC_UNDECIDABLE,
     EXEC_UNGROUNDED,
     ExecVerdict,
+    _gross_miss_kind,
     compare_execution,
     is_numeric_record,
     rederive_calc,
@@ -278,3 +280,77 @@ def test_derived_label_reexecution_compares_value_and_columns():
     assert cmp.category == EXEC_CONFLICT and cmp.should_abstain
     assert any("対象列" in c for c in cmp.conflicts)
     assert any("値の相違" in c for c in cmp.conflicts)
+
+
+# --------------------------------------------------------------------------- SOT-2547: 大外し矯正 / 対象定義照合
+def test_gross_miss_kind_classifies_sign_and_magnitude():
+    assert _gross_miss_kind("-30.78416", "0.15002") and "符号" in _gross_miss_kind("-30.78416", "0.15002")
+    assert _gross_miss_kind("18948", "272") and "桁" in _gross_miss_kind("18948", "272")
+    assert _gross_miss_kind("100", "0") and "桁" in _gross_miss_kind("100", "0")   # one side ~0
+    # near / rounding-scale differences are NOT gross misses (stay 棄権, never corrected)
+    assert _gross_miss_kind("100", "108") is None
+    assert _gross_miss_kind("2012", "1899") is None           # idx47: two plausible years, no大外し
+    assert _gross_miss_kind("bmi", "age") is None             # non-numeric → value magnitude n/a
+
+
+def test_default_correct_off_keeps_gross_miss_as_conflict_abstain():
+    """既定 correct=False: 大外しでも従来どおり EXEC_CONFLICT→棄権(byte-identical・回答増なし)。"""
+    committed = _record("-30.78416", columns=("x",), input_rows=44, question="回帰予測値は?")
+    rederived = _record("0.15002", columns=("x",), input_rows=44, question="回帰予測値は?")
+    cmp = compare_execution(committed, rederived)          # correct defaults to False
+    assert cmp.category == EXEC_CONFLICT and cmp.should_abstain and not cmp.should_correct
+
+
+def test_idx63_sign_flip_corrected_to_reexecution():
+    """idx63 相当: 回帰予測の符号反転(−30.78 vs +0.15)を同一対象の独立再実行値で矯正 → match化。"""
+    committed = _record("-30.78416", columns=("x",), input_rows=44, question="回帰予測値は?")
+    rederived = _record("0.15002", columns=("x",), input_rows=44, question="回帰予測値は?")
+    cmp = compare_execution(committed, rederived, correct=True)
+    assert cmp.category == EXEC_CORRECTED and cmp.match and cmp.should_correct
+    assert cmp.corrected_answer == "0.15002" and not cmp.should_abstain
+    assert "符号" in cmp.reason
+
+
+def test_idx97_magnitude_miss_corrected_to_reexecution():
+    """idx97 相当: 差の別計算で桁違い(18948 vs 272)を同一対象の再計算値で矯正 → match化。"""
+    committed = _record("18948", columns=("val",), input_rows=100, question="差は?")
+    rederived = _record("272", columns=("val",), input_rows=100, question="差は?")
+    cmp = compare_execution(committed, rederived, correct=True)
+    assert cmp.category == EXEC_CORRECTED and cmp.corrected_answer == "272"
+
+
+def test_small_miss_not_corrected_even_when_enabled():
+    """惜しい差(大外しでない)は矯正せず従来どおり棄権 — 過剰置換を防ぐ精度優先。"""
+    committed = _record("100", columns=("x",), input_rows=10, question="値は?")
+    rederived = _record("108", columns=("x",), input_rows=10, question="値は?")
+    cmp = compare_execution(committed, rederived, correct=True)
+    assert cmp.category == EXEC_CONFLICT and cmp.should_abstain and not cmp.should_correct
+
+
+def test_target_mixup_stays_abstain_not_corrected():
+    """idx47/70 相当: 対象列が食い違う取り違えは確証不能 → 矯正せず安全棄権(誤答増ゼロ)。"""
+    # committed computed over one target, re-execution over a different target (対象取り違え).
+    committed = _record("2012", columns=("built_year_bldg_a",), input_rows=1, question="建設年は?")
+    rederived = _record("1899", columns=("built_year_bldg_b",), input_rows=1, question="建設年は?")
+    cmp = compare_execution(committed, rederived, correct=True)
+    assert cmp.category == EXEC_CONFLICT and cmp.should_abstain and not cmp.should_correct
+    assert any("対象列" in c for c in cmp.conflicts)
+
+
+def test_low_confidence_reexecution_does_not_correct():
+    """再実行の自己確信が低い場合は矯正しない(確定値でないため)→ 棄権。"""
+    committed = _record("18948", columns=("val",), input_rows=100, question="差は?")
+    rederived = _record("272", columns=("val",), input_rows=100, question="差は?")
+    rederived["confidence"] = 0.3
+    cmp = compare_execution(committed, rederived, correct=True)
+    assert cmp.category == EXEC_CONFLICT and cmp.should_abstain and not cmp.should_correct
+
+
+def test_corrected_verdict_shape_and_dict():
+    committed = _record("-30.78416", columns=("x",), input_rows=44, question="回帰予測値は?")
+    rederived = _record("0.15002", columns=("x",), input_rows=44, question="回帰予測値は?")
+    v = verify_execution(committed, rederive=lambda q: rederived, correct=True)
+    assert isinstance(v, ExecVerdict)
+    assert v.category == EXEC_CORRECTED and v.should_correct and v.corrected_answer == "0.15002"
+    d = v.to_dict()
+    assert d["should_correct"] is True and d["corrected_answer"] == "0.15002"

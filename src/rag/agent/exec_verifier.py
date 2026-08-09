@@ -38,6 +38,7 @@ in :mod:`~src.rag.agent.gate`, and there it is **default-OFF** until real-LB / �
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unicodedata
 from dataclasses import dataclass, field
@@ -93,9 +94,75 @@ EXEC_MATCH = "exec_match"            # 独立再実行が値・件数・単位�
 EXEC_CONFLICT = "evidence_conflict"  # 入力集合/計算の相違を検出(値/件数/単位/対象列) → 誤commit阻止
 EXEC_UNGROUNDED = "exec_ungrounded"  # 台帳に compute 証跡が無い(暗算) → 再実行対象が存在せず確認不能
 EXEC_UNDECIDABLE = "exec_undecidable"  # 独立再実行が値を再導出できず(棄権/失敗) → 決着不能
+# SOT-2547 — 大外し(桁/符号)を、同一対象を独立に再計算した確定値で矯正する(棄権化でなく置換).
+EXEC_CORRECTED = "exec_corrected"    # 台帳が大外し・独立再実行が同一対象で確定値 → 再計算値を採用(match化)
 
 # The conflict/ungrounded/undecidable outcomes are the ones the precision-first gate must not commit on.
 _ABSTAIN_CATEGORIES = frozenset({EXEC_CONFLICT, EXEC_UNGROUNDED, EXEC_UNDECIDABLE})
+
+
+# --------------------------------------------------------------------------- gross-miss thresholds (SOT-2547)
+def _float_env(key: str, default: float) -> float:
+    import os
+
+    try:
+        return float(os.getenv(key, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Order-of-magnitude divergence between committed and re-derived value that counts as a 大外し (idx97 型:
+# 18948 vs 272 ≈ 70x). Only such a *gross* miss — never a small/rounding-scale difference — is confident
+# enough to replace the committed number with the independent re-derivation.
+GROSS_MISS_RATIO = _float_env("EXEC_GROSS_MISS_RATIO", 10.0)
+# Minimum self-reported confidence of the independent re-execution before its value may *replace* the
+# committed answer. A low-confidence re-derivation cannot correct — it can only refuse (→ 棄権).
+GROSS_MISS_MIN_CONFIDENCE = _float_env("EXEC_CORRECT_MIN_CONFIDENCE", 0.7)
+
+_GROSS_NUM_RE = re.compile(r"[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?|[+-]?\d+(?:\.\d+)?")
+
+
+def _leading_number(answer: str) -> float | None:
+    """Parse the first signed numeric literal in an answer (commas stripped), or ``None``."""
+    m = _GROSS_NUM_RE.search(unicodedata.normalize("NFKC", str(answer or "")))
+    if not m:
+        return None
+    try:
+        return float(m.group(0).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _confidence_of(record: Mapping[str, Any] | None) -> float:
+    if not isinstance(record, Mapping):
+        return 0.0
+    try:
+        return float(record.get("confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _gross_miss_kind(committed_answer: str, rederived_answer: str) -> str | None:
+    """Classify a *gross* numeric divergence between two answers, or ``None`` for a small/near miss.
+
+    Returns ``"符号"`` when the two values carry opposite signs (idx63 型: 回帰予測 −30.78 vs +0.15) or
+    ``"桁"`` when their magnitudes differ by ≥ :data:`GROSS_MISS_RATIO` (idx97 型: 差の別計算 18948 vs 272).
+    A rounding-scale or otherwise modest difference returns ``None`` — those stay ambiguous (→ 棄権),
+    never corrected. Non-numeric / unparseable answers also return ``None`` (the target/definition axis,
+    not value magnitude, governs those)."""
+    a, b = _leading_number(committed_answer), _leading_number(rederived_answer)
+    if a is None or b is None:
+        return None
+    # 符号: opposite-signed values (treating 0 as sign-agnostic) with a real gap.
+    if a * b < 0 and abs(a - b) > 1e-9:
+        return "符号(正負反転)"
+    hi, lo = max(abs(a), abs(b)), min(abs(a), abs(b))
+    if lo <= 1e-12:
+        # one side is (near-)zero: a gross miss only if the other side is not itself ~0.
+        return "桁(一方が0近傍)" if hi > 1e-6 else None
+    if hi / lo >= GROSS_MISS_RATIO:
+        return f"桁(比率≈{hi / lo:.0f}倍)"
+    return None
 
 
 # --------------------------------------------------------------------------- ledger-record accessors
@@ -150,11 +217,17 @@ class ExecComparison:
     match: bool              # True iff the re-execution confirms the committed number
     reason: str              # human-readable 判定根拠 (auditable)
     conflicts: tuple[str, ...] = ()  # per-axis入力集合の差 (empty on a match)
+    corrected_answer: str = ""       # SOT-2547 — the re-derived value to adopt on EXEC_CORRECTED
 
     @property
     def should_abstain(self) -> bool:
         """Precision-first: a conflict / ungrounded / undecidable verdict must not commit (−1 avoidance)."""
         return self.category in _ABSTAIN_CATEGORIES
+
+    @property
+    def should_correct(self) -> bool:
+        """SOT-2547 — the committed number was a大外し and a confident同一対象 re-derivation replaces it."""
+        return self.category == EXEC_CORRECTED and bool(self.corrected_answer)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -162,10 +235,22 @@ class ExecComparison:
             "match": self.match,
             "reason": self.reason,
             "conflicts": list(self.conflicts),
+            "corrected_answer": self.corrected_answer,
         }
 
 
-def compare_execution(committed: Mapping[str, Any], rederived: Mapping[str, Any] | None) -> ExecComparison:
+def _columns_compatible(c_cols: set[str], r_cols: set[str]) -> bool:
+    """True when committed and re-derivation computed the *same* target (対象列一致 / 一方が未記録).
+
+    A gross-miss may only be *corrected* (re-derivation adopted) when both sides addressed the same
+    target — same columns, or one side did not record its columns. When the target columns genuinely
+    diverge the disagreement is a対象取り違え whose correct side is ambiguous, so it must 棄権 (idx47/70
+    型), never silently adopt one target over the other."""
+    return not c_cols or not r_cols or c_cols == r_cols
+
+
+def compare_execution(committed: Mapping[str, Any], rederived: Mapping[str, Any] | None, *,
+                      correct: bool = False) -> ExecComparison:
     """Reconcile a committed numeric ledger record with an independent re-execution's ledger record.
 
     ``committed`` and ``rederived`` are both SOT-2495 calc-ledger-shaped dicts (``answer`` / ``typed_value``
@@ -180,7 +265,13 @@ def compare_execution(committed: Mapping[str, Any], rederived: Mapping[str, Any]
        then the value itself (via the tested :func:`~src.rag.agent.verifier.compare_answers` rounding axis),
        then the unit. Every detected axis is collected into ``conflicts`` for the audit line.
     4. **一致 (:data:`EXEC_MATCH`)** — none of the above: the re-execution confirms the number.
-    """
+
+    **大外し矯正 (:data:`EXEC_CORRECTED`, SOT-2547).** When ``correct`` is True and the deciding conflict is a
+    *value* mismatch that is a大外し (:func:`_gross_miss_kind` — 符号反転 idx63 型 / 桁違い idx97 型) while
+    the two addressed the **same target** (:func:`_columns_compatible`) and the independent re-derivation is
+    grounded, contract-clean and confident, the committed number is *replaced* by the re-derivation instead
+    of abstaining — a deterministic-backed matching correction. Default ``correct=False`` keeps the pure
+    EXEC_CONFLICT→棄権 behavior byte-identical (対象取り違え idx47/70 型 stays 棄権, 確証不能につき安全側)."""
     # 1) 暗算: a committed number with no calculation証跡 has nothing to re-run.
     if not is_grounded(committed):
         return ExecComparison(
@@ -224,6 +315,7 @@ def compare_execution(committed: Mapping[str, Any], rederived: Mapping[str, Any]
 
     conflicts: list[str] = []
     primary: str | None = None
+    value_gross_miss: str | None = None
 
     # 3a) 対象列 (columns_used): the direct signature of a 相関ペア取り違え / wrong-column derivation.
     c_cols, r_cols = _columns_used(committed), _columns_used(rederived)
@@ -249,6 +341,7 @@ def compare_execution(committed: Mapping[str, Any], rederived: Mapping[str, Any]
     if not value_cmp.agree and value_cmp.category != CATEGORY_ABSTAIN:
         conflicts.append(f"値の相違: {value_cmp.reason}")
         primary = primary or EXEC_CONFLICT
+        value_gross_miss = _gross_miss_kind(_answer_of(committed), _answer_of(rederived))
 
     # 3d) 単位 (unit): a value that matches numerically but differs in unit is still a mismatch.
     c_unit, r_unit = _unit_of(committed), _unit_of(rederived)
@@ -257,6 +350,21 @@ def compare_execution(committed: Mapping[str, Any], rederived: Mapping[str, Any]
         primary = primary or EXEC_CONFLICT
 
     if primary == EXEC_CONFLICT:
+        # 3e) 大外し矯正 (SOT-2547): a value 大外し over the *same target* with a confident, grounded,
+        # contract-clean independent re-derivation is corrected — the re-derivation replaces the committed
+        # number (idx63 符号 / idx97 桁). 対象列が食い違う取り違え(idx47/70)は same-target 条件で除外され
+        # 従来どおり棄権(確証不能につき安全側)。value 以外の食い違い(単位/丸めのみ)も矯正しない。
+        rederived_answer = _answer_of(rederived)
+        if (correct and value_gross_miss and _columns_compatible(c_cols, r_cols)
+                and _confidence_of(rederived) >= GROSS_MISS_MIN_CONFIDENCE
+                and not is_abstain(rederived_answer)):
+            return ExecComparison(
+                EXEC_CORRECTED, True,
+                f"台帳が大外し[{value_gross_miss}]・同一対象の独立再実行が確定値 → 再計算値を採用"
+                f"(台帳『{_answer_of(committed)}』→ 採用『{rederived_answer}』): " + " / ".join(conflicts),
+                conflicts=tuple(conflicts),
+                corrected_answer=rederived_answer,
+            )
         return ExecComparison(
             EXEC_CONFLICT, False,
             "独立再実行と不一致(EVIDENCE_CONFLICT) — " + " / ".join(conflicts),
@@ -283,6 +391,12 @@ class ExecVerdict:
     committed_answer: str
     rederived_answer: str
     conflicts: tuple[str, ...] = field(default_factory=tuple)
+    corrected_answer: str = ""       # SOT-2547 — value to adopt when the verdict is EXEC_CORRECTED
+
+    @property
+    def should_correct(self) -> bool:
+        """SOT-2547 — the committed 大外し should be replaced by :attr:`corrected_answer`."""
+        return self.category == EXEC_CORRECTED and bool(self.corrected_answer)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -290,9 +404,11 @@ class ExecVerdict:
             "category": self.category,
             "match": self.match,
             "should_abstain": self.should_abstain,
+            "should_correct": self.should_correct,
             "reason": self.reason,
             "committed_answer": self.committed_answer,
             "rederived_answer": self.rederived_answer,
+            "corrected_answer": self.corrected_answer,
             "conflicts": list(self.conflicts),
         }
 
@@ -308,22 +424,25 @@ def _build_verdict(committed: Mapping[str, Any], rederived: Mapping[str, Any] | 
         committed_answer=_answer_of(committed),
         rederived_answer=("" if rederived is None else _answer_of(rederived)),
         conflicts=cmp.conflicts,
+        corrected_answer=cmp.corrected_answer,
     )
 
 
 # --------------------------------------------------------------------------- driver (pure over rederive)
 def verify_execution(committed: Mapping[str, Any], *,
-                     rederive: Callable[[str], Mapping[str, Any] | None]) -> ExecVerdict:
+                     rederive: Callable[[str], Mapping[str, Any] | None],
+                     correct: bool = False) -> ExecVerdict:
     """Independently re-execute the committed numeric answer's calculation and reconcile the two.
 
     ``committed`` is a SOT-2495 calc-ledger record. ``rederive`` maps the *question* to an independently
     re-executed calc-ledger record (or ``None`` when the re-execution could not run) — inject a scripted
     record in offline tests, or :func:`rederive_calc` for the live heterogeneous Gemini re-execution. The
-    re-executor never sees the committed answer, so its errors stay uncorrelated.
+    re-executor never sees the committed answer, so its errors stay uncorrelated. When ``correct`` is True
+    a同一対象 大外し is replaced by the re-derivation (:data:`EXEC_CORRECTED`, SOT-2547) instead of abstaining.
     """
     question = str(committed.get("question", ""))
     rederived = rederive(question)
-    cmp = compare_execution(committed, rederived)
+    cmp = compare_execution(committed, rederived, correct=correct)
     return _build_verdict(committed, rederived, cmp)
 
 
@@ -384,10 +503,12 @@ def exec_model_factory(question: str, tools: Sequence[AgentTool], *,
 def verify_question(committed: Mapping[str, Any], *, model: str | None = None,
                     profile: CorpusProfile | None = None,
                     max_turns: int = DEFAULT_MAX_TURNS,
-                    timeout_s: float = DEFAULT_TIMEOUT_S) -> ExecVerdict:
+                    timeout_s: float = DEFAULT_TIMEOUT_S,
+                    correct: bool = False) -> ExecVerdict:
     """Convenience live entry point: independently re-execute a committed numeric record's calculation.
 
     Only meaningful for a numeric, grounded committed record; callers gate on :func:`is_numeric_answer`.
+    When ``correct`` is True a同一対象 大外し is corrected to the re-derivation (SOT-2547) instead of 棄権.
     """
     def _rederive(q: str) -> Mapping[str, Any]:
         return rederive_calc(
@@ -395,7 +516,7 @@ def verify_question(committed: Mapping[str, Any], *, model: str | None = None,
             profile_factory=(lambda: profile) if profile is not None else None,
             max_turns=max_turns, timeout_s=timeout_s)
 
-    return verify_execution(committed, rederive=_rederive)
+    return verify_execution(committed, rederive=_rederive, correct=correct)
 
 
 def is_verifiable_record(record: Mapping[str, Any] | None) -> bool:

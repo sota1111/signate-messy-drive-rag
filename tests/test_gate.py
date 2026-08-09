@@ -267,6 +267,43 @@ def test_exec_gate_does_not_resurrect_an_abstention():
     assert not d.commit and d.answer == settings.ABSTAIN
 
 
+# --------------------------------------------------------------------------- SOT-2547: 大外し矯正 gate
+from src.rag.agent.exec_verifier import EXEC_CORRECTED  # noqa: E402
+
+
+def _corrected_verdict(*, committed, corrected):
+    return ExecVerdict(
+        question="Q?", category=EXEC_CORRECTED, match=True, should_abstain=False,
+        reason=f"{EXEC_CORRECTED} 桁 reason", committed_answer=committed,
+        rederived_answer=corrected, corrected_answer=corrected, conflicts=("値の相違",))
+
+
+def test_exec_gate_corrects_gross_miss_when_correction_enabled():
+    """idx63/97 相当: EXEC_CORRECTED verdict + 矯正ON → 台帳の大外しを再計算値へ置換(commit維持)。"""
+    r = _resolution("-30.78416", "-30.78416", confidence=0.9)
+    v = _corrected_verdict(committed="-30.78416", corrected="0.15002")
+    d = apply_gate(r, commit_confidence=0.7, exec_verdict=v, exec_verify=True, exec_correct=True)
+    assert d.commit and d.answer == "0.15002"
+    assert "矯正" in d.reason and EXEC_CORRECTED in d.reason
+
+
+def test_exec_gate_correction_disabled_abstains_on_gross_miss():
+    """矯正OFF(既定)で EXEC_CORRECTED を受け取っても大外しを commit せず安全側で棄権。"""
+    r = _resolution("18948", "18948", confidence=0.9)
+    v = _corrected_verdict(committed="18948", corrected="272")
+    d = apply_gate(r, commit_confidence=0.7, exec_verdict=v, exec_verify=True, exec_correct=False)
+    assert not d.commit and d.answer == settings.ABSTAIN
+    assert gate.GATE_EXEC_CORRECT is False   # default OFF → byte-identical answer path
+
+
+def test_exec_gate_correction_scoped_to_numeric_like_answer():
+    """非数値回答は矯正対象外(heterogeneous verifier のまま)= EXEC_CORRECTED でも original を維持。"""
+    r = _resolution("bmi", "bmi", confidence=0.9)
+    v = _corrected_verdict(committed="bmi", corrected="age")
+    d = apply_gate(r, commit_confidence=0.7, exec_verdict=v, exec_verify=True, exec_correct=True)
+    assert d.commit and d.answer == "bmi"
+
+
 def test_gate_question_runs_live_exec_verification(monkeypatch):
     """``gate_question`` wires the committed numeric record through the execution verifier when enabled."""
     r = _resolution("0.61", "0.61", confidence=0.9)

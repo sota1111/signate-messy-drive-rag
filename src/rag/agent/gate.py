@@ -82,6 +82,12 @@ GATE_TIEBREAK_CONFIDENCE = _float_env("GATE_TIEBREAK_CONFIDENCE", 0.85)
 GATE_EXEC_VERIFY = _bool_env("GATE_EXEC_VERIFY", True)
 GATE_EXEC_VERIFY_CONTRACTS = frozenset(
     c.strip() for c in os.getenv("GATE_EXEC_VERIFY_CONTRACTS", "numeric").split(",") if c.strip())
+# SOT-2547 — when a committed numeric/ID answer is a大外し(桁/符号) and an independent同一対象 re-execution
+# produces a confident, deterministic-backed value, *replace* the committed number with the re-derivation
+# (棄権化でなく矯正; idx63 符号 / idx97 桁). Default OFF so the answer path is byte-identical: with this OFF
+# the exec verifier never emits EXEC_CORRECTED and a大外し stays EXEC_CONFLICT→棄権, exactly as today. 対象
+# 取り違え(対象列が食い違う idx47/70)は same-target 条件で矯正対象外=従来どおり棄権(確証不能につき安全側).
+GATE_EXEC_CORRECT = _bool_env("GATE_EXEC_CORRECT", False)
 # SOT-2503 — whether the 合議一致 commit threshold is calibrated **per question-contract slice** rather
 # than by the single global GATE_COMMIT_CONFIDENCE. Default OFF: the whole slice-calibration path is
 # behavior-neutral (既定は現行同等・byte-identical) until 関門2 非劣化 / 実LB で緩和が確認できるまで — mirrors
@@ -215,6 +221,14 @@ def _abstain(question: str, resolution: Resolution, reason: str) -> GateDecision
     )
 
 
+def _corrected(decision: GateDecision, corrected_answer: str, reason: str) -> GateDecision:
+    """SOT-2547 — replace a大外し committed answer with the independent re-derivation (keeps commit)."""
+    return GateDecision(
+        question=decision.question, answer=corrected_answer, commit=True,
+        confidence=decision.confidence, reason=reason, resolution=decision.resolution,
+    )
+
+
 # --------------------------------------------------------------------------- execution gate (SOT-2501)
 def _exec_enabled(exec_verify: bool | None, contract: str | None, question: str) -> bool:
     """Resolve the master switch + contract allow-list; an explicit argument is a force override."""
@@ -226,13 +240,19 @@ def _exec_enabled(exec_verify: bool | None, contract: str | None, question: str)
 
 def apply_exec_gate(decision: GateDecision, exec_verdict: ExecVerdict | None, *,
                     exec_verify: bool | None = None,
-                    contract: str | None = None) -> GateDecision:
-    """Downgrade a committed derived-calculation answer when re-execution does not confirm it.
+                    contract: str | None = None,
+                    exec_correct: bool | None = None) -> GateDecision:
+    """Downgrade — or, on a大外し, *correct* — a committed derived-calculation answer per re-execution.
 
     Literal numeric answers and the ``numeric`` question-contract slice are in scope; unrelated text
     lookups remain with the heterogeneous verifier. With no explicit ``exec_verify`` override, both the
-    master flag and :data:`GATE_EXEC_VERIFY_CONTRACTS` must opt the contract in. A conflicting,
-    ungrounded or undecidable verdict turns the commit into a precision-first abstention.
+    master flag and :data:`GATE_EXEC_VERIFY_CONTRACTS` must opt the contract in.
+
+    A conflicting, ungrounded or undecidable verdict turns the commit into a precision-first abstention.
+    SOT-2547: when execution *correction* is enabled (``exec_correct`` / :data:`GATE_EXEC_CORRECT`) and the
+    verdict is :data:`~src.rag.agent.exec_verifier.EXEC_CORRECTED`, the committed大外し is *replaced* by the
+    independent re-derivation instead of abstaining (idx63 符号 / idx97 桁). 対象取り違え(idx47/70)は
+    EXEC_CORRECTED を出さず EXEC_CONFLICT のまま棄権へ倒れる(確証不能につき安全側)。
     """
     enabled = _exec_enabled(exec_verify, contract, decision.question)
     if not (enabled and decision.commit and exec_verdict is not None):
@@ -240,6 +260,18 @@ def apply_exec_gate(decision: GateDecision, exec_verdict: ExecVerdict | None, *,
     effective_contract = contract or _classify_contract(decision.question)
     if not (is_numeric_answer(decision.answer) or effective_contract == "numeric"):
         return decision
+    exec_correct = GATE_EXEC_CORRECT if exec_correct is None else exec_correct
+    if exec_verdict.should_correct:
+        if exec_correct:
+            return _corrected(
+                decision, exec_verdict.corrected_answer,
+                f"計算回答の大外しを実行検証で矯正({exec_verdict.category}): {exec_verdict.reason}")
+        # Correction disabled but the re-execution confirmed a大外し: never commit the wrong number —
+        # fall back to a precision-first abstention (defensive; the live path passes the same flag to
+        # the verifier so this branch is only reachable with a pre-built EXEC_CORRECTED verdict).
+        return _abstain(
+            decision.question, decision.resolution,
+            f"計算回答の大外しを検出(矯正無効のため棄権, {exec_verdict.category}): {exec_verdict.reason}")
     if not exec_verdict.should_abstain:
         return decision
     return _abstain(
@@ -254,6 +286,7 @@ def apply_gate(resolution: Resolution, *,
                tiebreak_confidence: float | None = None,
                exec_verdict: ExecVerdict | None = None,
                exec_verify: bool | None = None,
+               exec_correct: bool | None = None,
                slice_thresholds: dict[str, float] | None = None,
                contract: str | None = None,
                slice_calibrate: bool | None = None) -> GateDecision:
@@ -293,7 +326,8 @@ def apply_gate(resolution: Resolution, *,
         resolution, commit_confidence=effective_commit,
         commit_on_tiebreak=commit_on_tiebreak, tiebreak_confidence=tiebreak_confidence)
     return apply_exec_gate(
-        decision, exec_verdict, exec_verify=exec_verify, contract=contract)
+        decision, exec_verdict, exec_verify=exec_verify, contract=contract,
+        exec_correct=exec_correct)
 
 
 def _apply_confidence_gate(resolution: Resolution, *,
@@ -348,6 +382,7 @@ def gate_question(question: str, *,
                   tiebreak_confidence: float | None = None,
                   committed_calc_record: dict[str, Any] | None = None,
                   exec_verify: bool | None = None,
+                  exec_correct: bool | None = None,
                   contract: str | None = None,
                   slice_thresholds: dict[str, float] | None = None,
                   slice_calibrate: bool | None = None,
@@ -375,19 +410,21 @@ def gate_question(question: str, *,
         if committed_calc_record and committed_calc_record.get("contract") else None)
     contract = contract or _classify_contract(question)
     exec_verdict = _live_exec_verdict(
-        committed_calc_record, exec_verify=exec_verify, contract=contract, question=question)
+        committed_calc_record, exec_verify=exec_verify, exec_correct=exec_correct,
+        contract=contract, question=question)
     if slice_thresholds is None:
         slice_thresholds = load_slice_thresholds()
     return apply_gate(
         resolution, commit_confidence=commit_confidence,
         commit_on_tiebreak=commit_on_tiebreak, tiebreak_confidence=tiebreak_confidence,
-        exec_verdict=exec_verdict, exec_verify=exec_verify,
+        exec_verdict=exec_verdict, exec_verify=exec_verify, exec_correct=exec_correct,
         slice_thresholds=slice_thresholds, contract=contract, slice_calibrate=slice_calibrate,
     )
 
 
 def _live_exec_verdict(committed_calc_record: dict[str, Any] | None, *,
-                       exec_verify: bool | None, contract: str | None = None,
+                       exec_verify: bool | None, exec_correct: bool | None = None,
+                       contract: str | None = None,
                        question: str = "") -> ExecVerdict | None:
     """Best-effort live verdict for an opted-in calculation record (None when inapplicable)."""
     enabled = _exec_enabled(exec_verify, contract, question)
@@ -397,7 +434,8 @@ def _live_exec_verdict(committed_calc_record: dict[str, Any] | None, *,
 
     if not exec_verifier.is_verifiable_record(committed_calc_record):
         return None
+    correct = GATE_EXEC_CORRECT if exec_correct is None else exec_correct
     try:
-        return exec_verifier.verify_question(committed_calc_record)
+        return exec_verifier.verify_question(committed_calc_record, correct=correct)
     except Exception:  # noqa: BLE001 — advisory re-execution must never break the answer path
         return None
