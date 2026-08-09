@@ -14,6 +14,7 @@ secrets go only into the runtime, gitignored ``corpus_profile.json`` via ``profi
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -266,14 +267,25 @@ def caption_figure(file: str | Path | FileRef, question: str | None = None) -> d
         for start in range(0, len(pages), batch_size):
             batch = pages[start:start + batch_size]
             end = start + len(batch)
+            verbatim_item = bool(question and re.search(
+                r"(?:そのまま|抜き出|全文).*(?:内容|本文|詳細|説明)|"
+                r"(?:内容|本文|詳細|説明).*(?:そのまま|抜き出|全文)", question))
+            granularity_instruction = (
+                "質問は項目内容の逐語抽出です。candidate は対象IDに対応する Action/内容セルの全文とし、"
+                "見出しや先頭語だけに短縮しないでください。セル内の改行は連結し、説明・補足・実装内容・"
+                "ドキュメント化など同じセルに続く本文を末尾まで含めてください。source は対象IDを含む表の"
+                "行全体、conditioned_text は対象IDとAction/内容セル全文を含む形で転記してください。"
+                if verbatim_item else
+                "candidate は引用条件が直接修飾する最小の役務名だけにし、同じセルの隣接項目を含めないで"
+                "ください。特に読点で並ぶ項目や改行で分かれた項目を連結しないでください。"
+            )
             prompt = (
                 f"画像はPDFのページ{start + 1}〜{end}です。次の質問に答える根拠だけを画像から厳密に転記してください。\n"
                 f"質問: {query}\n\n"
                 "推測・要約・言い換えは禁止です。引用語や『明記』を求める質問では、その引用語を含む条件と"
                 "回答候補を同じ表セル・同じ文・同じ行で確認してください。質問が主語・所属・役割・表の欄を"
                 "限定している場合は、その限定と一致する行だけを採用し、引用語があっても別の節・表・役割の"
-                "候補は混ぜないでください。candidate は引用条件が直接修飾する最小の役務名だけにし、同じセルの"
-                "隣接項目を含めないでください。特に読点で並ぶ項目や改行で分かれた項目を連結しないでください。"
+                "候補は混ぜないでください。" + granularity_instruction +
                 "conditioned_text には条件語とcandidateが載る同一の視覚上の行だけを転記し、条件語が別の行なら"
                 "same_visual_line=false としてください。source は確認用のセル全体、candidate は条件語の直前にある"
                 "同一行の単一項目としてください。"
