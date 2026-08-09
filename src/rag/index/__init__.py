@@ -159,6 +159,25 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  canonical manifest skipped: {type(e).__name__}: {e}")
 
+    # Document registry (SOT-2583 / 事前処理 #1): one deterministic record per corpus file
+    # (doc_id / case_id / normalized filename + aliases / version family / entities / structure), so
+    # the serve path can resolve *which document* a question refers to — and hard-abstain on an
+    # explicitly-named file it cannot find (idx12) — before the answer loop starts, instead of burning
+    # the turn budget re-discovering the corpus. Additive and fully guarded — a failure here can never
+    # corrupt the retrieval index, and runtime consultation is opt-in (RAG_DOCUMENT_REGISTRY) so the
+    # champion serve path is byte-identical by default.
+    try:
+        from src.rag.index import document_registry
+        dr_counts = document_registry.build(refs)
+        if verbose:
+            print(f"  document registry: {dr_counts['files']} files "
+                  f"(versioned={dr_counts['versioned']}, with_predecessor={dr_counts['with_predecessor']}, "
+                  f"with_sheets={dr_counts['with_sheets']}, warnings={dr_counts['warnings']}) "
+                  f"-> {document_registry.default_out_path()}")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  document registry skipped: {type(e).__name__}: {e}")
+
     # Pre-index decrypt cache (SOT-2529 / 事前処理 #2): resolve every encrypted Office file's
     # password ONCE here and persist it into corpus_profile.json, so the run-wide shared profile
     # (SOT-2528) is pre-warmed and the first runtime decrypt/extract_office hits the cache instead
