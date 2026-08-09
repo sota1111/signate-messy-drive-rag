@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -99,6 +100,25 @@ _COLOR_SYNONYMS = {
 }
 
 
+# A coarse colour and the finer shades a human would still call by that name. Asking for 「青」(blue)
+# means any blue-ish fill, but the classifier separates 水色 (light blue) from 青 — so a 青 filter would
+# silently drop a 水色 highlight (SOT-2564 idx25, whose 青色ハイライト cells classify as 水色). Only
+# consulted when RAG_HIGHLIGHT_EXTRA is on, so the default filter stays an exact-name match (byte-identical).
+_COLOR_FAMILY = {
+    "青": {"青", "水色", "紺"},
+    "水色": {"水色", "青"},
+}
+
+_ON = {"1", "true", "yes", "on"}
+
+
+def _extra_enabled() -> bool:
+    """``RAG_HIGHLIGHT_EXTRA`` (default OFF): conditional-format highlights, blue-family colour
+    matching, and pivot-ancestor context. OFF ⇒ ``highlight_extract`` is byte-identical (champion
+    serve unchanged), mirroring ``RAG_FONT_EMPHASIS`` / ``RAG_XLSX_EMBEDDED_IMAGE`` (SOT-2564)."""
+    return os.getenv("RAG_HIGHLIGHT_EXTRA", "0").strip().lower() in _ON
+
+
 def _norm_color_query(color: str | None) -> str | None:
     """Normalise a caller-supplied colour filter to the coarse name the classifiers emit (or ``None``)."""
     if not color:
@@ -114,13 +134,21 @@ def _norm_color_query(color: str | None) -> str | None:
     return c
 
 
-def _color_matches(item_color: str | None, target: str | None) -> bool:
-    """True when no filter is set, or the item's classified colour equals the normalised target."""
+def _color_matches(item_color: str | None, target: str | None, *, family: bool = False) -> bool:
+    """True when no filter is set, or the item's classified colour equals the normalised target.
+
+    With ``family=True`` (RAG_HIGHLIGHT_EXTRA on) a coarse target also matches its finer shades — a
+    「青」 filter matches a 水色 highlight — via :data:`_COLOR_FAMILY` (SOT-2564 idx25)."""
     if target is None:
         return True
     if item_color is None:
         return False
-    return nfc(item_color).strip().lower() == target.strip().lower()
+    ic = nfc(item_color).strip()
+    if ic.lower() == target.strip().lower():
+        return True
+    if family:
+        return ic in _COLOR_FAMILY.get(target.strip(), frozenset())
+    return False
 
 
 def _item(value: Any, *, engine: str, color: str | None, kind: str,
@@ -156,6 +184,32 @@ def _office_bytes(ref: FileRef, profile: CorpusProfile | None) -> bytes | None:
 
 
 # --------------------------------------------------------------------------- per-format extractors
+def _pivot_ancestors(ws, cell) -> dict[str, Any] | None:
+    """Enclosing group labels of a highlighted cell in a (possibly hierarchical / forward-filled) pivot.
+
+    For each column left of the cell, the nearest non-empty value at or above the cell's row, keyed by
+    that column's header (row 1). Recovers ``{Gender: Male, target: 2, Age: 40-44, Country: Spain}`` for
+    a highlighted count cell so a "抽出条件と集計内容" question is answerable (SOT-2564 idx15). Dense
+    tables (every left cell filled) resolve on the same row, so this stays cheap; only sparse pivots
+    scan upward. ``None`` when no ancestor label exists."""
+    from openpyxl.utils import get_column_letter
+
+    ctx: dict[str, Any] = {}
+    for c in range(1, cell.column):
+        label = None
+        for r in range(cell.row, 0, -1):
+            v = ws.cell(r, c).value
+            if v is not None and str(v).strip() != "":
+                label = v
+                break
+        if label is None:
+            continue
+        header = ws.cell(1, c).value
+        key = str(header).strip() if header not in (None, "") else get_column_letter(c)
+        ctx[key] = label
+    return ctx or None
+
+
 def _xlsx_items(ref: FileRef, data: bytes | None) -> list[dict[str, Any]]:
     """Every solid-filled (highlighted) cell, sheet→row→column order, named via ``_excel_color_name``."""
     import openpyxl
@@ -163,6 +217,7 @@ def _xlsx_items(ref: FileRef, data: bytes | None) -> list[dict[str, Any]]:
     src = io.BytesIO(data) if data else str(ref.path)
     wb = openpyxl.load_workbook(src, data_only=True)
     file = ref.rel or str(ref.path)
+    extra = _extra_enabled()
     items: list[dict[str, Any]] = []
     for ws in wb.worksheets:
         for row in ws.iter_rows():
@@ -176,7 +231,106 @@ def _xlsx_items(ref: FileRef, data: bytes | None) -> list[dict[str, Any]]:
                 value = "" if cell.value is None else str(cell.value)
                 items.append(_item(value, engine="xlsx", color=color, kind="cell",
                                    file=file, sheet=ws.title, cell=cell.coordinate,
-                                   row=cell.row, column=cell.column))
+                                   row=cell.row, column=cell.column,
+                                   group=_pivot_ancestors(ws, cell) if extra else None))
+    return items
+
+
+def _cf_condition_text(operator: str | None, formulas: Any) -> str:
+    """Human-readable condition for a ``cellIs`` conditional-format rule (e.g. ``セルの値 < -0.99``)."""
+    ops = {"lessThan": "<", "lessThanOrEqual": "<=", "greaterThan": ">",
+           "greaterThanOrEqual": ">=", "equal": "=", "notEqual": "!=",
+           "between": "の範囲", "notBetween": "の範囲外", "containsText": "を含む"}
+    vals = ", ".join(str(x) for x in (formulas or []))
+    label = ops.get(operator or "", operator or "")
+    if operator in ("between", "notBetween"):
+        return f"セルの値が {vals} {label}".strip()
+    return f"セルの値 {label} {vals}".strip()
+
+
+def _cf_satisfying_cells(ws, sqref, operator: str | None, formulas: Any) -> list[tuple[str, Any]]:
+    """Numeric cells inside ``sqref`` that satisfy a ``cellIs`` rule, as ``(coordinate, value)``."""
+    try:
+        thr = [float(str(f)) for f in (formulas or [])]
+    except (TypeError, ValueError):
+        return []
+    if not thr:
+        return []
+
+    def ok(x: float) -> bool:
+        if operator == "lessThan":
+            return x < thr[0]
+        if operator == "lessThanOrEqual":
+            return x <= thr[0]
+        if operator == "greaterThan":
+            return x > thr[0]
+        if operator == "greaterThanOrEqual":
+            return x >= thr[0]
+        if operator == "equal":
+            return x == thr[0]
+        if operator == "notEqual":
+            return x != thr[0]
+        if operator == "between" and len(thr) >= 2:
+            return thr[0] <= x <= thr[1]
+        if operator == "notBetween" and len(thr) >= 2:
+            return not (thr[0] <= x <= thr[1])
+        return False
+
+    out: list[tuple[str, Any]] = []
+    for cr in sqref.ranges:
+        min_col, min_row, max_col, max_row = cr.bounds
+        for r in range(min_row, max_row + 1):
+            for c in range(min_col, max_col + 1):
+                v = ws.cell(r, c).value
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    continue
+                if ok(float(v)):
+                    out.append((ws.cell(r, c).coordinate, v))
+    return out
+
+
+def _xlsx_cf_items(ref: FileRef, data: bytes | None) -> list[dict[str, Any]]:
+    """Conditional-format highlights — the fills openpyxl exposes ONLY via ``ws.conditional_formatting``.
+
+    A yellow/red highlight applied by a rule (e.g. ``値 < -0.99``) never touches ``cell.fill``, so the
+    solid-fill scan in :func:`_xlsx_items` misses it entirely (SOT-2564 idx65 returned zero). Surface
+    each ``cellIs`` rule as one highlight item carrying its colour (from the dxf fill) and a
+    human-readable condition, plus the numeric cells that satisfy it — so both "黄色ハイライトの条件は?"
+    (needs the rule) and "青ハイライトの合計は?" (needs the cells) are answerable. Best-effort: any read
+    error yields no CF items (zero regression)."""
+    import openpyxl
+
+    src = io.BytesIO(data) if data else str(ref.path)
+    try:
+        wb = openpyxl.load_workbook(src, data_only=True)
+    except Exception:
+        return []
+    file = ref.rel or str(ref.path)
+    items: list[dict[str, Any]] = []
+    for ws in wb.worksheets:
+        cf = ws.conditional_formatting
+        for rng in cf:
+            for rule in cf[rng]:
+                if getattr(rule, "type", None) != "cellIs":
+                    continue
+                dxf = getattr(rule, "dxf", None)
+                fill = getattr(dxf, "fill", None) if dxf else None
+                color = None
+                if fill is not None:
+                    for attr in ("bgColor", "fgColor"):
+                        c = getattr(fill, attr, None)
+                        name = _office._excel_color_name(c) if c is not None else None
+                        if name:
+                            color = name
+                            break
+                cond = _cf_condition_text(rule.operator, rule.formula)
+                sat = _cf_satisfying_cells(ws, rng.sqref, rule.operator, rule.formula)
+                items.append(_item(
+                    cond, engine="xlsx", color=color, kind="conditional_format",
+                    file=file, sheet=ws.title, sqref=str(rng.sqref), operator=rule.operator,
+                    formula=[str(f) for f in (rule.formula or [])], condition=cond,
+                    n_matched=len(sat), matched_cells=[c for c, _ in sat][:50],
+                    matched_values=[v for _, v in sat][:50]))
     return items
 
 
@@ -487,7 +641,13 @@ def highlight_extract(file: str | Path | FileRef, *, color: str | None = None,
         items = list(items) + _xlsx_embedded_image.embedded_highlight_items(
             ref, _office_bytes(ref, profile))
 
-    items = [it for it in items if _color_matches(it["method"].get("color"), target)]
+    # SOT-2564: conditional-format highlights (rule-based fills the solid-fill scan cannot see).
+    # Additive and opt-in — empty/absent when RAG_HIGHLIGHT_EXTRA is off, so champion is byte-identical.
+    extra = _extra_enabled()
+    if extra and ref.ext in ("xlsx", "xlsm"):
+        items = list(items) + _xlsx_cf_items(ref, _office_bytes(ref, profile))
+
+    items = [it for it in items if _color_matches(it["method"].get("color"), target, family=extra)]
     colors = sorted({it["method"]["color"] for it in items if it["method"].get("color")})
     return contract.make(
         items,
