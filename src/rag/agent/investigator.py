@@ -1945,6 +1945,27 @@ def answer_question(question: str, *, model: str | None = None,
     (default: deterministic classification only, so this path stays reproducible).
     """
     profile_obj = profile or CorpusProfile()
+    # Explicit-file hard constraint (SOT-2583 / 事前処理 #1, idx12): when the question names a file
+    # explicitly and the document registry cannot resolve it after an exhaustive manifest scan, abstain
+    # with the coded reason instead of falling through to semantic retrieval and over-inferring. Opt-in
+    # (RAG_DOCUMENT_REGISTRY) — a no-op when disabled or the artifact is absent, so the champion serve
+    # path stays byte-identical.
+    from src.rag.index import document_registry as _document_registry
+    _dr_reason = _document_registry.hard_constraint_abstain(question)
+    if _dr_reason is not None:
+        return Investigation(
+            question=question,
+            answer=Answer(answer=ABSTAIN, confidence=0.0,
+                          evidence=f"registry: {_dr_reason}",
+                          method="document_registry.hard_constraint"),
+            iterations=0,
+            tool_calls=["document_registry"],
+            usage=Usage(),
+            model="deterministic",
+            elapsed_s=0.0,
+            stop_reason=_dr_reason,
+            contract=None,
+        )
     tools = build_tools(profile_obj)
     system: str | None = None
     contract: str | None = None
