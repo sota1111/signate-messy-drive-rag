@@ -167,6 +167,34 @@ def test_regulation_content_contract_requires_fallback_general_rule() -> None:
     assert complete.passed and complete.applicable and not complete.missing
 
 
+def test_regulation_content_flags_not_found_phrasing() -> None:
+    """SOT-2548 idx78: a 「…が見つかりませんでした」 negative must trip the completeness guard.
+
+    The consolidated run answered idx78 with a "not found" wording rather than 「存在しない」, which the
+    original _NO_SPECIAL_REGULATION_RE missed — so the general-rule fields were never enforced and the
+    answer trailed off incomplete.
+    """
+    q = ("ひがし丘の契約条件において、ACTHが200時間を超えた場合の精算方法に関する規定内容を"
+         "答えてください。")
+    idx78_answer = ("ひがし丘の契約書には「ACTH」に関する記述が見つかりませんでしたが、実績工数が"
+                    "見積を超えた場合の精算方法については、以下の一般規定が適用されます。")
+    flagged = qc.validate_regulation_answer(q, idx78_answer)
+    assert not flagged.passed and flagged.applicable
+    assert set(flagged.missing) == {"単価", "税処理", "課金単位", "丸め", "精算周期", "上限"}
+
+    complete = qc.validate_regulation_answer(
+        q,
+        "ACTHの特別な精算規定は見つかりませんが、一般規定として時間単価25,000円(税別)に消費税を"
+        "加算し、30分単位で切上げ、月次精算します。上限はありません。",
+    )
+    assert complete.passed and not complete.missing
+
+    # A regulation-content answer that does not make a negative/not-found claim is untouched.
+    positive = qc.validate_regulation_answer(
+        q, "ACTHが200時間を超えた分は時間単価25,000円で別途精算すると規定されています。")
+    assert positive.passed
+
+
 def test_gantt_week_question_is_chart_read_with_geometry_completion() -> None:
     q = "提案書.pptxでモデル改善の実行予定スケジュールは案件開始から第何週目ですか。"
     result = classify(q)

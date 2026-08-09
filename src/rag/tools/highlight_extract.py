@@ -62,6 +62,7 @@ from src.rag.extract import passwords as _passwords
 from src.rag.tools import contract
 from src.rag.tools.contract import ContractError
 from src.rag.tools.extract_tools import resolve_ref
+from src.rag.tools import xlsx_embedded_image as _xlsx_embedded_image
 from src.rag.tools.pdf_faux_italic import detect_faux_italic
 from src.rag.tools.profile import CorpusProfile
 
@@ -478,6 +479,13 @@ def highlight_extract(file: str | Path | FileRef, *, color: str | None = None,
             raise ContractError(
                 f"unsupported file for highlight extraction: .{ref.ext} "
                 "(expected xlsx/xlsm/pptx/docx/pdf)")
+
+    # SOT-2548: a sheet whose content is a *picture* (an embedded EMF screenshot of a table) reports no
+    # cells, so the grid scan above finds no highlights. Additively surface the picture's highlighted
+    # cells with their pivot grouping context (gated by RAG_XLSX_EMBEDDED_IMAGE; empty when off).
+    if ref.ext in ("xlsx", "xlsm") and _xlsx_embedded_image.enabled():
+        items = list(items) + _xlsx_embedded_image.embedded_highlight_items(
+            ref, _office_bytes(ref, profile))
 
     items = [it for it in items if _color_matches(it["method"].get("color"), target)]
     colors = sorted({it["method"]["color"] for it in items if it["method"].get("color")})
