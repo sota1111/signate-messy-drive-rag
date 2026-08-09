@@ -182,6 +182,12 @@ def test_regulation_content_flags_not_found_phrasing() -> None:
     assert not flagged.passed and flagged.applicable
     assert set(flagged.missing) == {"単価", "税処理", "課金単位", "丸め", "精算周期", "上限"}
 
+    # The consolidated run instead phrased the negative as 「直接の記述はありません」 (subject 記述 + あり
+    # ません, which the 見つからない-only widening still missed) — the guard must fire on this too.
+    no_record = ("ACTHという直接の記述はありませんが、実績工数に基づき時間単価25,000円で精算されます。")
+    flagged_record = qc.validate_regulation_answer(q, no_record)
+    assert not flagged_record.passed and "精算周期" in flagged_record.missing
+
     complete = qc.validate_regulation_answer(
         q,
         "ACTHの特別な精算規定は見つかりませんが、一般規定として時間単価25,000円(税別)に消費税を"
