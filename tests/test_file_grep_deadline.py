@@ -52,6 +52,17 @@ def test_max_scan_seconds_default_and_env(monkeypatch: pytest.MonkeyPatch) -> No
     assert call_budget.max_scan_seconds() == 180.0
 
 
+def test_reserve_seconds_default_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("RAG_FILE_GREP_RESERVE_S", raising=False)
+    assert call_budget.reserve_seconds() == 30.0
+    monkeypatch.setenv("RAG_FILE_GREP_RESERVE_S", "12")
+    assert call_budget.reserve_seconds() == 12.0
+    monkeypatch.setenv("RAG_FILE_GREP_RESERVE_S", "-1")
+    assert call_budget.reserve_seconds() == 0.0
+    monkeypatch.setenv("RAG_FILE_GREP_RESERVE_S", "bogus")
+    assert call_budget.reserve_seconds() == 30.0
+
+
 def test_scan_deadline_unbounded_when_disabled_and_no_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RAG_FILE_GREP_MAX_SCAN_S", "0")
     assert call_budget.current_remaining() is None
@@ -60,6 +71,7 @@ def test_scan_deadline_unbounded_when_disabled_and_no_budget(monkeypatch: pytest
 
 def test_scan_deadline_is_smaller_of_cap_and_remaining(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RAG_FILE_GREP_MAX_SCAN_S", "180")
+    monkeypatch.setenv("RAG_FILE_GREP_RESERVE_S", "30")
     now = 1000.0
     clk = lambda: now  # noqa: E731
     # No propagated budget ⇒ bounded by the cap only.
@@ -67,7 +79,7 @@ def test_scan_deadline_is_smaller_of_cap_and_remaining(monkeypatch: pytest.Monke
     # Remaining budget smaller than the cap ⇒ bounded by the remaining budget.
     with call_budget.remaining_budget(30.0):
         assert call_budget.current_remaining() == 30.0
-        assert call_budget.scan_deadline(clk) == pytest.approx(now + 30.0)
+        assert call_budget.scan_deadline(clk) == pytest.approx(now)
     # Remaining budget larger than the cap ⇒ bounded by the cap.
     with call_budget.remaining_budget(600.0):
         assert call_budget.scan_deadline(clk) == pytest.approx(now + 180.0)
@@ -75,6 +87,15 @@ def test_scan_deadline_is_smaller_of_cap_and_remaining(monkeypatch: pytest.Monke
     with call_budget.remaining_budget(0.0):
         assert call_budget.scan_deadline(clk) == pytest.approx(now)
     assert call_budget.current_remaining() is None            # context restored on exit
+
+
+def test_scan_deadline_reserves_time_for_route_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RAG_FILE_GREP_MAX_SCAN_S", "180")
+    monkeypatch.setenv("RAG_FILE_GREP_RESERVE_S", "30")
+    with call_budget.remaining_budget(180.0):
+        assert call_budget.scan_deadline(lambda: 1000.0) == pytest.approx(1150.0)
+    with call_budget.remaining_budget(90.0):
+        assert call_budget.scan_deadline(lambda: 1000.0) == pytest.approx(1060.0)
 
 
 # --------------------------------------------------------------------------- file_grep cancellation

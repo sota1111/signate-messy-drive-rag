@@ -36,6 +36,7 @@ from typing import Callable, Iterator
 _REMAINING_S: ContextVar["float | None"] = ContextVar("rag_call_remaining_s", default=None)
 
 _DEFAULT_MAX_SCAN_S = 180.0
+_DEFAULT_RESERVE_S = 30.0
 
 
 def max_scan_seconds(default: float = _DEFAULT_MAX_SCAN_S) -> float:
@@ -50,6 +51,23 @@ def max_scan_seconds(default: float = _DEFAULT_MAX_SCAN_S) -> float:
         return default
     try:
         return float(raw.strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def reserve_seconds(default: float = _DEFAULT_RESERVE_S) -> float:
+    """Question budget kept for route switching after a cancelled scan.
+
+    ``RAG_FILE_GREP_RESERVE_S`` is applied only when the investigator propagated a remaining
+    question budget.  Direct calls still receive the full per-call cap.  Keeping a small reserve is
+    essential: clamping a scan to *all* remaining time bounds the runaway, but leaves no model turn
+    in which to consume ``deadline_hit`` and select the alternate route promised by the contract.
+    """
+    raw = os.getenv("RAG_FILE_GREP_RESERVE_S")
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return max(0.0, float(raw.strip()))
     except (TypeError, ValueError):
         return default
 
@@ -88,7 +106,11 @@ def scan_deadline(clock: Callable[[], float] = time.monotonic,
     if cap is not None and cap > 0:
         budget = float(cap)
     if remaining is not None:
-        budget = float(remaining) if budget is None else min(budget, float(remaining))
+        # Leave time for the model to observe deadline_hit and execute a cheaper route.  Without
+        # this reserve the former min(cap, remaining) merely changed a 300–658s overrun into a
+        # ~180s timeout/abstain, as the SOT-2563 human-review focused run demonstrated.
+        route_budget = max(0.0, float(remaining) - reserve_seconds())
+        budget = route_budget if budget is None else min(budget, route_budget)
     if budget is None:
         return None
     return clock() + max(0.0, budget)
