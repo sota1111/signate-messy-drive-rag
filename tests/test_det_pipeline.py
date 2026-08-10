@@ -5,6 +5,11 @@ All network-free: the classifier runs deterministically, the registry is a pure 
 test are the Stage0 contract: default OFF ⇒ byte-identical; empty registry ⇒ every question routes to
 the LLM loop; a grounded pipeline short-circuits the loop; an ungrounded pipeline falls back
 (回答数を減らさない).
+
+Registry-mechanics and ``resolve`` unit tests use a synthetic free contract name (:data:`_C`) so they
+exercise the registry itself without colliding with the real per-type pipelines that now self-register
+(Wave A1 ``version_diff`` / Wave A2 ``numeric``). The live wiring tests keep the real ``numeric`` contract
+(that is how ``_numeric_question`` classifies) and override / clear it explicitly per test.
 """
 from __future__ import annotations
 
@@ -16,11 +21,21 @@ from src.rag.agent import question_contract as qc
 from src.rag.agent.investigator import ABSTAIN, SUBMIT_ANSWER, Call, Step, Usage
 from src.rag.tools import contract as _contract
 
+# A synthetic contract name for the pure registry/resolve mechanics — never a real classified contract,
+# so registering it can never collide with (or be shadowed by) a self-registering per-type pipeline.
+_C = "__det_test_contract__"
+
 
 # --------------------------------------------------------------------------- registry cleanup fixture
 @pytest.fixture(autouse=True)
 def _restore_registry():
-    """Snapshot and restore the module-global registry so tests never leak registrations."""
+    """Snapshot and restore the module-global registry so tests never leak registrations.
+
+    The real per-type pipelines are bootstrapped *before* the snapshot, so ``saved`` always carries the
+    canonical registry (version_diff + numeric + …) and the finally-block restores it verbatim — a test
+    that overrides/clears an entry (with ``replace=True`` / ``unregister``) is undone afterward.
+    """
+    dp.registered_contracts()  # force the lazy pipelines bootstrap before snapshotting
     saved = dict(dp._REGISTRY)
     try:
         yield
@@ -73,10 +88,18 @@ def test_wave_a1_wires_version_diff():
     assert "version_diff" in dp.registered_contracts()
 
 
+def test_wave_a2_wires_numeric():
+    # Wave A2 (SOT-2607) registers the deterministic ``numeric`` pipeline via the same lazy bootstrap.
+    from src.rag.agent.pipelines import numeric as num
+
+    assert "numeric" in dp.registered_contracts()
+    assert dp._REGISTRY["numeric"] is num.pipeline
+
+
 def test_register_and_lookup():
     fn = lambda q, *, profile=None: _contract.make("v", engine="test")
-    dp.register("numeric", fn)
-    assert "numeric" in dp.registered_contracts()
+    dp.register(_C, fn)
+    assert _C in dp.registered_contracts()
 
 
 def test_register_rejects_empty_type():
@@ -86,15 +109,15 @@ def test_register_rejects_empty_type():
 
 def test_register_rejects_non_callable():
     with pytest.raises(TypeError):
-        dp.register("numeric", 123)  # type: ignore[arg-type]
+        dp.register(_C, 123)  # type: ignore[arg-type]
 
 
 def test_register_duplicate_raises_without_replace():
-    dp.register("numeric", lambda q, *, profile=None: None)
+    dp.register(_C, lambda q, *, profile=None: None)
     with pytest.raises(ValueError):
-        dp.register("numeric", lambda q, *, profile=None: None)
+        dp.register(_C, lambda q, *, profile=None: None)
     # replace=True overwrites without raising
-    dp.register("numeric", lambda q, *, profile=None: None, replace=True)
+    dp.register(_C, lambda q, *, profile=None: None, replace=True)
 
 
 def test_unregister_is_noop_when_absent():
@@ -103,9 +126,9 @@ def test_unregister_is_noop_when_absent():
 
 # --------------------------------------------------------------------------- resolve() unit tests
 def test_resolve_none_when_disabled():
-    dp.register("numeric", lambda q, *, profile=None: _contract.make("v", engine="test"))
+    dp.register(_C, lambda q, *, profile=None: _contract.make("v", engine="test"))
     # flag off (force not set) ⇒ never runs the pipeline
-    assert dp.resolve("q", "numeric") is None
+    assert dp.resolve("q", _C) is None
 
 
 def test_resolve_none_when_contract_unset():
@@ -113,13 +136,13 @@ def test_resolve_none_when_contract_unset():
 
 
 def test_resolve_none_when_unregistered():
-    assert dp.resolve("q", "numeric", force=True) is None
+    assert dp.resolve("q", "does_not_exist", force=True) is None
 
 
 def test_resolve_returns_normalized_contract_when_grounded():
-    dp.register("numeric",
+    dp.register(_C,
                 lambda q, *, profile=None: _contract.make(42, engine="pandas", evidence={"file": "t.xlsx"}))
-    out = dp.resolve(_numeric_question(), "numeric", force=True)
+    out = dp.resolve(_numeric_question(), _C, force=True)
     assert out is not None
     assert _contract.is_contract(out)
     assert out["value"] == 42
@@ -129,34 +152,34 @@ def test_resolve_returns_normalized_contract_when_grounded():
 
 def test_resolve_falls_back_on_none_value():
     # a contract whose value is None means "resolved nothing" ⇒ fall back to the LLM loop
-    dp.register("numeric", lambda q, *, profile=None: _contract.make(None, engine="test"))
-    assert dp.resolve("q", "numeric", force=True) is None
+    dp.register(_C, lambda q, *, profile=None: _contract.make(None, engine="test"))
+    assert dp.resolve("q", _C, force=True) is None
 
 
 def test_resolve_falls_back_on_pipeline_returning_none():
-    dp.register("numeric", lambda q, *, profile=None: None)
-    assert dp.resolve("q", "numeric", force=True) is None
+    dp.register(_C, lambda q, *, profile=None: None)
+    assert dp.resolve("q", _C, force=True) is None
 
 
 def test_resolve_falls_back_on_malformed_result():
-    dp.register("numeric", lambda q, *, profile=None: {"not": "a contract"})
-    assert dp.resolve("q", "numeric", force=True) is None
+    dp.register(_C, lambda q, *, profile=None: {"not": "a contract"})
+    assert dp.resolve("q", _C, force=True) is None
 
 
 def test_resolve_falls_back_when_pipeline_raises():
     def boom(q, *, profile=None):
         raise RuntimeError("pipeline blew up")
 
-    dp.register("numeric", boom)
-    assert dp.resolve("q", "numeric", force=True) is None  # never propagates into the answer path
+    dp.register(_C, boom)
+    assert dp.resolve("q", _C, force=True) is None  # never propagates into the answer path
 
 
 def test_resolve_env_gated(monkeypatch):
-    dp.register("numeric", lambda q, *, profile=None: _contract.make("v", engine="test"))
+    dp.register(_C, lambda q, *, profile=None: _contract.make("v", engine="test"))
     monkeypatch.setenv("RAG_DET_PIPELINE_ROUTER", "1")
-    assert dp.resolve("q", "numeric") is not None
+    assert dp.resolve("q", _C) is not None
     monkeypatch.setenv("RAG_DET_PIPELINE_ROUTER", "0")
-    assert dp.resolve("q", "numeric") is None
+    assert dp.resolve("q", _C) is None
 
 
 # --------------------------------------------------------------------------- answer_question wiring
@@ -169,7 +192,7 @@ def test_router_off_is_byte_identical_even_with_a_registered_pipeline(monkeypatc
         called["pipeline"] = True
         return _contract.make("決定論の値", engine="test")
 
-    dp.register("numeric", pipeline)
+    dp.register("numeric", pipeline, replace=True)  # override the real Wave A2 pipeline for this test
 
     def fake_factory(question, tools, *, model=None, system=None):
         return _ScriptedModel([_submit("モデル主導の値", confidence=0.9)])
@@ -185,8 +208,9 @@ def test_router_off_is_byte_identical_even_with_a_registered_pipeline(monkeypatc
 
 
 def test_router_empty_registry_routes_to_loop(monkeypatch):
-    # flag ON but Stage0 registry empty ⇒ every question still routes to the LLM loop (byte-identical).
+    # flag ON but no pipeline registered for this contract ⇒ the question still routes to the LLM loop.
     monkeypatch.setenv("RAG_DET_PIPELINE_ROUTER", "1")
+    dp.unregister("numeric")  # remove the real Wave A2 pipeline so the numeric route has no det pipeline
 
     def fake_factory(question, tools, *, model=None, system=None):
         return _ScriptedModel([_submit("モデル主導の値", confidence=0.9)])
@@ -205,7 +229,8 @@ def test_router_short_circuits_loop_when_pipeline_grounds_value(monkeypatch):
     monkeypatch.setenv("RAG_DET_PIPELINE_ROUTER", "1")
     dp.register("numeric",
                 lambda q, *, profile=None: _contract.make(
-                    "12.3", engine="pandas", evidence={"file": "train.xlsx"}, confidence=0.95))
+                    "12.3", engine="pandas", evidence={"file": "train.xlsx"}, confidence=0.95),
+                replace=True)
 
     def fake_factory(question, tools, *, model=None, system=None):
         raise AssertionError("LLM loop must not be entered when the router grounds an answer")
@@ -225,7 +250,7 @@ def test_router_short_circuits_loop_when_pipeline_grounds_value(monkeypatch):
 def test_router_falls_back_to_loop_when_pipeline_ungrounded(monkeypatch):
     # flag ON + a pipeline that resolves nothing ⇒ fall back to the LLM loop (回答数を減らさない).
     monkeypatch.setenv("RAG_DET_PIPELINE_ROUTER", "1")
-    dp.register("numeric", lambda q, *, profile=None: _contract.make(None, engine="test"))
+    dp.register("numeric", lambda q, *, profile=None: _contract.make(None, engine="test"), replace=True)
 
     def fake_factory(question, tools, *, model=None, system=None):
         return _ScriptedModel([_submit("フォールバック値", confidence=0.8)])
