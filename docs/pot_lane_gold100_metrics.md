@@ -55,10 +55,28 @@ N-sample majority    一致条件 = answer ∧ operand source ∧ unit ∧ branc
 
 出力: `artifacts/pot_lane_diagnostics.json`。
 
-> live gold ラン (Gemini 認証・コスト・timeout) は本 PR の範囲外。details 取込口を用意済みで、
-> 有効提出時に上記三層 accuracy が同一スクリプトで記録される。idx76 型の分岐選択ミスは
-> Condition IR の `branch_signature` 不一致として formula 層で捕捉され、多数決でも branch 軸の不一致
-> として弾かれる (回帰テスト `test_conditional_branch_must_reference_base_quantity`)。
+2026-08-10 に `RAG_POT_HARD_LANE=1` で `derived_calculation` 32 問を本番 investigator 経路で実測した。
+`verify_formula` が実行された 12 問の三層 trace は以下。残りは特化 route または数値計算に至る前の
+棄権/timeout であり、trace の分母には含めない。最終回答は match 4 / abstain 27 / wrong 1 で、
+三層診断は最終回答一致とは分離して記録した。
+
+| metric | value |
+| --- | --- |
+| traces | 12 |
+| operand_binding_accuracy | 1.0000 |
+| formula_accuracy | 1.0000 |
+| execution_accuracy | 1.0000 |
+| verifier_disagreement_rate | 0.0000 |
+| commit_rate | 1.0000 |
+
+実測の途中、prompt 指示だけでは NUMERIC 回答が `verify_formula` を素通りできることを検出した。
+そのため terminal submit 境界に決定論的ゲートを追加し、ON 時の非棄権 NUMERIC 回答は三層 verdict が
+存在するまで確定できない。OFF 時はゲートも details キー追加も発動しない。
+
+idx76 型の分岐選択ミスは Condition IR の `branch_signature` 不一致として formula 層で捕捉され、
+多数決でも branch 軸の不一致として弾かれる
+(回帰テスト `test_conditional_branch_must_reference_base_quantity`)。今回の idx76 live trace は三層すべて PASS、
+verifier COMMIT として details に記録された。
 
 ## idx76 の捕捉
 

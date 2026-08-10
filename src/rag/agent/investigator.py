@@ -1476,6 +1476,17 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 text = ABSTAIN
             candidate = Answer(answer=text, confidence=0.0,
                                method="(submit_answer未使用: 最終テキストを採用)")
+            # SOT-2586 — the PoT lane is a gate, not merely prompt guidance.  A NUMERIC answer may not
+            # bypass binder→restricted AST→Decimal→independent verification via plain final text.
+            if (POT_HARD_LANE and _pot_lane.enabled() and contract == "numeric"
+                    and not is_abstain(candidate.answer) and pot_lane_verdict is None):
+                responses = [ToolResponse(SUBMIT_ANSWER, {
+                    "answer_rejected": True,
+                    "reason": "NUMERIC 回答の PoT 強制レーン検算が未実行です。",
+                    "directive": _pot_lane.numeric_lane_directive(),
+                })]
+                iterations += 1
+                continue
             rejection = _reference_commit_rejection(
                 question, candidate, contract, tool_outputs=tool_outputs,
                 version_diff_result=version_diff_result)
@@ -1532,6 +1543,18 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
             tool_calls.append(call.name)
             if call.name == SUBMIT_ANSWER:
                 candidate = _answer_from_args(call.args)
+                # SOT-2586 — enforce the advertised forced lane at the terminal boundary.  Prompt-only
+                # guidance is insufficient: production models can submit directly.  Abstention remains
+                # available, but every committed NUMERIC value must rest on a retained verify_formula trace.
+                if (POT_HARD_LANE and _pot_lane.enabled() and contract == "numeric"
+                        and not is_abstain(candidate.answer) and pot_lane_verdict is None):
+                    responses.append(ToolResponse(SUBMIT_ANSWER, {
+                        "answer_rejected": True,
+                        "reason": "NUMERIC 回答の PoT 強制レーン検算が未実行です。",
+                        "directive": _pot_lane.numeric_lane_directive(),
+                    }))
+                    dispatched_tool = True
+                    break
                 # SOT-2507 — chart pixels are never numeric authority.  A non-abstain chart answer may
                 # commit only after read_chart_values returned numCache or source-cell recomputation.
                 if (contract == "chart_read" and not is_abstain(candidate.answer)

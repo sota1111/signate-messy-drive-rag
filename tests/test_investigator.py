@@ -327,6 +327,32 @@ def test_investigate_omits_pot_lane_when_lane_not_exercised():
     assert "pot_lane" not in res.to_dict()
 
 
+def test_pot_hard_lane_rejects_numeric_submit_until_verified(monkeypatch):
+    """SOT-2586 — ON means a real terminal gate: direct NUMERIC submit cannot bypass verify_formula."""
+    from src.rag.agent import pot_lane as pl
+
+    monkeypatch.setattr(inv, "POT_HARD_LANE", True)
+    monkeypatch.setattr(pl, "enabled", lambda: True)
+    verify_tool = AgentTool(
+        pl.TOOL_NAME, pl.TOOL_DESCRIPTION, pl.TOOL_PARAMETERS,
+        lambda candidates=None, simple=None, require_units=False: pl.verify_formula(
+            candidates, simple=simple, require_units=bool(require_units)))
+    spec = {"operands": [{"name": "x", "value": 2, "unit": "円", "source": "c:S!A1"},
+                         {"name": "y", "value": 3, "unit": "円", "source": "c:S!A2"}],
+            "formula": {"op": "ADD", "args": [{"ref": "x"}, {"ref": "y"}]},
+            "condition": None, "result_unit": "円"}
+    model = ScriptedModel([
+        _submit("5円", confidence=0.9),
+        Step(function_calls=(Call(pl.TOOL_NAME, {"candidates": [spec]}),), usage=Usage(20, 10)),
+        _submit("5円", confidence=0.9),
+    ])
+    res = investigate(model, "2円と3円の合計はいくらですか？", [verify_tool, inv.SUBMIT_ANSWER_TOOL],
+                      max_turns=5, contract="numeric")
+    assert res.answer.answer == "5円"
+    assert res.tool_calls.count(inv.SUBMIT_ANSWER) == 2
+    assert res.pot_lane is not None
+
+
 def test_investigate_accepts_plain_final_text_with_zero_confidence():
     model = ScriptedModel([Step(function_calls=(), final_text="20日", usage=Usage(10, 5))])
     res = investigate(model, "…", build_tools(CorpusProfile()), max_turns=3)
