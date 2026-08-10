@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import re
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 from typing import Any, Callable, Mapping, Sequence
 
 from src.rag.tools import contract as _contract
@@ -90,6 +91,168 @@ def enabled() -> bool:
     exit together with the router: off ⇒ never invoked ⇒ champion byte-identical.
     """
     return _env_flag("RAG_DET_PIPELINE_ROUTER", False)
+
+
+def derived_contracts_enabled() -> bool:
+    """Whether the SOT-2617 derived 書式契約 (unit/rounding/verbosity) fire — ``RAG_DERIVED_FORMAT_CONTRACTS`` (default OFF).
+
+    A *second*, independent gate on top of :func:`enabled`: even when the inverted exit runs, these
+    format-class contracts are opt-in so they never regress the SOT-2604 baseline. Off ⇒ the layer's
+    output is byte-identical to before this issue.
+    """
+    return _env_flag("RAG_DERIVED_FORMAT_CONTRACTS", False)
+
+
+# ------------------------------------------------------------------- SOT-2617 derived 書式契約 (unit/rounding/verbosity)
+# All three contract classes are keyed off *question* cues (never off a gold value), operate on the
+# rendered deterministic text, and preserve the numeric derivation — they only correct 書式 (単位表記・
+# 丸め桁・冗長表現). No answer / corpus fact is hardcoded.
+
+# A generic *counter* suffix a currency/measure question can override without touching the number. These
+# are dimensionless tallies (件数/個数…), NOT domain units — a real unit (円/時間/%/人…) is never rewritten.
+_GENERIC_COUNTERS = ("件", "個", "つ", "箇所", "点", "コ")
+# A leading signed number (comma-grouped, optional decimals) optionally followed by a unit token.
+_NUMBER_UNIT_RE = re.compile(r"^\s*(?P<num>-?\d[\d,]*(?:\.\d+)?)\s*(?P<unit>\D*?)\s*$")
+# Currency ask — the answer's unit should be 円. Gated away from an explicit count ask (何件/いくつ…).
+_CURRENCY_Q_RE = re.compile(r"金額|差額|費用|価格|料金|コスト|請求|予算|単価|総額|売上|利益|収益|価額|いくら")
+_COUNT_Q_RE = re.compile(r"何\s*(?:件|個|人|社|名|箇所|つ|回)|いくつ|幾つ")
+
+# Rounding ask — honor an explicit precision directive stated in the question (四捨五入).
+_ROUND_DECIMAL_RE = re.compile(r"小数(?:点以下)?第\s*(?P<n>[0-9０-９一二三四五六七八九十]+)\s*位(?:まで)?")
+_ROUND_INT_RE = re.compile(r"整数(?:で|に|化)|小数(?:点以下)?を?四捨五入|四捨五入して整数")
+
+# Verbosity — a scalar-quantity ask (何<unit>/いくつ/合計で…) whose deterministic value came back as a
+# whole verbose sentence. The asked unit is captured so the summary quantity span can be pulled out.
+_QUANTITY_ASK_RE = re.compile(
+    r"何\s*(?P<unit>時間|日間|日|件|個|人|回|分|秒|年|ヶ月|か月|月|週間|週|割|名|社|ページ|枚|%|％)")
+_SUMMARY_MARKER_RE = re.compile(r"合計|総計|総合|全体|トータル|あわせ|併せ|合わせ|計で|の計")
+# Trailing redundant count annotation on a non-count answer: 「…（該当件数: 14件）」「…(該当14件)」.
+_TRAILING_COUNT_PAREN_RE = re.compile(
+    r"\s*[（(]\s*(?:該当[^）)]*?\d+\s*(?:件|個|セル|箇所|レコード|行)?|\d+\s*(?:件|個|セル|箇所)\s*(?:該当|一致)?)\s*[)）]\s*$")
+# A question that asks for a *condition/description*, not a tally — so a trailing count note is 冗長.
+_CONDITION_Q_RE = re.compile(r"条件|どのよう|どんな|どういう|説明|理由|内容|定義|方法|状態")
+
+_FULLWIDTH_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
+_KANJI_SMALL_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+
+def _parse_small_int(raw: str) -> "int | None":
+    """Parse a small positive integer written in ASCII/fullwidth digits or 一〜十 kanji (precision桁 use)."""
+    s = raw.translate(_FULLWIDTH_DIGITS).strip()
+    if s.isdigit():
+        return int(s)
+    if s in _KANJI_SMALL_NUM:
+        return _KANJI_SMALL_NUM[s]
+    return None
+
+
+def _quantity_span_re(unit: str) -> "re.Pattern[str]":
+    """Match a ``<number>`` or ``<number>〜<number>`` span immediately followed by ``unit`` (a range wins)."""
+    num = r"-?\d[\d,]*(?:\.\d+)?"
+    return re.compile(rf"{num}(?:\s*[〜～\-~－]\s*{num})?\s*{re.escape(unit)}")
+
+
+def _apply_unit_contract(text: str, question: str, rules: list[str]) -> str:
+    """idx6 class — a currency ask answered with a bare number or a *generic counter* ⇒ append/fix 円.
+
+    Only rewrites a dimensionless counter (件/個/…) or a unit-less number; a real domain unit is left
+    intact, and the number itself is never changed. Fires only when the question implies currency and
+    does NOT explicitly ask for a count.
+    """
+    if not (_CURRENCY_Q_RE.search(question) and not _COUNT_Q_RE.search(question)):
+        return text
+    m = _NUMBER_UNIT_RE.match(text)
+    if not m:
+        return text
+    unit = m.group("unit")
+    if unit == "円" or unit.endswith("円"):
+        return text  # already correct
+    if unit == "" or unit in _GENERIC_COUNTERS:
+        rules.append("unit_currency")
+        return f"{m.group('num')}円"
+    return text  # a specific non-generic unit ⇒ our detection is off, leave it
+
+
+def _apply_rounding_contract(text: str, question: str, rules: list[str]) -> str:
+    """丸め class — honor an explicit precision directive (小数第N位 / 整数で) via 四捨五入 (ROUND_HALF_UP).
+
+    Format-level only: re-renders the SAME number at the requested precision. Runs in a local Decimal
+    context so global precision is never polluted. No directive ⇒ no-op.
+    """
+    m = _NUMBER_UNIT_RE.match(text)
+    if not m:
+        return text
+    dec_m = _ROUND_DECIMAL_RE.search(question)
+    places: "int | None" = None
+    if dec_m:
+        places = _parse_small_int(dec_m.group("n"))
+    elif _ROUND_INT_RE.search(question):
+        places = 0
+    if places is None or places < 0:
+        return text
+    try:
+        with localcontext() as ctx:
+            ctx.prec = 50
+            num = Decimal(m.group("num").replace(",", ""))
+            quant = Decimal(1) if places == 0 else Decimal(1).scaleb(-places)
+            rounded = num.quantize(quant, rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        return text
+    formatted = f"{rounded:.{places}f}" if places else str(int(rounded))
+    if formatted == m.group("num"):
+        return text
+    rules.append("rounding")
+    return f"{formatted}{m.group('unit')}"
+
+
+def _apply_verbosity_trim(text: str, question: str, rules: list[str]) -> str:
+    """idx64/idx65 class — strip 冗長表現 down to the asked answer, never touching the retained fact.
+
+    Two sub-rules, both evidence-free but question-cue-gated:
+    * **summary-quantity extraction**: a 「(合計で)何<unit>」 ask answered by a whole sentence ⇒ reduce to
+      the summary ``<number(range)><unit>`` span (the one after a 合計/あわせ marker; or the sole span
+      when unambiguous). Ambiguous multi-span with no marker ⇒ left untouched (no guessing).
+    * **trailing count-note removal**: a condition/description ask whose answer trails a redundant
+      「（該当件数: N件）」 tally ⇒ drop the parenthetical.
+    """
+    q = question
+    ask = _QUANTITY_ASK_RE.search(q)
+    if ask and len(text) > len(ask.group(0)) + 6:
+        unit = ask.group("unit")
+        span_re = _quantity_span_re(unit)
+        marker = _SUMMARY_MARKER_RE.search(text)
+        chosen: "str | None" = None
+        if marker:
+            after = span_re.search(text, marker.end())
+            if after:
+                chosen = after.group(0)
+        if chosen is None:
+            # No 合計/あわせ marker: only safe to trim when a single unique span exists (else guessing).
+            uniq = list(dict.fromkeys(m.group(0).strip() for m in span_re.finditer(text)))
+            if len(uniq) == 1:
+                chosen = uniq[0]
+        if chosen is not None:
+            trimmed = re.sub(r"\s+", "", chosen)
+            if trimmed and trimmed != text.strip():
+                rules.append("verbosity_summary")
+                text = trimmed
+
+    stripped = _TRAILING_COUNT_PAREN_RE.sub("", text)
+    if stripped != text and stripped.strip() and not _COUNT_Q_RE.search(q):
+        # only for a non-count ask; a condition/description ask is the canonical case.
+        if _CONDITION_Q_RE.search(q) or not _QUANTITY_ASK_RE.search(q):
+            rules.append("verbosity_count_note")
+            text = stripped.strip()
+    return text
+
+
+def _apply_derived_format_contracts(text: str, question: str, rules: list[str]) -> str:
+    """SOT-2617 — run the three derived 書式契約 in order (verbosity → unit → rounding). Value-preserving."""
+    question = question or ""
+    text = _apply_verbosity_trim(text, question, rules)
+    text = _apply_unit_contract(text, question, rules)
+    text = _apply_rounding_contract(text, question, rules)
+    return text
 
 
 # --------------------------------------------------------------------------- value shaping (deterministic)
@@ -329,6 +492,10 @@ def format_contract(contract: Any, question: str = "", *, contract_type: "str | 
     if text is None:
         return None  # shaping emptied the value ⇒ nothing to commit; fall back.
     text = _canonical_none(text, rules)  # SOT-2544 none-form → 「該当なし」
+
+    # 2b) SOT-2617 derived 書式契約 (unit/rounding/verbosity) — opt-in second gate, value-preserving.
+    if derived_contracts_enabled():
+        text = _apply_derived_format_contracts(text, question, rules)
 
     # 3) at most ONE short LLM naturalize call, and only for a free-text type whose value is still raw.
     if _needs_llm(value, contract_type, method):
