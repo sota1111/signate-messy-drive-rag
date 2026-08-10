@@ -92,6 +92,40 @@ def test_env_toggle_disables_normalization(monkeypatch):
     assert N.normalize_answer("100 万ドル超") == "100万ドル超"
 
 
+# ----------------------------- SOT-2619 redundant self-gloss dedup ----------------------------
+def test_redundant_ordinal_gloss_is_collapsed():
+    # idx75: 「第4週目（第4週）」 restates the same ordinal week twice — the parenthetical adds no value,
+    # so it collapses to the concise canonical form 「第4週」 (the 「目」 is dropped as ordinal noise).
+    assert N.normalize_answer("第4週目（第4週）") == "第4週"
+    assert N.normalize_answer("第2回目（第2回）") == "第2回"
+    # ASCII parens are handled too.
+    assert N.normalize_answer("第4週目(第4週)") == "第4週"
+
+
+def test_exact_duplicate_gloss_is_collapsed():
+    # A parenthetical that is a verbatim restatement of the head collapses regardless of ordinals.
+    assert N.normalize_answer("バッチ処理（バッチ処理）") == "バッチ処理"
+
+
+def test_gloss_dedup_preserves_every_distinct_value():
+    out = N.normalize_answer("第4週目（第4週）")
+    assert N._preserves_meaning_setwise("第4週目（第4週）", out)
+    assert set(N.numbers(out)) == set(N.numbers("第4週目（第4週）"))
+
+
+def test_parenthetical_with_real_detail_is_untouched():
+    # The parenthetical carries information the head does not ⇒ NOT a restatement ⇒ never collapsed
+    # (guards idx62's gold form and ordinary annotations from being stripped).
+    for a in ["n_estimators（1位=500、2位=300）", "田中（営業部）", "AUC（0.92）",
+              "モデル構築（第4週）と評価（第5週）", "第4週目（第5週）"]:
+        assert N.normalize_answer(a) == a
+
+
+def test_gloss_dedup_is_off_when_normalization_disabled(monkeypatch):
+    monkeypatch.setenv(N._ENV_FLAG, "0")
+    assert N.normalize_answer("第4週目（第4週）") == "第4週目（第4週）"
+
+
 # ============ structural two-axis non-regression proof (sealed hold-out × real-style) ==========
 def _deterministic_gt_items():
     """Every deterministic-GT (truth, kind) pair backing the two generalization axes: the sealed

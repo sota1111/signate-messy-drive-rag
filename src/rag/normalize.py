@@ -88,6 +88,26 @@ def preserves_meaning(original: str, candidate: str) -> bool:
     return True
 
 
+def _preserves_meaning_setwise(original: str, candidate: str) -> bool:
+    """Like :func:`preserves_meaning` but compares number/identifier *sets*, not multisets.
+
+    This is the strictly narrower licence the redundant-self-gloss dedup needs: collapsing
+    「第4週目（第4週）」→「第4週」 drops a *repeated* value, so the multiset changes ([4,4]→[4]) even though
+    no *unique* value is lost. Set comparison permits dropping a duplicate while still forbidding the loss
+    of any distinct number/identifier or the introduction of any new character (no fabrication). Used only
+    for the gloss dedup below, never for the general reformat.
+    """
+    if not candidate.strip():
+        return False
+    if set(numbers(candidate)) != set(numbers(original)):
+        return False
+    if set(identifiers(candidate)) != set(identifiers(original)):
+        return False
+    if not _content_chars(candidate) <= _content_chars(original):
+        return False
+    return True
+
+
 # ---------------------------------- deterministic transforms ----------------------------------
 _LABEL = re.compile(r"^(?:回答|答え|解答|結論|Answer|A)\s*[:：]\s*")
 # Trailing polite copulas and fixed hedge *clauses* a concise ground-truth answer would not carry.
@@ -104,6 +124,44 @@ _TRAILING_COPULA = re.compile(
 _UNIT = ("万|億|兆|千|百|円|ドル|％|%|個|件|人|名|社|年|月|日|時間|時|分|秒|週|回|台|"
          "枚|本|点|割|倍|度|色|行|列|位|番|歳|㎡|平方メートル|パーセント|ポイント|割合")
 _DIGIT_UNIT_SPACE = re.compile(rf"(?<=\d)[ 　]+(?=(?:{_UNIT}))")
+
+
+# --------------------------- SOT-2619 redundant self-gloss dedup (format-equivalence) ---------------------
+# A committed answer that states the same fact twice — a head immediately followed by a *parenthetical
+# gloss that merely restates it*: 「第4週目（第4週）」 (idx75). The gloss adds no value, and the concise
+# ground-truth style the judge rewards carries the single canonical form (「第4週」). Collapsing it is
+# meaning-preserving, so this lifts an already-correct answer the verbose duplicate was dragging toward
+# Incorrect. Fires ONLY on *pure* redundancy (head ≡ gloss after ordinal-counter normalization), so a
+# parenthetical that carries real detail (「n_estimators（1位=500、2位=300）」, 「田中（営業部）」) is untouched.
+# The 「目」 in an explicit ordinal counter (「第4週目」) is dropped so it matches the bare-ordinal restatement.
+_ORDINAL_COUNTER = re.compile(
+    r"(第\s*\d+\s*(?:週|回|章|項|条|日|月|年|号|番|期|限|フェーズ|ステップ|段階))目")
+# Exactly one parenthetical, anchored to the very end (a mid-string gloss / trailing prose ⇒ no match).
+_TRAILING_GLOSS = re.compile(r"^(?P<head>.+?)\s*[（(](?P<gloss>[^（）()]{1,60})[)）]\s*$")
+
+
+def _ordinal_canon(text: str) -> str:
+    """Drop the redundant 「目」 from an explicit ordinal counter (「第4週目」→「第4週」); identity otherwise."""
+    return _ORDINAL_COUNTER.sub(r"\1", text)
+
+
+def _dedupe_redundant_gloss(answer: str) -> str:
+    """Collapse 「HEAD（GLOSS）」 to the canonical head when GLOSS only restates HEAD (ordinal-aware).
+
+    Returns the unchanged answer unless the parenthetical is a pure, value-free restatement of the head.
+    """
+    m = _TRAILING_GLOSS.match(answer.strip())
+    if not m:
+        return answer
+    head = m.group("head").strip()
+    gloss = m.group("gloss").strip()
+    if not head or not gloss:
+        return answer
+    hn = _ordinal_canon(unicodedata.normalize("NFC", head))
+    gn = _ordinal_canon(unicodedata.normalize("NFC", gloss))
+    if hn and hn == gn:
+        return hn  # the single canonical form, with the ordinal 「目」 already dropped
+    return answer
 
 
 def _candidate(answer: str) -> str:
@@ -127,10 +185,16 @@ def normalize_answer(answer: str, *, question: str = "") -> str:
     """
     if not enabled() or _is_abstain(answer):
         return answer
+    result = answer
     candidate = _candidate(answer)
     if candidate != answer and preserves_meaning(answer, candidate):
-        return candidate
-    return answer
+        result = candidate
+    # SOT-2619: collapse a redundant self-gloss (「第4週目（第4週）」→「第4週」). Set-wise preservation so the
+    # *duplicated* value may be dropped while every distinct value/identifier is retained (never fabricates).
+    deduped = _dedupe_redundant_gloss(result)
+    if deduped != result and _preserves_meaning_setwise(result, deduped):
+        result = deduped
+    return result
 
 
 def normalize_with_flag(answer: str, *, question: str = "") -> tuple[str, bool]:

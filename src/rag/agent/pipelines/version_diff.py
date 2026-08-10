@@ -122,7 +122,18 @@ def pipeline(question: str, *, profile: Any = None) -> "dict[str, Any] | None":
     change, pair = selected
 
     label = _context_label(pair, change)
-    rendered = f"{label}：{change.before} → {change.after}" if label else f"{change.before} → {change.after}"
+    # Gold 書式 for a version-diff answer is a flowing prose sentence (「<行ラベル>が<旧>から<新>に変更」),
+    # not the raw 「行ラベル：旧 → 新」 arrow. Render that prose **deterministically** here (idx74 focused
+    # trace, SOT-2619). Previously this handed a raw arrow to the Stage3 LLM one-shot naturalizer, which
+    # (in the gold100 measurement) prepended a 前置き＋箇条書き（「案件遂行に関連する変更は以下の通りです。\n
+    # ・…」）; the judge's verbatim-set 比較 read the multi-line list as a set mismatch and scored the
+    # (value-correct) answer Incorrect. A pure template removes that non-deterministic 整形ゆらぎ, preserves
+    # the value verbatim, and stays byte-stable — so ``naturalize`` is now False (Stage3 renders it as-is,
+    # no model call). Every token here is corpus/diff-derived (no hardcoding).
+    rendered = (
+        f"{label}が{change.before}から{change.after}に変更" if label
+        else f"{change.before}から{change.after}に変更"
+    )
 
     evidence = {
         "file": pair.new.rel,
@@ -137,10 +148,10 @@ def pipeline(question: str, *, profile: Any = None) -> "dict[str, Any] | None":
         "engine": "diffpair",
         "contract": CONTRACT_TYPE,
         "selection": "single_substantive_modify",
-        # Ask Stage3 for one short naturalize call: a raw 「行ラベル：旧 → 新」 is the correct fact but the
-        # gold 書式 is prose (「…の担当者が旧から新に変更」). The naturalizer preserves the value verbatim
-        # and degrades to this template text if the LLM is unavailable (idx74 の粒度を整形層で解消).
-        "naturalize": True,
+        # Deterministic naturalization: ``rendered`` is already gold-shaped prose, so Stage3 renders it
+        # verbatim with **no** LLM call (idx74 focused trace, SOT-2619 — the previous ``naturalize: True``
+        # let a model prepend a 前置き＋箇条書き that the判定側 scored Incorrect despite a correct value).
+        "naturalize": False,
         "confidence": 1.0,
     }
     return {"value": rendered, "evidence": evidence, "method": method}
