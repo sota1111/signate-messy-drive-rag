@@ -261,6 +261,19 @@ class ConditionIR:
                 "is_conditional": self.is_conditional,
                 "branch_signature": self.branch_signature()}
 
+    @classmethod
+    def from_spec(cls, spec: "Mapping[str, Any] | None") -> "ConditionIR":
+        """Materialize a pre-built condition spec into a validated IR (SOT-2621 pre-loop 受け口).
+
+        The SOT-2621 condition prefill builds a ConditionIR *skeleton* before the answer loop and injects
+        it into the Evidence Packet; this is the symmetric receiver that turns that spec (or the one the
+        LLM fills in and passes to ``verify_formula``) back into a :class:`ConditionIR`. It delegates to
+        :func:`build_condition`, so the extra hint keys the skeleton carries (delta/unit/operand_hint) are
+        ignored and only the IR fields (predicate/predicate_truth/base_quantity/adjustments[kind,rate,
+        order]) are read — an empty/None spec yields an unconditional IR.
+        """
+        return build_condition(spec)
+
 
 def _adj_key(a: Adjustment) -> tuple[int, str]:
     return (a.order, a.kind)
