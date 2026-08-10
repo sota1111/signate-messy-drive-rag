@@ -21,4 +21,9 @@ from . import numeric as numeric  # noqa: F401
 # ``full_enumeration`` and ``cross_aggregate`` contracts.
 from . import enumeration as enumeration  # noqa: F401
 
-__all__ = ["version_diff", "numeric", "enumeration"]
+# Wave A4 — chart_read / spatial (SOT-2609). Imported AFTER ``enumeration`` so its ``register()`` can
+# capture A3's ``full_enumeration`` pipeline and compose the seating列挙 recognizer in front of it
+# (座席列挙 idx44) without dropping A3's behavior.
+from . import chart_spatial as chart_spatial  # noqa: F401
+
+__all__ = ["version_diff", "numeric", "enumeration", "chart_spatial"]
