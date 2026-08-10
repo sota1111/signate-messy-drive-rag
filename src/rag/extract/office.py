@@ -141,6 +141,7 @@ def extract_docx(ref: FileRef, data: bytes | None) -> str:
                 terms.append(b)
         lines.insert(0, "【太字箇所】" + " / ".join(terms))
     lines.extend(_font_emphasis_lines(ref))
+    lines.extend(_format_event_lines(ref))
     return "\n".join(lines)
 
 
@@ -270,6 +271,7 @@ def extract_xlsx(ref: FileRef, data: bytes | None) -> str:
             out.append("【ハイライトされたセル】")
             out.extend(f"  {h}" for h in highlights[:200])
     out.extend(_font_emphasis_lines(ref))
+    out.extend(_format_event_lines(ref))
     return "\n".join(out)
 
 
@@ -460,6 +462,38 @@ def _font_emphasis_lines(ref: FileRef) -> list[str]:
         loc = it["evidence"].get("cell") or it["evidence"].get("paragraph") \
             or it["evidence"].get("slide") or it["evidence"].get("page")
         lines.append(f"  [{deco}] {it['value']}" + (f" ({loc})" if loc is not None else ""))
+    return lines
+
+
+def _format_event_lines(ref: FileRef) -> list[str]:
+    """Best-effort ``【書式イベント】`` + ``__FMT__`` annotations for the extract face (SOT-2585).
+
+    Surfaces OOXML semantic format events — Excel conditional-format rules, docx effective-style runs
+    (composite 黄∧赤字 predicates), and docx comment anchors — as machine-searchable ``__FMT__`` lines so
+    the typed evidence-index and lexical grep can answer format-predicate / comment questions without
+    embedding similarity. Gated by ``RAG_FORMAT_EVENTS`` (empty when off ⇒ champion serve byte-identical).
+    Never raises — a reader error just yields no annotation (mirrors ``_font_emphasis_lines``).
+    """
+    from src.rag.tools import format_events as _fmt  # lazy: format_events imports this module
+    if not _fmt.enabled():
+        return []
+    try:
+        items = _fmt.format_events(ref)["value"]
+    except Exception:  # noqa: BLE001 — annotation is best-effort, never blocks extraction
+        return []
+    if not items:
+        return []
+    lines = ["【書式イベント(FORMAT_EVENT)のある箇所】"]
+    for it in items[:200]:
+        ev, m = it["evidence"], it["method"]
+        loc = ev.get("cell") or ev.get("range") or ev.get("paragraph") or ""
+        loc = f" ({ev.get('sheet')+'!' if ev.get('sheet') else ''}{loc})" if loc else ""
+        if m["kind"] == "comment":
+            lines.append(f"  [コメント] {it['value']}"
+                         + (f" ←{ev['comment_text']}" if ev.get("comment_text") else ""))
+        else:
+            lines.append(f"  {it['value']}{loc}")
+        lines.append("  " + _fmt.fmt_notation(it))
     return lines
 
 

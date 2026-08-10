@@ -35,6 +35,7 @@ from src.rag.agent.question_contract import QuestionContract
 import importlib
 
 from src.rag.tools import font_emphasis as _font_emphasis
+from src.rag.tools import format_events as _format_events
 from src.rag.tools.canonical_route import infer_kinds as _infer_kinds
 
 # ``src.rag.tools.__init__`` re-exports the ``highlight_extract`` *function*, shadowing the submodule
@@ -54,9 +55,31 @@ _FONT_DECORATION_RE = re.compile(r"太字|下線|アンダーライン|イタリ
 _HIGHLIGHT_COLOR_RE = re.compile(r"ハイライト|highlight|網掛け|塗りつぶし|セル.{0,4}色|マーカー", re.I)
 
 
+# Comment / conditional-format cue words (SOT-2585). A question asking for a docx コメント本文, or the
+# *条件* of a conditional-format highlight, is answered by the ``format_events`` FORMAT_EVENT tool — the
+# comment anchor / cfRule condition never appears in the flattened text nor in the single-property
+# highlight/font tools. Pure vocabulary (no corpus fact).
+_COMMENT_RE = re.compile(r"コメント|comment|注釈|吹き出し", re.I)
+# A composite colour+font predicate ("黄色ハイライトかつ赤字") needs the effective-style AND, not one
+# property — format_events evaluates the composite predicate.
+_COMPOSITE_FORMAT_RE = re.compile(
+    r"(ハイライト|網掛け|塗り|マーカー).{0,12}(かつ|且つ|and|と).{0,8}(赤字|青字|文字色|色の文字|font)"
+    r"|(赤字|青字|文字色).{0,12}(かつ|且つ|and|と).{0,8}(ハイライト|網掛け|塗り|マーカー)", re.I)
+
+
 def references_font_decoration(question: str) -> bool:
     """True when ``question`` names a font decoration (太字/下線/イタリック) — a font_emphasis question."""
     return bool(_FONT_DECORATION_RE.search(question or ""))
+
+
+def references_comment(question: str) -> bool:
+    """True when ``question`` asks for a document comment (a ``format_events`` comment question)."""
+    return bool(_COMMENT_RE.search(question or ""))
+
+
+def references_composite_format(question: str) -> bool:
+    """True when ``question`` asks a composite fill+font-colour predicate (黄ハイライト∧赤字, idx16)."""
+    return bool(_COMPOSITE_FORMAT_RE.search(question or ""))
 
 
 def references_highlight_color(question: str) -> bool:
@@ -141,6 +164,11 @@ def first_tools_for(contract: QuestionContract, question: str) -> tuple[str, ...
         # inspect it directly; a second broad BM25 pass can consume the whole question budget without
         # ever exposing the page image.
         return ("find_files", "caption_image", "read_office", "file_grep")
+    if _format_events.enabled() and (references_comment(question)
+                                     or references_composite_format(question)):
+        # docx コメント本文/anchor (idx49) と 黄ハイライト∧赤字 の複合述語 (idx16) は、平文にも単一プロパティ
+        # ツールにも出ない OOXML 意味構造。FORMAT_EVENT を正本として先頭に据える (SOT-2585)。
+        return ("format_events", *(t for t in base if t != "format_events"))
     if (contract.contract == _qc.FORMAT_CHECK and _font_emphasis.enabled()
             and references_font_decoration(question)):
         # 太字/下線/イタリックの複合書式条件は色ハイライトではなく font_emphasis が正本 (SOT-2564)。
@@ -261,6 +289,18 @@ def route_hint(contract: QuestionContract, question: str) -> str:
                     f"単位={req.unit}" if req.unit else "",
                     f"小数第{req.decimal_places}位" if req.decimal_places is not None else "",
                 ) if x) + "。丸めは未丸め値の計算後、最後の一段だけで適用する。")
+    if _format_events.enabled() and references_comment(question):
+        lines.append(
+            "コメント(注釈)抽出は format_events(file=..., kind='comment') を使う。返る各項目の "
+            "evidence.anchor_text が『コメントがついている部分そのもの』で、これを回答する(コメント本文は "
+            "evidence.comment_text)。docxのコメントは平文には出ないので read_office/file_grep では取れない。"
+            "対象ファイルが不明なら先に find_files で会議録/対象docxを特定する。")
+    if _format_events.enabled() and references_composite_format(question):
+        lines.append(
+            "『黄色ハイライトかつ赤字』のような複合書式条件は単一プロパティでは解けない。"
+            "format_events(file=..., fill='黄', font_color='赤') のように背景色と文字色を同時に渡し、"
+            "両方に該当(AND)する箇所(evidence/value)だけを回答する。実効書式(ハイライト＞塗り、直接色＞テーマ)"
+            "を分離済み。該当が無ければ『該当なし』ではなく抽出可否を確認してから判断する。")
     if (contract.contract == _qc.FORMAT_CHECK and _font_emphasis.enabled()
             and references_font_decoration(question)):
         lines.append(
