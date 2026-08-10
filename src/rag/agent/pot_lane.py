@@ -936,19 +936,114 @@ TOOL_PARAMETERS: dict[str, Any] = {
     "required": ["candidates"],
 }
 
+# SOT-2616 — the augmented schema exposed *only* when operand prefill is on: an operand may be selected
+# from the injected catalog by ``select`` (id) instead of a literal ``value``, and the call carries the
+# ``catalog`` array so the lane binds value/unit/source from the enumerated cell verbatim. The base schema
+# above is untouched, so the default-OFF tool definition stays byte-identical.
+_OPERAND_SCHEMA_SELECT: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "select": {"type": "string", "description": "operand 候補カタログの id (op1…)"},
+        "value": {"type": ["number", "string"]},
+        "unit": {"type": "string"},
+        "source": {"type": "string"},
+    },
+    "required": ["name"],
+}
+_CANDIDATE_SCHEMA_SELECT: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "operands": {"type": "array", "items": _OPERAND_SCHEMA_SELECT},
+        "formula": _NODE_SCHEMA,
+        "condition": {"type": "object"},
+        "result_unit": {"type": "string"},
+    },
+    "required": ["operands", "formula"],
+}
+TOOL_PARAMETERS_PREFILL: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "candidates": {"type": "array", "items": _CANDIDATE_SCHEMA_SELECT},
+        "catalog": {"type": "array", "items": {"type": "object"},
+                    "description": "注入された operand 候補カタログ(そのまま渡す)"},
+        "simple": {"type": "boolean"},
+        "require_units": {"type": "boolean"},
+    },
+    "required": ["candidates"],
+}
+
+
+# --------------------------------------------------------------------------- SOT-2616 operand handoff
+class CatalogError(FormulaError):
+    """Raised when a candidate selects an operand id absent from the prefilled catalog."""
+
+
+def resolve_operand_selections(candidates: Sequence[Mapping[str, Any]],
+                               catalog: Sequence[Mapping[str, Any]] | None
+                               ) -> list[dict[str, Any]]:
+    """Bind ``{"name", "select": <id>}`` operands from a prefilled candidate catalog (SOT-2616).
+
+    The operand-prefill layer (:mod:`src.rag.agent.operand_prefill`) injects a deterministic catalog of
+    numeric candidates; the LLM *selects* by ``id`` instead of re-typing values. This resolves each
+    operand's ``select`` into the catalog entry's value/unit/source (the operand keeps its role ``name``),
+    so the value the lane binds is the enumerated cell's value **verbatim** — the model cannot mistype or
+    invent it. Operands with an explicit ``value`` and no ``select`` pass through unchanged (mixed
+    selection + literal is allowed), so this is a pure superset of the existing tool contract. Returns a
+    new candidate list (inputs are not mutated). A ``select`` referencing an unknown id raises
+    :class:`CatalogError`; an empty/absent catalog with no ``select`` operands is a no-op.
+    """
+    by_id: dict[str, Mapping[str, Any]] = {}
+    for entry in catalog or ():
+        cid = str(entry.get("id", "")).strip()
+        if cid:
+            by_id[cid] = entry
+    resolved: list[dict[str, Any]] = []
+    for cand in candidates:
+        cand = dict(cand)
+        ops_out: list[dict[str, Any]] = []
+        for op in cand.get("operands", ()) or ():
+            op = dict(op)
+            sel = op.pop("select", None)
+            if sel is not None and op.get("value") in (None, ""):
+                entry = by_id.get(str(sel).strip())
+                if entry is None:
+                    raise CatalogError(
+                        f"未知の operand 候補 id: {sel!r}（catalog の id から選んでください）")
+                op["value"] = entry.get("value")
+                if not op.get("unit") and entry.get("unit"):
+                    op["unit"] = entry.get("unit")
+                if not op.get("source") and entry.get("source"):
+                    op["source"] = entry.get("source")
+                if not str(op.get("name", "")).strip():
+                    op["name"] = str(entry.get("label") or sel)
+            ops_out.append(op)
+        cand["operands"] = ops_out
+        resolved.append(cand)
+    return resolved
+
 
 def verify_formula(candidates: Sequence[Mapping[str, Any]] | None = None, *,
                    simple: bool | None = None, require_units: bool = False,
-                   min_multi_agreement: int = 2) -> dict[str, Any]:
+                   min_multi_agreement: int = 2,
+                   catalog: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
     """Agent-callable entry: run the forced lane over ``candidates`` and return a JSON-safe verdict.
 
     Errors are returned as ``{"error": ...}`` (never raised) so a malformed candidate spec surfaces to the
     model as feedback — the loop must not crash on one bad tool call. On a COMMIT it also carries the
-    rendered ``value`` string so the model can submit it verbatim (no re-derivation, no 暗算)."""
+    rendered ``value`` string so the model can submit it verbatim (no re-derivation, no 暗算).
+
+    ``catalog`` (SOT-2616) is the prefilled operand-candidate catalog; when supplied, operands may be
+    selected by ``{"name", "select": <id>}`` and are bound to the catalog entry's value/unit/source
+    before evaluation. Absent/empty catalog keeps the original literal-operand contract byte-for-byte."""
     if not candidates:
         return {"error": "candidates が空です。少なくとも1つの {operands, formula} 候補を渡してください。"}
     try:
-        result = run_forced_lane(list(candidates), simple=simple, require_units=require_units,
+        prepared = resolve_operand_selections(list(candidates), catalog) if catalog else list(candidates)
+    except CatalogError as exc:
+        return {"error": f"operand 選択 不正: {exc}"}
+    try:
+        result = run_forced_lane(prepared, simple=simple, require_units=require_units,
                                  min_multi_agreement=min_multi_agreement)
     except FormulaError as exc:
         return {"error": f"formula spec 不正: {exc}"}

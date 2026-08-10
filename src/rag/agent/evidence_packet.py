@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from src.rag.agent import early_abstain as _early
+from src.rag.agent import operand_prefill as _operand_prefill
 from src.rag.agent import query_router as _router
 from src.rag.index import document_registry as _dr
 
@@ -142,6 +143,21 @@ def build_packet(question: str, *, project: str | None = None,
     docs = _resolve_documents(question, project=project, limit=max_documents)
     required = dec.evidence_slots
     evidence: dict[str, Any] = {}
+    # SOT-2616 — NUMERIC operand candidate prefill. Behind ``RAG_OPERAND_PREFILL`` (default OFF ⇒ evidence
+    # stays ``{}`` and the packet JSON is byte-identical). When on for a NUMERIC route, enumerate numeric
+    # operand candidates from the just-resolved documents' offline assets and record them as a catalog in
+    # the ``operand_candidates`` evidence key. The required slots (incl. "operands") deliberately stay in
+    # ``missing``: the catalog is *candidates*, and the LLM still selects which is base/rate/条件 — this
+    # only adds pre-listed provenance, it never fills the answer. Empty catalog → nothing added (no
+    # degradation). Guarded so a prefill hiccup never changes the packet's core fields.
+    if _operand_prefill.enabled() and dec.route == _router.NUMERIC:
+        try:
+            catalog = _operand_prefill.build_catalog(
+                question, [d.doc_id for d in docs], project=project)
+            if catalog:
+                evidence["operand_candidates"] = catalog
+        except Exception:  # noqa: BLE001 — additive; never break the packet
+            pass
     missing = tuple(slot for slot in required if slot not in evidence)
     return EvidencePacket(
         route=dec.route,
@@ -196,11 +212,18 @@ def packet_directive(packet: EvidencePacket) -> str:
     # is still not grown). Byte-identical when the recalibration is OFF: the clause is only appended then.
     if _early.enabled():
         slot_block = f"{slot_block}\n{_early.packet_relaxation_clause()}"
+    # SOT-2616 — when the NUMERIC operand prefill recorded a candidate catalog, render it as a selection
+    # directive so the agent picks operands from the list (→ verify_formula catalog/select handoff) instead
+    # of grep-spinning. Absent catalog (default OFF / empty) appends nothing → byte-identical.
+    catalog = packet.evidence.get("operand_candidates") if packet.evidence else None
+    operand_block = _operand_prefill.candidates_directive(catalog) if catalog else ""
     packet_json = packet.to_json()
-    return (
+    directive = (
         "【Evidence Packet（回答ループ前・決定論フェーズ）】\n"
-        + doc_block + lane_block + slot_block
-        + f"\nEvidence Packet(JSON): {packet_json}")
+        + doc_block + lane_block + slot_block)
+    if operand_block:
+        directive = f"{directive}\n{operand_block}"
+    return f"{directive}\nEvidence Packet(JSON): {packet_json}"
 
 
 def build_directive(question: str, *, project: str | None = None,
