@@ -26,4 +26,8 @@ from . import enumeration as enumeration  # noqa: F401
 # (座席列挙 idx44) without dropping A3's behavior.
 from . import chart_spatial as chart_spatial  # noqa: F401
 
-__all__ = ["version_diff", "numeric", "enumeration", "chart_spatial"]
+# Wave B2 — simple_lookup / fact_lookup (SOT-2612). Deterministic schedule-table / report-page reads;
+# everything else it cannot pin structurally falls back to the LLM loop.
+from . import fact_lookup as fact_lookup  # noqa: F401
+
+__all__ = ["version_diff", "numeric", "enumeration", "chart_spatial", "fact_lookup"]
