@@ -285,6 +285,74 @@ def test_investigate_dispatches_then_submits_structured_answer():
     assert d["cost_usd"] >= 0.0
 
 
+def test_investigate_captures_pot_lane_verdict_into_details():
+    """SOT-2586 — a verify_formula (PoT forced-lane) verdict is threaded onto the Investigation and
+    surfaces in to_dict()/details.jsonl so measure_pot_lane.py --details can aggregate the three-layer
+    accuracies. The retained trace carries the operand/formula/execution verdicts."""
+    from src.rag.agent import pot_lane as pl
+
+    verify_tool = AgentTool(
+        pl.TOOL_NAME, pl.TOOL_DESCRIPTION, pl.TOOL_PARAMETERS,
+        lambda candidates=None, simple=None, require_units=False: pl.verify_formula(
+            candidates, simple=simple, require_units=bool(require_units)))
+    tools = [verify_tool, inv.SUBMIT_ANSWER_TOOL]
+    spec = {"operands": [{"name": "h", "value": 174, "unit": "時間", "source": "c:S1!B2"},
+                         {"name": "rate", "value": 1500, "unit": "円", "source": "c:S1!B3"}],
+            "formula": {"op": "MUL", "args": [{"ref": "h"}, {"ref": "rate"}]},
+            "condition": None, "result_unit": "円"}
+    model = ScriptedModel([
+        Step(function_calls=(Call(pl.TOOL_NAME, {"candidates": [spec]}),), usage=Usage(50, 10)),
+        _submit("261000円", confidence=0.95, evidence="verify_formula", method="pot_lane"),
+    ])
+    res = investigate(model, "…", tools, max_turns=5)
+    assert res.stop_reason == "answered"
+    assert res.pot_lane is not None and res.pot_lane.get("candidates")
+    d = res.to_dict()
+    assert "pot_lane" in d and d["pot_lane"] is res.pot_lane
+    chosen = res.pot_lane["candidates"][0]
+    assert set(chosen["verdicts"]) == {pl.LAYER_OPERAND, pl.LAYER_FORMULA, pl.LAYER_EXECUTION}
+    json.dumps(d, ensure_ascii=False)  # details.jsonl serialization must not raise
+
+
+def test_investigate_omits_pot_lane_when_lane_not_exercised():
+    """SOT-2586 — no verify_formula call ⇒ pot_lane stays None ⇒ key absent from to_dict()/details, so a
+    lane-OFF run's details.jsonl is byte-identical to the champion's."""
+    tools = [_tool_that_records([]), inv.SUBMIT_ANSWER_TOOL]
+    model = ScriptedModel([
+        Step(function_calls=(Call("compute", {}),), usage=Usage(10, 5)),
+        _submit("20", confidence=0.9),
+    ])
+    res = investigate(model, "…", tools, max_turns=5)
+    assert res.pot_lane is None
+    assert "pot_lane" not in res.to_dict()
+
+
+def test_pot_hard_lane_rejects_numeric_submit_until_verified(monkeypatch):
+    """SOT-2586 — ON means a real terminal gate: direct NUMERIC submit cannot bypass verify_formula."""
+    from src.rag.agent import pot_lane as pl
+
+    monkeypatch.setattr(inv, "POT_HARD_LANE", True)
+    monkeypatch.setattr(pl, "enabled", lambda: True)
+    verify_tool = AgentTool(
+        pl.TOOL_NAME, pl.TOOL_DESCRIPTION, pl.TOOL_PARAMETERS,
+        lambda candidates=None, simple=None, require_units=False: pl.verify_formula(
+            candidates, simple=simple, require_units=bool(require_units)))
+    spec = {"operands": [{"name": "x", "value": 2, "unit": "円", "source": "c:S!A1"},
+                         {"name": "y", "value": 3, "unit": "円", "source": "c:S!A2"}],
+            "formula": {"op": "ADD", "args": [{"ref": "x"}, {"ref": "y"}]},
+            "condition": None, "result_unit": "円"}
+    model = ScriptedModel([
+        _submit("5円", confidence=0.9),
+        Step(function_calls=(Call(pl.TOOL_NAME, {"candidates": [spec]}),), usage=Usage(20, 10)),
+        _submit("5円", confidence=0.9),
+    ])
+    res = investigate(model, "2円と3円の合計はいくらですか？", [verify_tool, inv.SUBMIT_ANSWER_TOOL],
+                      max_turns=5, contract="numeric")
+    assert res.answer.answer == "5円"
+    assert res.tool_calls.count(inv.SUBMIT_ANSWER) == 2
+    assert res.pot_lane is not None
+
+
 def test_investigate_accepts_plain_final_text_with_zero_confidence():
     model = ScriptedModel([Step(function_calls=(), final_text="20日", usage=Usage(10, 5))])
     res = investigate(model, "…", build_tools(CorpusProfile()), max_turns=3)
