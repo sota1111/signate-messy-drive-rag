@@ -1,0 +1,343 @@
+"""SOT-2604 (Stage3) — deterministic-value → gold-format naturalization layer.
+
+Parent PLAN SOT-2602 (決定論先行パイプラインへの反転). This is the **exit** of the inverted
+architecture. The deterministic pipelines (Stage0 router :mod:`src.rag.agent.det_pipeline`, Wave A1〜B2)
+ground a ``{value, evidence, method}`` contract; this layer *naturalizes* that value into gold's answer
+書式 **without altering the facts** — the single, short LLM call the design allows lives here and here
+only, and is skipped entirely whenever a deterministic template already produces gold format.
+
+Design invariants
+-----------------
+* **Template-first, LLM-last.** Types whose 書式 is deterministic (数値・ID列挙・週範囲・「該当なし」…) are
+  formatted by a pure template — **no LLM**. Only a free-text-requiring type whose deterministic value is
+  still a *raw structure* (or that explicitly asks for it via ``method['naturalize']``) spends **one short
+  LLM call** to phrase it, and that call is instructed to preserve the value verbatim and add no new fact.
+* **Value facts are never invented.** Every transformation here is *format-level*: canonicalizing a
+  none-form to 「該当なし」 (SOT-2544 記号↔文章形の同義), completing a truncated verbatim extract from a
+  *fuller fragment already in evidence* (SOT-2545), or trimming an over-enumerated list down to the
+  *evidence-designated* single item (SOT-2545). None of these read a corpus fact from outside the supplied
+  contract, and none fabricate a value. No answer / no corpus fact is hardcoded in this module.
+* **Additive, never subtractive.** A valid non-blank contract in ⇒ a valid contract out (回答数を減らさない).
+  The only ``None`` return is the defensive blank-value guard (「決定論値が空なら整形せず上位へ返す」): the
+  caller then falls back to abstain / the LLM loop rather than committing an empty answer. A failing /
+  unavailable LLM naturalizer degrades to the deterministic template text — it never drops the answer.
+* **Gated OFF with the router.** Shares ``RAG_DET_PIPELINE_ROUTER`` (default OFF) with the Stage0 router:
+  the layer is only ever reached from the router's det-path, so with the flag off (or the Stage0 registry
+  empty) it is never invoked and the champion serve path is byte-identical.
+"""
+from __future__ import annotations
+
+import os
+import re
+from typing import Any, Callable, Mapping, Sequence
+
+from src.rag.tools import contract as _contract
+
+# A naturalizer turns a deterministic value string + the question into gold-shaped prose, preserving the
+# value and adding no fact. ``None`` (the default) means "build the lazy Gemini one-shot on demand"; tests
+# inject a stub so the layer stays network-free.
+Naturalizer = Callable[[str, str], "str | None"]
+
+# Contract types (question_contract.CONTRACTS) whose 書式 a pure template always produces — these NEVER
+# spend an LLM call even if a stray ``method['naturalize']`` flag is set. Numeric values, ID/enumeration
+# lists, format/chart/spatial reads are all rendered by the deterministic template below. Every other type
+# (simple_lookup / multi_hop / cross_aggregate / version_diff …) may opt into the one short naturalize call.
+_TEMPLATE_CONTRACTS: "frozenset[str]" = frozenset(
+    {"numeric", "full_enumeration", "format_check", "chart_read", "spatial"}
+)
+
+# ------------------------------------------------------------------- SOT-2544 記号↔文章形の同義 (none-form)
+# The canonical gold spelling for a 「該当なし」 conclusion, and the none-forms that normalize to it. Matched
+# on the *whole* stripped value (fullmatch) so a legitimate answer that merely contains 「なし」 as a
+# substring (e.g. 「課題なし体制」) is never collapsed. A 該当なし conclusion is a REAL answer under the
+# rubric — this canonicalization does not touch the abstain path.
+_NONE_CANONICAL = "該当なし"
+_NONE_RE = re.compile(
+    r"^(?:"
+    r"該当(?:する)?(?:項目|もの|データ|記載事項|記載|情報|値|レコード)?(?:は)?"
+    r"(?:なし|無し|ありません|存在しません|存在しない|見つかりません|見当たりません)"
+    r"|なし|無し|ありません|存在しません|存在しない|見つかりません|見当たりません"
+    r"|N/?A"
+    r")[。.]?$",
+    re.IGNORECASE,
+)
+
+# ------------------------------------------------------------------- SOT-2545 粒度 (granularity) cues
+# A single-item selector pins the ask to one unit (第N週/N番目/…); mirrors question_contract._SINGLE_SELECTOR_RE.
+_SINGLE_SELECTOR_RE = re.compile(
+    r"第\s*\d+\s*(?:週|回|章|項|条|フェーズ|ステップ|段階|日)目?|\d+\s*(?:番目|つ目|個目|件目)")
+# Enumeration cues make a question genuinely multi-item and suppress the over-enumeration trim.
+_ENUMERATION_CUE_RE = re.compile(
+    r"すべて|全て|全部|列挙|挙げて|一覧|それぞれ|各(?:項目|案件|人|々)|漏れなく|網羅|複数")
+# A verbatim/full-content extract ask promises the whole body; a shorter prefix is a truncation.
+_VERBATIM_EXTRACT_RE = re.compile(r"そのまま|抜き出|原文|全文|一字一句|逐語|内容|本文|詳細")
+# Evidence keys a pipeline may set to designate the trimmed / completed target (evidence-driven, no guess).
+_SELECTED_KEYS = ("selected", "designated", "chosen", "target")
+_FULLTEXT_KEYS = ("full_text", "fulltext", "body", "full", "content", "verbatim")
+
+
+def _env_flag(key: str, default: bool) -> bool:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def enabled() -> bool:
+    """Whether the formatting layer runs — shares ``RAG_DET_PIPELINE_ROUTER`` (default OFF).
+
+    The layer is only reached from the Stage0 router's det-path, so this flag gates the whole inverted
+    exit together with the router: off ⇒ never invoked ⇒ champion byte-identical.
+    """
+    return _env_flag("RAG_DET_PIPELINE_ROUTER", False)
+
+
+# --------------------------------------------------------------------------- value shaping (deterministic)
+def _is_blank(value: Any) -> bool:
+    """A value that carries no answer: ``None``, an empty/whitespace string, or an empty collection."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) == 0
+    return False
+
+
+def _evidence_get(evidence: Mapping[str, Any], keys: Sequence[str]) -> Any:
+    for k in keys:
+        if k in evidence and not _is_blank(evidence[k]):
+            return evidence[k]
+    return None
+
+
+def _complete_truncation(value: Any, question: str, evidence: Mapping[str, Any],
+                         rules: list[str]) -> Any:
+    """SOT-2545 truncation completion — a verbatim/full-content ask answered with a head-only prefix.
+
+    Deterministic and evidence-bound: replaces ``value`` with a *fuller fragment already in evidence*
+    (an explicit ``full_text``-family key, or any evidence string of which ``value`` is a strict prefix /
+    substring). Never invents text — if evidence carries nothing longer, the value is left unchanged.
+    """
+    if not isinstance(value, str) or not _VERBATIM_EXTRACT_RE.search(question or ""):
+        return value
+    head = value.strip()
+    if not head:
+        return value
+    # 1) an explicitly designated full-text field wins.
+    designated = _evidence_get(evidence, _FULLTEXT_KEYS)
+    if isinstance(designated, str) and len(designated.strip()) >= len(head) + 8 \
+            and (designated.strip().startswith(head) or head in designated):
+        rules.append("truncation_completed")
+        return designated.strip()
+    # 2) otherwise any evidence fragment of which the answer is a strict head/substring.
+    for frag in _evidence_fragments(evidence):
+        f = frag.strip()
+        if len(f) >= len(head) + 8 and f != head and (f.startswith(head) or head in f):
+            rules.append("truncation_completed")
+            return f
+    return value
+
+
+def _trim_over_enumeration(value: Any, question: str, evidence: Mapping[str, Any],
+                           rules: list[str]) -> Any:
+    """SOT-2545 over-enumeration trim — a single-item ask answered with a list.
+
+    Fires only when the question has a single-item selector (第N週/N番目/…) AND no enumeration cue widens
+    it AND ``value`` is a multi-item list AND evidence names the designated item (``selected``-family).
+    Returns that evidence-designated single item; otherwise leaves the list untouched (no guessing which
+    item to keep — that would fabricate a selection).
+    """
+    if not isinstance(value, (list, tuple)) or len(value) <= 1:
+        return value
+    q = question or ""
+    if not _SINGLE_SELECTOR_RE.search(q) or _ENUMERATION_CUE_RE.search(q):
+        return value
+    selected = _evidence_get(evidence, _SELECTED_KEYS)
+    if selected is None:
+        return value
+    items = [str(v).strip() for v in value if not _is_blank(v)]
+    sel = str(selected).strip()
+    if sel in items:
+        rules.append("over_enumeration_trimmed")
+        return sel
+    return value
+
+
+def _evidence_fragments(evidence: Mapping[str, Any]) -> list[str]:
+    """Flatten evidence values to string fragments (self-contained; no obligations import)."""
+    frags: list[str] = []
+
+    def walk(v: Any) -> None:
+        if v is None or isinstance(v, bool):
+            return
+        if isinstance(v, Mapping):
+            for nested in v.values():
+                walk(nested)
+        elif isinstance(v, (list, tuple, set)):
+            for item in v:
+                walk(item)
+        else:
+            s = str(v).strip()
+            if s:
+                frags.append(s)
+
+    walk(dict(evidence))
+    return frags
+
+
+def _render_template(value: Any) -> "str | None":
+    """Render a deterministic value to its gold surface form — pure, no LLM. ``None`` when blank.
+
+    * ``str``  → stripped verbatim (structured notation like ``n_estimators（1位=500、2位=300）`` survives).
+    * ``bool`` → 「はい」/「いいえ」 (a yes/no contract's canonical Japanese form).
+    * ``int``/``float`` → the number without a spurious trailing ``.0``.
+    * ``list``/``tuple`` → non-blank items joined with 「、」 (a single item renders bare); the gold
+      enumeration 書式.
+    * ``dict`` → ``key=value`` pairs joined with 「、」 (deterministic; order preserved).
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        s = value.strip()
+        return s or None
+    if isinstance(value, bool):
+        return "はい" if value else "いいえ"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() else repr(value)
+    if isinstance(value, (list, tuple)):
+        items = [t for t in (_render_template(v) for v in value) if t]
+        if not items:
+            return None
+        return items[0] if len(items) == 1 else "、".join(items)
+    if isinstance(value, Mapping):
+        parts = [f"{k}={_render_template(v)}" for k, v in value.items()
+                 if not _is_blank(v)]
+        return "、".join(parts) if parts else None
+    s = str(value).strip()
+    return s or None
+
+
+def _canonical_none(text: str, rules: list[str]) -> str:
+    """SOT-2544 — collapse a whole-string none-form to the canonical 「該当なし」 (real answer, not abstain)."""
+    if _NONE_RE.match(text.strip()):
+        if text.strip() != _NONE_CANONICAL:
+            rules.append("none_canonical")
+        return _NONE_CANONICAL
+    return text
+
+
+def _needs_llm(value: Any, contract_type: "str | None", method: Mapping[str, Any]) -> bool:
+    """Whether the one short LLM naturalize call is warranted — template-first, so **opt-in only**.
+
+    The LLM fires only when the deterministic pipeline *explicitly* requests it via a truthy
+    ``method['naturalize']`` — and never for a template-format type (数値/列挙/…), whose 書式 a pure
+    template always produces. This keeps the call minimal and predictable: a pipeline that can already
+    hand back a gold-shaped string never triggers a model call; only a free-text type that hands back a
+    raw structure it wants phrased sets the flag. (The type is checked so a stray flag on a numeric/enum
+    contract cannot force a needless call.)
+    """
+    if _is_blank(value):
+        return False
+    if not method.get("naturalize"):
+        return False
+    return contract_type not in _TEMPLATE_CONTRACTS
+
+
+_NATURALIZE_SYSTEM = (
+    "あなたは、決定論パイプラインが確定した回答値を、質問に対する自然な日本語の回答文へ整えるだけの整形器です。"
+    "厳守事項:\n"
+    "- 与えられた値の事実(数値・ID・固有名・列挙対象)を一切変更・追加・削除しない。新しい事実を創作しない。\n"
+    "- 値に含まれない情報を補わない。値が答えそのものなら、そのまま最小限に整えて返す。\n"
+    "- 前置き・言い訳・思考過程・引用符を付けず、回答本文のみを1つ返す。"
+)
+
+
+def _default_naturalizer(value_text: str, question: str) -> "str | None":
+    """Lazy Gemini one-shot (production default). Best-effort: any failure returns ``None`` → template text.
+
+    Imported lazily so this module stays dependency-light and offline tests never touch the network.
+    """
+    try:
+        from src.rag import llm as _llm
+    except Exception:  # noqa: BLE001 — no client available ⇒ keep template text
+        return None
+    prompt = (
+        f"質問:\n{question}\n\n"
+        f"決定論パイプラインが確定した回答値:\n{value_text}\n\n"
+        "この値を、質問に自然に答える日本語の回答文へ整形してください。値の事実は改変しないこと。"
+    )
+    try:
+        out = _llm.generate(prompt, system=_NATURALIZE_SYSTEM, temperature=0.0,
+                            thinking_budget=0, max_output_tokens=512)
+    except Exception:  # noqa: BLE001 — naturalize is additive; degrade to the template text
+        return None
+    out = (out or "").strip()
+    return out or None
+
+
+def _maybe_naturalize(text: str, question: str, naturalizer: "Naturalizer | None",
+                      rules: list[str]) -> str:
+    """Run the one short LLM naturalize call; keep the template text on any empty/failed result."""
+    fn = naturalizer or _default_naturalizer
+    try:
+        out = fn(text, question)
+    except Exception:  # noqa: BLE001 — never break the answer path on a naturalizer error
+        out = None
+    out = (out or "").strip() if isinstance(out, str) else None
+    if out:
+        rules.append("llm_naturalized")
+        return out
+    return text
+
+
+# --------------------------------------------------------------------------- public entry
+def format_contract(contract: Any, question: str = "", *, contract_type: "str | None" = None,
+                    naturalizer: "Naturalizer | None" = None,
+                    force: bool = False) -> "dict[str, Any] | None":
+    """Naturalize a deterministic ``{value, evidence, method}`` into gold 書式 (Stage3 exit).
+
+    Returns the reformatted contract dict, or ``None`` **only** when the deterministic value is blank
+    (「決定論値が空なら整形せず上位へ返す」 — the caller then abstains / falls back to the LLM loop). When the
+    layer is disabled (flag off and ``force`` unset) it is an identity no-op (returns the normalized
+    contract unchanged), so it can never alter the answer outside the gated router path. The formatting
+    provenance (which rules fired, whether the LLM was used) is recorded under ``method['formatting']``;
+    ``method['confidence']`` and every other method field are preserved.
+    """
+    if not _contract.is_contract(contract):
+        return None
+    c = _contract.ensure_contract(contract)
+    if not (force or enabled()):
+        return c  # identity no-op when the inverted exit is gated off
+    value = c.get("value")
+    if _is_blank(value):
+        return None  # blank deterministic value ⇒ let the caller abstain / fall back (回答数を減らさない)
+
+    evidence: Mapping[str, Any] = c.get("evidence") or {}
+    method = dict(c.get("method") or {})
+    rules: list[str] = []
+
+    # 1) evidence-bound granularity repair (SOT-2545): complete a truncated verbatim extract, then trim an
+    #    over-enumerated single-item list — both only when evidence licenses it (never a guess).
+    value = _complete_truncation(value, question, evidence, rules)
+    value = _trim_over_enumeration(value, question, evidence, rules)
+
+    # 2) deterministic template render (template-first — no LLM for numbers/lists/strings/none-forms).
+    text = _render_template(value)
+    if text is None:
+        return None  # shaping emptied the value ⇒ nothing to commit; fall back.
+    text = _canonical_none(text, rules)  # SOT-2544 none-form → 「該当なし」
+
+    # 3) at most ONE short LLM naturalize call, and only for a free-text type whose value is still raw.
+    if _needs_llm(value, contract_type, method):
+        text = _maybe_naturalize(text, question, naturalizer, rules)
+
+    method["formatting"] = {
+        "engine": "formatting",
+        "template_only": "llm_naturalized" not in rules,
+        "rules": rules,
+        "contract_type": contract_type,
+    }
+    return {"value": text, "evidence": dict(evidence), "method": method}
