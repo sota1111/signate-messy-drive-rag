@@ -35,7 +35,9 @@ from pathlib import Path
 from typing import Any
 
 from config import settings
+from src.rag.agent import eu_gate as _eu
 from src.rag.agent.calc_ledger import is_numeric_answer
+from src.rag.agent.eu_gate import GateSignals
 from src.rag.agent.exec_verifier import ExecVerdict
 from src.rag.agent.investigator import Answer
 from src.rag.agent.tiebreak import (
@@ -99,6 +101,13 @@ GATE_SLICE_CALIBRATE = _bool_env("GATE_SLICE_CALIBRATE", False)
 # Path to the per-slice calibration model (or a bare ``{contract: threshold}`` map). Unset/missing → no
 # per-slice relaxation, so the gate is byte-identical even if GATE_SLICE_CALIBRATE is toggled on.
 GATE_SLICE_CALIBRATION_FILE = os.getenv("GATE_SLICE_CALIBRATION_FILE", "")
+# SOT-2589 — replace the confidence-threshold commit decision with the expected-utility three-tier gate
+# (:mod:`src.rag.agent.eu_gate`). Default OFF (``RAG_EU_GATE``): the whole EU path — signal construction
+# and :func:`eu_gate.decide` — is skipped, so the gate is byte-identical to the confidence gate. When ON,
+# a served (non-abstained) resolution is committed/abstained on U = P(P)+0.5P(A)−P(I) > 0 with hard
+# evidence signals as the primary input and verbal confidence demoted; the execution gate still applies on
+# top. BUDGET_EXHAUSTED is never an abstain criterion here (operational, not epistemic).
+GATE_EU = _bool_env("RAG_EU_GATE", False)
 
 _TIEBREAK_STATUSES = (STATUS_TIEBREAK_INVESTIGATOR, STATUS_TIEBREAK_VERIFIER)
 
@@ -289,7 +298,9 @@ def apply_gate(resolution: Resolution, *,
                exec_correct: bool | None = None,
                slice_thresholds: dict[str, float] | None = None,
                contract: str | None = None,
-               slice_calibrate: bool | None = None) -> GateDecision:
+               slice_calibrate: bool | None = None,
+               eu_gate_on: bool | None = None,
+               eu_signals: GateSignals | None = None) -> GateDecision:
     """Apply the precision-first confidence gate to an adjudicated :class:`Resolution`.
 
     Commit rules (EV最適, Incorrect=−1 / Missing=0):
@@ -318,6 +329,16 @@ def apply_gate(resolution: Resolution, *,
     commit_on_tiebreak = GATE_COMMIT_ON_TIEBREAK if commit_on_tiebreak is None else commit_on_tiebreak
     tiebreak_confidence = GATE_TIEBREAK_CONFIDENCE if tiebreak_confidence is None else tiebreak_confidence
     slice_calibrate = GATE_SLICE_CALIBRATE if slice_calibrate is None else slice_calibrate
+    eu_gate_on = GATE_EU if eu_gate_on is None else eu_gate_on
+
+    # SOT-2589 — expected-utility three-tier gate replaces the confidence decision when enabled AND a
+    # signal bundle is supplied. Default OFF (or no signals) ⇒ this branch is never taken and the
+    # confidence gate below runs unchanged (byte-identical).
+    if eu_gate_on and eu_signals is not None:
+        decision = _apply_eu_gate(resolution, eu_signals)
+        return apply_exec_gate(
+            decision, exec_verdict, exec_verify=exec_verify, contract=contract,
+            exec_correct=exec_correct)
 
     effective_commit = _slice_commit_confidence(
         resolution, commit_confidence, slice_thresholds, contract, slice_calibrate)
@@ -328,6 +349,24 @@ def apply_gate(resolution: Resolution, *,
     return apply_exec_gate(
         decision, exec_verdict, exec_verify=exec_verify, contract=contract,
         exec_correct=exec_correct)
+
+
+def _apply_eu_gate(resolution: Resolution, signals: GateSignals) -> GateDecision:
+    """SOT-2589 — commit/abstain a served resolution on the expected-utility three-tier gate.
+
+    A consensus that already abstained is never resurrected (there is no answer to serve). Otherwise the
+    served answer is committed iff :func:`eu_gate.decide` returns HARD/SOFT ACCEPT; the tier and the
+    utility go into the auditable ``reason``. The served confidence stays the resolution's own (the EU
+    gate re-frames the *decision*, not the reported confidence)."""
+    q = resolution.question
+    if resolution.abstained:
+        return _abstain(q, resolution, f"合議が棄権 — 棄権を維持({resolution.reason})")
+    dec = _eu.decide(signals)
+    if dec.commit:
+        return GateDecision(
+            question=q, answer=resolution.answer, commit=True, confidence=resolution.confidence,
+            reason=f"EU-gate {dec.tier}: {dec.reason}", resolution=resolution)
+    return _abstain(q, resolution, f"EU-gate {dec.tier}: {dec.reason}")
 
 
 def _apply_confidence_gate(resolution: Resolution, *,
@@ -386,6 +425,9 @@ def gate_question(question: str, *,
                   contract: str | None = None,
                   slice_thresholds: dict[str, float] | None = None,
                   slice_calibrate: bool | None = None,
+                  eu_gate_on: bool | None = None,
+                  eu_signals: GateSignals | None = None,
+                  project: str | None = None,
                   **resolve_kwargs: Any) -> GateDecision:
     """Convenience live entry point: run the full 合議 then apply the confidence + execution gates.
 
@@ -414,12 +456,71 @@ def gate_question(question: str, *,
         contract=contract, question=question)
     if slice_thresholds is None:
         slice_thresholds = load_slice_thresholds()
+    eu_gate_on = GATE_EU if eu_gate_on is None else eu_gate_on
+    if eu_gate_on and eu_signals is None:
+        eu_signals = _build_eu_signals(
+            resolution, contract=contract, exec_verdict=exec_verdict, project=project)
     return apply_gate(
         resolution, commit_confidence=commit_confidence,
         commit_on_tiebreak=commit_on_tiebreak, tiebreak_confidence=tiebreak_confidence,
         exec_verdict=exec_verdict, exec_verify=exec_verify, exec_correct=exec_correct,
         slice_thresholds=slice_thresholds, contract=contract, slice_calibrate=slice_calibrate,
+        eu_gate_on=eu_gate_on, eu_signals=eu_signals,
     )
+
+
+def _build_eu_signals(resolution: Resolution, *, contract: str | None,
+                      exec_verdict: ExecVerdict | None,
+                      project: str | None = None) -> GateSignals:
+    """Best-effort live :class:`~src.rag.agent.eu_gate.GateSignals` from the consensus + execution verdict.
+
+    Only built when the EU gate is enabled (opt-in). Reads what the live path *does* carry — the
+    investigator↔verifier agreement, the served evidence/method, the calc-ledger record, the execution
+    verdict, and (lazily, network-free) the SOT-2583 document registry's canonical-doc resolution — and
+    maps them onto the signal bundle. Every unknown signal keeps its non-blocking default, so a partial
+    live view degrades to a conservative estimate rather than a spurious hard-abstain.
+    """
+    contract = contract or _classify_contract(resolution.question)
+    agree = bool(resolution.agree)
+    has_evidence = bool((resolution.evidence or "").strip())
+    calc = resolution.calc_record or {}
+    is_numeric = (contract == "numeric") or bool(calc)
+
+    # execution-engine agreement from the (opt-in) re-execution verdict, when present.
+    exec_agree = True
+    operands_complete = True
+    if exec_verdict is not None:
+        exec_agree = not getattr(exec_verdict, "should_abstain", False)
+        operands_complete = not getattr(exec_verdict, "should_abstain", False)
+
+    canonical = _registry_resolves(resolution.question, project=project)
+
+    return GateSignals(
+        canonical_doc_resolved=canonical,
+        evidence_slots_complete=has_evidence and agree,
+        self_consistency_agrees=agree,
+        answer_verifier_agrees=agree,
+        operand_sources_complete=operands_complete if is_numeric else True,
+        execution_engines_agree=exec_agree if is_numeric else True,
+        deterministic_lane=is_numeric and bool(calc),
+        verbal_confidence=float(resolution.confidence),
+    )
+
+
+def _registry_resolves(question: str, *, project: str | None = None) -> bool:
+    """True when the SOT-2583 document registry resolves a target document for the question.
+
+    Lazy + fail-open: any import/lookup error (e.g. a missing registry artifact) → ``False`` (a
+    non-blocking default), never an exception on the answer path."""
+    try:
+        from src.rag.index import document_registry as _dr
+
+        resolver = _dr.get_resolver()
+        if resolver is None:
+            return False
+        return bool(resolver.resolve(question, project=project, limit=1))
+    except Exception:  # noqa: BLE001 — advisory signal; never break the gate
+        return False
 
 
 def _live_exec_verdict(committed_calc_record: dict[str, Any] | None, *,
