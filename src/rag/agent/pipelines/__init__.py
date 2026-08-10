@@ -30,4 +30,9 @@ from . import chart_spatial as chart_spatial  # noqa: F401
 # everything else it cannot pin structurally falls back to the LLM loop.
 from . import fact_lookup as fact_lookup  # noqa: F401
 
-__all__ = ["version_diff", "numeric", "enumeration", "chart_spatial", "fact_lookup"]
+# Wave B1 — document_extract / format_check (SOT-2611). Deterministic highlighted-pivot-cell extraction
+# conditions + aggregation (real-cell outline, embedded-EMF outline, EMF 2D cross-tab); anything it cannot
+# ground structurally falls back to the LLM loop.
+from . import document_extract as document_extract  # noqa: F401
+
+__all__ = ["version_diff", "numeric", "enumeration", "chart_spatial", "fact_lookup", "document_extract"]
