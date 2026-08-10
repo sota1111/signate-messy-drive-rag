@@ -31,6 +31,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
+from src.rag.agent import early_abstain as _early
 from src.rag.agent import obligations as ob
 from src.rag.agent.obligations import (
     COMPUTATION,
@@ -216,6 +217,11 @@ class ResearchDirector:
         self._targeted: set[str] = set()
         self.rounds: list[ResearchRound] = []
         self.terminal: str = ""
+        # SOT-2599 — early-abstain recalibration state. ``_deterministic_tried`` flips True as soon as ANY
+        # cheap deterministic probe is dispatched (success or not — a tried-and-empty probe still counts),
+        # and ``_probe_forced`` makes the forced-probe push strictly one-shot so it can never loop.
+        self._deterministic_tried = False
+        self._probe_forced = False
 
     # -- obligations (decomposed lazily, once) --------------------------------------------------------
     def obligations(self) -> ob.ObligationSet:
@@ -226,6 +232,11 @@ class ResearchDirector:
     # -- evidence collection (observer) ---------------------------------------------------------------
     def observe(self, tool_name: str, resp: Any) -> None:
         """Record a successful tool result as collected evidence (kinds tagged from :data:`_TOOL_KINDS`)."""
+        # SOT-2599 — a cheap deterministic probe counts as "tried" regardless of whether it surfaced
+        # evidence, so the early-abstain recalibration never forces a *second* probe of a route the model
+        # already exhausted (未試行なら1回は試す).
+        if _early.is_cheap_deterministic_tool(tool_name):
+            self._deterministic_tried = True
         if _succeeded(resp):
             self._evidence.append(ob.EvidenceItem(
                 text=_resp_text(tool_name, resp), ref=tool_name,
@@ -257,7 +268,21 @@ class ResearchDirector:
         unmet = self._unmet(evidence_text)
         fresh = [o for o in unmet if o.kind not in self._targeted]
         if not fresh:
-            # nothing unmet, or every open kind already re-searched → searched thoroughly, none found
+            # nothing unmet, or every open kind already re-searched → normally "searched thoroughly, none
+            # found" → UNANSWERABLE. SOT-2599: forbid this at iters≤2 when no cheap deterministic probe has
+            # been tried — force ONE deterministic probe (canonical_route/file_grep/find_files) first. The
+            # push is one-shot and recorded as a bounded round, so it can never loop; the *next* review
+            # (probe tried) finalizes UNANSWERABLE exactly as before. Byte-identical when the recal is OFF.
+            if not _early.may_finalize_unanswerable(
+                    tool_call_count=tool_call_count,
+                    deterministic_probe_tried=self._deterministic_tried,
+                    probe_forced=self._probe_forced):
+                self._probe_forced = True
+                probe_tactic = (_early.probe_directive(),)
+                self.rounds.append(ResearchRound(
+                    round=len(self.rounds) + 1, kind=_early.PROBE_KIND,
+                    obligations=(), tactics=probe_tactic, boundary=at_boundary))
+                return _early.probe_directive()
             self.terminal = UNANSWERABLE
             return None
         kind = fresh[0].kind  # obligations keep discharge order → most fundamental gap first
