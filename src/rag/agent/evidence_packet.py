@@ -37,6 +37,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.rag.agent import condition_prefill as _condition_prefill
 from src.rag.agent import early_abstain as _early
 from src.rag.agent import operand_prefill as _operand_prefill
 from src.rag.agent import query_router as _router
@@ -158,6 +159,21 @@ def build_packet(question: str, *, project: str | None = None,
                 evidence["operand_candidates"] = catalog
         except Exception:  # noqa: BLE001 — additive; never break the packet
             pass
+    # SOT-2621 — NUMERIC what-if condition IR prefill. Behind ``RAG_CONDITION_PREIR`` (default OFF ⇒
+    # evidence stays untouched and the packet JSON is byte-identical). When on for a NUMERIC route, detect
+    # a what-if / 条件分岐 skeleton (predicate + ordered adjustments) deterministically from the question
+    # and record it under the ``condition_ir`` evidence key. Only *fires* when an adjustment is detected
+    # (no firing-condition relaxation): a question with no branch structure injects nothing → no
+    # degradation. The skeleton is a hint (base_quantity / predicate_truth left blank for the LLM); it is
+    # not a required slot, so "operands"/etc. stay in ``missing``. Guarded so a detection hiccup never
+    # changes the packet's core fields.
+    if _condition_prefill.enabled() and dec.route == _router.NUMERIC:
+        try:
+            ir_spec = _condition_prefill.build_condition_ir(question)
+            if ir_spec:
+                evidence["condition_ir"] = ir_spec
+        except Exception:  # noqa: BLE001 — additive; never break the packet
+            pass
     missing = tuple(slot for slot in required if slot not in evidence)
     return EvidencePacket(
         route=dec.route,
@@ -217,12 +233,20 @@ def packet_directive(packet: EvidencePacket) -> str:
     # of grep-spinning. Absent catalog (default OFF / empty) appends nothing → byte-identical.
     catalog = packet.evidence.get("operand_candidates") if packet.evidence else None
     operand_block = _operand_prefill.candidates_directive(catalog) if catalog else ""
+    # SOT-2621 — when the NUMERIC condition prefill recorded a branch IR skeleton, render it as a
+    # fill-in-the-blanks directive so the agent uses the pre-built branch structure instead of
+    # re-interpreting the condition through more search. Absent skeleton (default OFF / not fired) appends
+    # nothing → byte-identical.
+    ir_spec = packet.evidence.get("condition_ir") if packet.evidence else None
+    condition_block = _condition_prefill.condition_directive(ir_spec) if ir_spec else ""
     packet_json = packet.to_json()
     directive = (
         "【Evidence Packet（回答ループ前・決定論フェーズ）】\n"
         + doc_block + lane_block + slot_block)
     if operand_block:
         directive = f"{directive}\n{operand_block}"
+    if condition_block:
+        directive = f"{directive}\n{condition_block}"
     return f"{directive}\nEvidence Packet(JSON): {packet_json}"
 
 
