@@ -17,4 +17,8 @@ from . import version_diff as version_diff  # noqa: F401
 # Wave A2 — numeric / derived_calculation (SOT-2607). Importing the module runs its ``register()``.
 from . import numeric as numeric  # noqa: F401
 
-__all__ = ["version_diff", "numeric"]
+# Wave A3 — enum / cross_aggregate (SOT-2608). Importing the module runs its ``register()`` for both the
+# ``full_enumeration`` and ``cross_aggregate`` contracts.
+from . import enumeration as enumeration  # noqa: F401
+
+__all__ = ["version_diff", "numeric", "enumeration"]
