@@ -73,6 +73,38 @@ def test_hard_constraint_is_opt_in_and_requires_every_named_file(
     assert dr.hard_constraint_abstain("train.csv を確認", project="Alpha", path=registry) is None
 
 
+def test_resolution_miss_falls_back_when_scope_resolves_but_abstains_without_scope(
+        registry: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SOT-2597: a resolver *miss* on an explicit file is a resolver gap, not proof of absence.
+
+    With a ``scope_resolver`` supplied (the serve path passes the legacy case/project resolver), a
+    miss must fall back to exploration (``None``) whenever *any* case scope resolves — the file is
+    reachable there — and hard-abstain only when no scope resolves at all (certified absent).
+    """
+    monkeypatch.setenv("RAG_DOCUMENT_REGISTRY", "1")
+    dr.reset_cache()
+    # An explicitly-named file that the trusted tiers cannot resolve (nickname / decorated token).
+    question = "missing_nickname.xlsx を確認して"
+    assert dr.get_resolver(registry) is not None
+    # No scope signal → legacy miss→abstain behavior is preserved (byte-identical fallback).
+    assert dr.hard_constraint_abstain(question, path=registry) == dr.DOC_NOT_FOUND_REASON
+    # A resolvable scope → reachable via legacy exploration → do NOT hard-abstain.
+    assert dr.hard_constraint_abstain(
+        question, path=registry, scope_resolver=lambda _q: "Alpha") is None
+    # No resolvable scope → nowhere in the population the file could live → certified absent.
+    assert dr.hard_constraint_abstain(
+        question, path=registry, scope_resolver=lambda _q: None) == dr.DOC_NOT_FOUND_REASON
+    # A scope probe that raises must fail open to exploration, never speculatively abstain.
+    def _boom(_q: str) -> str | None:
+        raise RuntimeError("scope probe failed")
+    assert dr.hard_constraint_abstain(question, path=registry, scope_resolver=_boom) is None
+    # A *resolved* explicit file still short-circuits to None even with a scope_resolver present
+    # (the registry only accelerates; the scope branch is never reached).
+    assert dr.hard_constraint_abstain(
+        "train.csv を確認", project="Alpha", path=registry,
+        scope_resolver=lambda _q: None) is None
+
+
 def test_measurement_records_recall_at_1_and_3(registry: Path) -> None:
     target = "プロジェクト/Alpha/03.データ/train.csv"
     result = dr.measure_recall([("train.csv を確認", "Alpha", target)], path=registry)

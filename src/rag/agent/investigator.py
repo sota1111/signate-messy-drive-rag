@@ -2106,7 +2106,14 @@ def answer_question(question: str, *, model: str | None = None,
     # (RAG_DOCUMENT_REGISTRY) — a no-op when disabled or the artifact is absent, so the champion serve
     # path stays byte-identical.
     from src.rag.index import document_registry as _document_registry
-    _dr_reason = _document_registry.hard_constraint_abstain(question)
+    # SOT-2597 (較正1): pass the legacy path's own case/project resolver so a registry resolution
+    # *miss* falls back to exploration (find_files/canonical_route/file_grep) instead of a
+    # speculative 0-iteration abstain — the registry stays "resolve→accelerate", and hard-abstains
+    # only when no scope resolves at all (certified absent). ``resolve_project`` is imported directly
+    # (the tools re-export shadows the module attribute — known gotcha).
+    from src.rag.tools.canonical_route import resolve_project as _resolve_project
+    _dr_reason = _document_registry.hard_constraint_abstain(
+        question, scope_resolver=lambda q: _resolve_project(q, None))
     if _dr_reason is not None:
         return Investigation(
             question=question,

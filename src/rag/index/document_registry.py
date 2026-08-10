@@ -673,14 +673,31 @@ def get_resolver(path: Path | None = None) -> Resolver | None:
 
 
 def hard_constraint_abstain(question: str, *, project: str | None = None,
-                            path: Path | None = None) -> str | None:
-    """:data:`DOC_NOT_FOUND_REASON` when the question names a file the registry cannot resolve.
+                            path: Path | None = None,
+                            scope_resolver: "Callable[[str], str | None] | None" = None
+                            ) -> str | None:
+    """:data:`DOC_NOT_FOUND_REASON` only when the named file is *certifiably absent*, else ``None``.
 
-    The idx12 fix: an *explicit* file reference is a hard constraint. When enabled and the question
-    names a file that the deterministic exact/alias/version tiers cannot resolve after scanning the
-    whole manifest, the serve path must abstain rather than fall back to semantic retrieval and
-    over-infer. Returns ``None`` (no constraint / resolved / disabled) otherwise — so the default-OFF
-    serve path is byte-identical.
+    An *explicit* file reference is a hard constraint. When enabled and the deterministic
+    exact/alias/version tiers resolve every named file, the registry merely *accelerates* the serve
+    path (``None`` — the answer loop proceeds with the resolved document seeded).
+
+    SOT-2597 (較正1): a resolution **miss** is a resolver gap, **not** proof of non-existence — the
+    trusted tiers mis-split decorated tokens (idx0/74: ``…から提案書.pptx`` → ``ら提案書.pptx``) and
+    cannot see a file referenced by nickname (idx59: ``PP_final.pptx`` vs corpus ``提案書_final.pptx``),
+    yet the document is reachable through the legacy exploration path
+    (find_files/canonical_route/file_grep). On a miss the serve path must therefore fall back to that
+    exploration (``None``) **unless** the registry can positively certify the document is absent.
+
+    *Certificate of absence*: the question resolves to **no** case/project scope in the corpus
+    (``scope_resolver`` returns nothing). Legacy exploration itself scopes by project, so with no
+    resolvable scope there is nowhere in the population the file could live — only then is
+    ``DOC_NOT_FOUND`` a real exhaustive-manifest-scan certificate rather than a speculative
+    0-iteration abstain on a reachable document. When ``scope_resolver`` is not supplied (no scope
+    signal available), the legacy miss→abstain behavior is kept unchanged.
+
+    Returns ``None`` (no constraint / resolved / reachable scope / disabled) otherwise — so the
+    default-OFF serve path is byte-identical.
     """
     if not enabled():
         return None
@@ -690,8 +707,16 @@ def hard_constraint_abstain(question: str, *, project: str | None = None,
     if resolver is None:
         return None  # no artifact → fail open to the live path (回帰ゼロ)
     if resolver.resolves_every_explicit(question, project=project):
-        return None
-    return DOC_NOT_FOUND_REASON
+        return None  # resolved → registry only accelerates; never abstain
+    if scope_resolver is None:
+        return DOC_NOT_FOUND_REASON  # no scope signal → keep the legacy miss→abstain behavior
+    try:
+        scope = scope_resolver(question)
+    except Exception:
+        return None  # scope probe failed → fail open to exploration (never speculatively abstain)
+    # A resolvable scope means the (possibly mis-named) document is reachable there via legacy
+    # exploration → explore. No scope → certified absent → hard-abstain.
+    return None if scope else DOC_NOT_FOUND_REASON
 
 
 # --------------------------------------------------------------------------- measurement
