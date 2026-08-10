@@ -435,3 +435,46 @@ def test_gate_question_loads_slice_file_when_enabled(monkeypatch, tmp_path):
     monkeypatch.setattr(gate, "resolve_question", lambda q, **kw: r)
     d = gate.gate_question(question, commit_confidence=0.7, slice_calibrate=True)
     assert d.commit and d.answer == "田中"
+
+
+# --------------------------------------------------------------------------- SOT-2589 EU three-tier gate
+def test_eu_gate_off_is_byte_identical_to_confidence_gate():
+    """Default OFF (and ON-without-signals) → the confidence gate runs unchanged (regression 0)."""
+    from src.rag.agent.eu_gate import GateSignals  # noqa: F401 (imported for symmetry)
+    r = _resolution("1526", "1526.0", confidence=0.9)
+    baseline = apply_gate(r, commit_confidence=0.7)                       # legacy call, no EU args
+    off = apply_gate(r, commit_confidence=0.7, eu_gate_on=False)
+    on_no_signals = apply_gate(r, commit_confidence=0.7, eu_gate_on=True, eu_signals=None)
+    assert baseline.to_dict() == off.to_dict() == on_no_signals.to_dict()
+
+
+def test_eu_gate_on_commits_with_strong_hard_evidence():
+    from src.rag.agent.eu_gate import GateSignals
+    r = _resolution("1526", "1526.0", confidence=0.9)
+    signals = GateSignals(canonical_doc_resolved=True, evidence_slots_complete=True,
+                          answer_verifier_agrees=True, deterministic_lane=True)
+    d = apply_gate(r, eu_gate_on=True, eu_signals=signals)
+    assert d.commit and d.answer == "1526"
+    assert "EU-gate" in d.reason and "HARD_ACCEPT" in d.reason
+
+
+def test_eu_gate_on_abstains_a_high_confidence_agreement_without_evidence():
+    """The EU gate abstains a 合議一致・高確信 answer that has no hard evidence — the whole point of the
+    re-calibration (verbal confidence is not sufficient)."""
+    from src.rag.agent.eu_gate import GateSignals
+    r = _resolution("1526", "1526.0", confidence=0.99)
+    d_conf = apply_gate(r, commit_confidence=0.7)                         # confidence gate would commit
+    assert d_conf.commit is True
+    d_eu = apply_gate(r, eu_gate_on=True, eu_signals=GateSignals(verbal_confidence=0.99))
+    assert d_eu.commit is False and d_eu.answer == settings.ABSTAIN
+    assert "EU-gate ABSTAIN" in d_eu.reason
+
+
+def test_eu_gate_never_resurrects_an_abstained_consensus():
+    from src.rag.agent.eu_gate import GateSignals
+    r = _resolution(settings.ABSTAIN, "1526")   # investigator abstains ⇒ 決着不能 / abstained consensus
+    assert r.abstained
+    strong = GateSignals(canonical_doc_resolved=True, evidence_slots_complete=True,
+                         answer_verifier_agrees=True, deterministic_lane=True)
+    d = apply_gate(r, eu_gate_on=True, eu_signals=strong)
+    assert d.commit is False and d.answer == settings.ABSTAIN
