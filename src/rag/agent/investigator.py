@@ -515,10 +515,21 @@ def _version_diff(question: str) -> dict[str, Any]:
     # precision-first agent entry: abstains on non-adjacent / unreadable / ambiguous pairs so a
     # wrong diff (−1) is never surfaced in place of an abstention (0).
     answer = diffpair.answer_question_agent(question)
+    evidence: dict[str, Any] = {"applicable": True, "resolved": answer is not None,
+                                "coverage": "all-slides/all-sheets"}
+    # SOT-2588 (opt-in, default OFF → byte-identical): pre-inject ranked substantive change candidates
+    # (intent/score/old/new/structural_location) so the agent reasons over aligned changed blocks and
+    # the substantive edit is the first candidate, not the largest structural diff.
+    if diffpair.align_enabled():
+        try:
+            cands = diffpair.ranked_candidates(question)
+        except Exception:
+            cands = []
+        if cands:
+            evidence["candidates"] = cands[:6]
     return _contract.make(
         answer, engine="diffpair",
-        evidence={"applicable": True, "resolved": answer is not None,
-                  "coverage": "all-slides/all-sheets"},
+        evidence=evidence,
         scheme="structural-version-diff",
         note=("隣接版(旧版→最新/vN→vN+1)の全スライド/全シート構造diff"
               "(セル/段落を整列し実質変更のみ)"

@@ -20,6 +20,7 @@ importing this module at serve time (lean container, no corpus) is free and neve
 """
 from __future__ import annotations
 
+import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -472,8 +473,368 @@ def resolve_pair(question: str) -> VersionPair | None:
     return None
 
 
+# =============================================================================================
+# SOT-2588 — block-alignment + edit-intent classification lane (opt-in, default OFF).
+#
+# Parent SOT-2568 deep-research (impl order 6/7, P2). idx1/idx14 mis-select the "largest" diff over
+# the *substantive* one: the champion path picks an added executive-summary section (idx1) or a section
+# reorder (idx14) while the real edit is a deleted results table (idx1) / a data-column-name change
+# (idx14). This lane keeps the deterministic structural diff but adds, on top of it:
+#
+#   Version family resolution → Structural normalization (the existing canonical _Struct) →
+#   Block alignment (deterministic keys already: cell key / sequence) → Atomic changes
+#   (ADD/DELETE/MODIFY/MOVE) → Edit-intent classification → Substantive ranking.
+#
+# vs. the OFF path it additionally (a) surfaces *deleted* / *added* keyed cells as atomic changes (a pure
+# table deletion is invisible to the modify-only OFF diff), (b) detects relocated blocks as MOVE, and
+# (c) ranks by an enterprise-document edit-intent taxonomy so boilerplate/layout edits sort below real
+# substantive changes and the top candidate is the substantive one.
+#
+# Design invariants (same as the sibling opt-ins RAG_POT_HARD_LANE / RAG_ENUM_SCAN): pure, deterministic,
+# network-free; default-OFF keeps `_rendered_diff` byte-identical (the whole lane is skipped); intents are
+# computed from label/before/after/kind only, so the SOT-2533 structure-store cache round-trip is unaffected.
+# =============================================================================================
+_DIFF_ALIGN_ON = {"1", "true", "yes", "on"}
+
+# Edit-intent taxonomy, re-defined for enterprise documents (contracts / estimates / internal PPT), NOT
+# the scientific-revision taxonomy transplanted verbatim (Re3 / EMNLP edit-intent give the *structure*:
+# align first, then classify — not the labels).
+SUBSTANTIVE = "SUBSTANTIVE"          # numbers/money/dates/parties/obligations/conditions/schema changed
+SURFACE = "SURFACE"                  # cosmetic value change with no substantive marker
+BOILERPLATE = "BOILERPLATE"          # footer / version label / page number / auto date / whitespace
+LAYOUT_METADATA = "LAYOUT_METADATA"  # relocated block (MOVE) / re-presented summary section
+UNCERTAIN = "UNCERTAIN"              # a real value edit we cannot confidently label
+
+# Ranking priority (higher = surfaced first).
+_INTENT_RANK = {SUBSTANTIVE: 4, UNCERTAIN: 3, SURFACE: 2, LAYOUT_METADATA: 1, BOILERPLATE: 0}
+
+# --- deterministic substantive-signal features (strong evidence a change matters) ---
+_F_MONEY = re.compile(r"(¥|￥|円|万円|億円|ドル|\$|usd|jpy)", re.I)
+_F_PERCENT = re.compile(r"(%|％|パーセント|ポイント|割引|(?<!割)割(?!合))")
+_F_DATE = re.compile(r"(\d{4}\s*[-/年]|\d{1,2}\s*月|\d{1,2}\s*日|令和|平成|昭和)")
+_F_QUANTITY = re.compile(r"\d+(?:\.\d+)?\s*(時間|人日|人月|人|件|個|台|日間|週間|週|ヶ月|か月|カ月|回|名|点|部|号)")
+_F_NUMBER = re.compile(r"\d")
+_F_PROPER = re.compile(r"(株式会社|有限会社|合同会社|医療法人|社会福祉法人|社団|財団|病院|クリニック|大学|銀行|信用金庫|信用組合|組合|センター)")
+# A person name (担当者 / 契約当事者 change): 姓 + 空白 + 名 in kanji. A responsible-party change is a
+# first-class substantive edit (idx74/idx95) but carries no number/money marker, so detect it explicitly.
+_F_PERSON = re.compile(r"[一-龥]{1,4}[ 　][一-龥]{1,3}")
+_F_OBLIGATION = re.compile(r"(しなければならない|してはならない|する必要がある|義務|許可|禁止|禁ずる|認めない|認める|不可|可能|要する|遵守|順守|責任|保証)")
+_F_CONDITION = re.compile(r"(場合|とき|条件|以上|以下|未満|超過|超える|以内|より小さい|より大きい|かつ|または|ただし|閾値|しきい値)")
+# schema / identifier edits (idx14: column names → underscore notation) — a snake_case / camelCase token.
+_F_IDENT = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+|[a-z]+[A-Z][A-Za-z0-9]*")
+
+# --- boilerplate / non-substantive features (raise the boilerplate prior) ---
+_B_VERSION_LABEL = re.compile(r"^(?:ver(?:sion)?|rev(?:ision)?|v|r|第?\s*\d+\s*版|版|バージョン|改訂\s*\d*)[\s._\-]*\d*$", re.I)
+_B_PAGE = re.compile(r"(ページ|頁|p\.?\s*\d+|\d+\s*/\s*\d+|table\s*of\s*contents|toc)", re.I)
+_B_FOOTER = re.compile(r"(copyright|©|\(c\)|all\s*rights\s*reserved|confidential|社外秘|マル秘|フッター|ヘッダー|footer|header)", re.I)
+_B_AUTODATE = re.compile(r"(作成日|更新日|印刷日|出力日|作成日時|最終更新|last\s*updated|printed)", re.I)
+# A newly *added* overview / summary section re-presents existing content — layout, not new substance.
+_SUMMARY_HEADING = re.compile(r"(エグゼクティブ\s*サマリ|エグゼクティブサマリー|サマリー|要約|概要|アジェンダ|目次|はじめに|表紙|タイトルページ)")
+
+
+def align_enabled() -> bool:
+    """True when version-diff answers go through the SOT-2588 block-alignment + edit-intent lane.
+
+    Gated by ``RAG_DIFF_ALIGN`` (default OFF — opt-in) exactly like the sibling lanes
+    (``RAG_POT_HARD_LANE`` / ``RAG_ENUM_SCAN``): OFF means ``_rendered_diff`` takes the historical path
+    and the champion answer is byte-identical."""
+    return os.getenv("RAG_DIFF_ALIGN", "0").strip().lower() in _DIFF_ALIGN_ON
+
+
+@dataclass
+class RankedChange:
+    change: Change
+    intent: str
+    score: float
+    location: str
+    features: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        """Candidate record for pre-injecting old/new pairs into the generation agent."""
+        return {
+            "intent": self.intent,
+            "score": round(self.score, 3),
+            "kind": self.change.kind,
+            "old": self.change.before,
+            "new": self.change.after,
+            "structural_location": self.location,
+            "reason_features": list(self.features),
+        }
+
+
+def _changed_text(c: Change) -> str:
+    """The text carrying the semantic payload of a change (after for add, before for delete, both else)."""
+    if c.kind == "add":
+        return c.after
+    if c.kind == "remove":
+        return c.before
+    return f"{c.before} {c.after}"
+
+
+def _substantive_features(text: str) -> list[str]:
+    t = nfc(text)
+    feats: list[str] = []
+    if _F_MONEY.search(t):
+        feats.append("money")
+    if _F_PERCENT.search(t):
+        feats.append("percent")
+    if _F_DATE.search(t):
+        feats.append("date")
+    if _F_QUANTITY.search(t):
+        feats.append("quantity")
+    elif _F_NUMBER.search(t):
+        feats.append("number")
+    if _F_PROPER.search(t):
+        feats.append("proper_noun")
+    if _F_PERSON.search(t):
+        feats.append("person_name")
+    if _F_OBLIGATION.search(t):
+        feats.append("obligation")
+    if _F_CONDITION.search(t):
+        feats.append("condition")
+    if _F_IDENT.search(t):
+        feats.append("identifier")
+    return feats
+
+
+def _boilerplate_feature(text: str, subst: list[str]) -> str | None:
+    """A non-substantive tag when the change is footer/version/page/auto-date/whitespace, else None."""
+    t = nfc(text).strip()
+    key = _norm(text)
+    if not key:
+        return "whitespace_only"
+    if _B_VERSION_LABEL.match(t):
+        return "version_label"
+    if _B_FOOTER.search(t):
+        return "footer"
+    if not subst and _B_AUTODATE.search(t):
+        return "auto_date"
+    if not subst and _B_PAGE.search(t):
+        return "pagination"
+    # A bare bullet / page number ("2が追記された") is pagination noise, not a substantive figure change.
+    if subst == ["number"] and len(key) <= 3:
+        return "trivial_number"
+    return None
+
+
+def classify_change(c: Change, moved: set[str] | None = None) -> RankedChange:
+    """Assign an enterprise edit-intent + substantive score to one atomic change (deterministic).
+
+    Scoring deliberately does NOT reward larger blocks (that is the very "diff size ⇄ importance"
+    confusion this lane exists to break, idx1/idx14). An in-place MODIFY of a value / schema name is the
+    purest substantive edit and outranks any ADD/DELETE of a whole block; feature count is only a small
+    tie-break within a kind."""
+    text = _changed_text(c)
+    location = c.label or ""
+    subst = _substantive_features(text)
+
+    bp = _boilerplate_feature(text, subst)
+    if bp is not None:
+        return RankedChange(c, BOILERPLATE, 0.10, location, [bp])
+
+    # A block that was relocated (its normalized text appears on both the add and delete side) is a MOVE:
+    # layout, not substance — this demotes idx14's Step/section reorder below the real column-name edit.
+    if moved and c.kind in ("add", "remove") and _norm(text) in moved:
+        return RankedChange(c, LAYOUT_METADATA, 0.25, location, subst + ["moved_block"])
+
+    # A newly *added* executive-summary / overview section re-presents content that already exists (idx1):
+    # rank it as layout re-presentation regardless of the figures it restates.
+    if c.kind == "add" and _SUMMARY_HEADING.search(nfc(location + " " + text)):
+        return RankedChange(c, LAYOUT_METADATA, 0.30, location, subst + ["summary_representation"])
+
+    if subst:
+        tie = 0.02 * min(len(subst), 3)
+        if c.kind == "modify":
+            score = 0.90 + tie   # in-place value / schema change — the strongest substantive signal
+        else:
+            score = 0.70 + tie   # structural add/delete of a substantive block (often reorganization)
+        return RankedChange(c, SUBSTANTIVE, min(score, 0.98), location, subst + [f"kind:{c.kind}"])
+
+    # A value change with no substantive marker: keep it (a real edit) but below marked-substantive ones.
+    if c.kind == "modify":
+        return RankedChange(c, UNCERTAIN, 0.50, location, ["value_change_unmarked"])
+    return RankedChange(c, SURFACE, 0.40, location, [f"kind:{c.kind}"])
+
+
+# --------------------------------------------------------------------------------------------
+# Version-family resolution via the SOT-2583 document registry (opt-in fallback).
+#
+# The filename/folder rules in :func:`find_pairs` require *both* siblings to carry a version token, so an
+# ``_old``-suffixed file paired with an *unversioned* latest sibling (idx1: ``…_最終報告_old.pptx`` vs
+# ``…_最終報告.pptx``) is not paired. The registry already groups such files by ``version_family_id``;
+# here we resolve the pair from the registry's families (treating an unversioned member as the latest).
+# Used only on the align_enabled() path, so the OFF pair set — and every store built from it — is unchanged.
+# --------------------------------------------------------------------------------------------
+def _family_key(full_path: str, ext: str, case_id: str) -> tuple[str, str, str, str]:
+    """(case, dir, version-stripped base, ext) — files sharing this key are one logical document."""
+    parts = full_path.split("/")
+    d = "/".join(parts[:-1])
+    stem = parts[-1].rsplit(".", 1)[0]
+    pv = _parse_version(stem)
+    base = pv[0] if pv else stem
+    return nfc(case_id), nfc(d), _norm(base), ext
+
+
+def _family_rank(full_path: str) -> tuple[int, int]:
+    """Version rank of a registry member; an unversioned member is the latest of an old→latest family."""
+    stem = full_path.split("/")[-1].rsplit(".", 1)[0]
+    pv = _parse_version(stem)
+    return pv[1] if pv else (2, 0)
+
+
+def _registry_family_pairs(company: str | None = None) -> list[VersionPair]:
+    """Version pairs grouped by the document-registry family id (old→new), or [] when unavailable."""
+    try:
+        from src.rag.index import document_registry as _dr
+        rows = _dr.load()
+    except Exception:
+        return []
+    if not rows:
+        return []
+    try:
+        refs_by_rel = {r.rel: r for r in _walk(company)}
+    except Exception:
+        return []
+
+    groups: dict[tuple[str, str, str, str], list[tuple[tuple[int, int], str]]] = {}
+    for r in rows:
+        rel = nfc(r.get("full_path") or r.get("doc_id") or "")
+        if rel not in refs_by_rel:
+            continue
+        ref = refs_by_rel[rel]
+        if ref.ext not in ("pptx", "docx", "xlsx"):
+            continue
+        key = _family_key(rel, ref.ext, r.get("case_id") or ref.project or "")
+        groups.setdefault(key, []).append((_family_rank(rel), rel))
+
+    pairs: list[VersionPair] = []
+    for _key, members in groups.items():
+        ranks = {m[0] for m in members}
+        if len(members) < 2 or len(ranks) < 2:
+            continue
+        members.sort(key=lambda t: t[0])
+        old = refs_by_rel[members[0][1]]
+        new = refs_by_rel[members[-1][1]]
+        if old.rel == new.rel:
+            continue
+        pairs.append(VersionPair(old, new, old.stem, "registry-family"))
+    return pairs
+
+
+def _resolve_family_pair(question: str) -> VersionPair | None:
+    """Resolve the version pair from the registry families when the filename rules found none (idx1)."""
+    from src.rag.extract import glossary  # lazy
+    try:
+        company = glossary.load().company_of(question)
+    except Exception:
+        company = None
+    pairs = _registry_family_pairs(company)
+    if not pairs:
+        return None
+    q = nfc(question)
+    matched = [p for p in pairs if _doc_matches_question(p, q)]
+    if len(matched) == 1:
+        return matched[0]
+    if not matched and len(pairs) == 1:
+        return pairs[0]
+    return None
+
+
+def _resolve_pair_for_render(question: str) -> VersionPair | None:
+    """Pair for a diff question; on the align lane, fall back to registry version-family resolution."""
+    pair = resolve_pair(question)
+    if pair is None and align_enabled():
+        pair = _resolve_family_pair(question)
+    return pair
+
+
+def _atomic_changes(pair: VersionPair) -> list[Change] | None:
+    """Structural diff extended with atomic ADD/DELETE of keyed cells (the OFF path reports MODIFY only).
+
+    A pure table/row deletion (idx1 の slide-7 性能比較表) leaves its cell keys in the old struct with no
+    counterpart in the new one; the modify-only OFF loop drops them silently. Here a missing/extra key is
+    reported as an explicit remove/add so it can be ranked. Flowing paragraphs reuse the existing aligned
+    sequence diff (which already emits add/delete)."""
+    so, sn = _struct(pair.old), _struct(pair.new)
+    if so is None or sn is None:
+        return None
+    changes: list[Change] = []
+    for key, (label, ov) in so.cells.items():
+        if key in sn.cells:
+            nlabel, nv = sn.cells[key]
+            if _norm(ov) != _norm(nv):
+                changes.append(Change(nlabel or label, ov, nv, "modify"))
+        else:
+            changes.append(Change(f"{label} 削除".strip(), ov, "", "remove"))
+    for key, (label, nv) in sn.cells.items():
+        if key not in so.cells:
+            changes.append(Change(label, "", nv, "add"))
+    changes.extend(_diff_flow(so.flow, sn.flow, so.flow_labels, sn.flow_labels))
+    # de-dup identical rendered changes, keep order (mirrors _structural_diff_live)
+    seen, out = set(), []
+    for c in changes:
+        r = c.render()
+        if r not in seen:
+            seen.add(r)
+            out.append(c)
+    return out
+
+
+def rank_changes(pair: VersionPair) -> list[RankedChange] | None:
+    """Atomic changes for a pair, classified by edit-intent and ranked substantive-first (deterministic)."""
+    changes = _atomic_changes(pair)
+    if changes is None:
+        return None
+    add_norms = {_norm(_changed_text(c)) for c in changes if c.kind == "add"}
+    rem_norms = {_norm(_changed_text(c)) for c in changes if c.kind == "remove"}
+    moved = {k for k in (add_norms & rem_norms) if k}
+    ranked = [classify_change(c, moved) for c in changes]
+    # stable sort: intent priority, then score, then original order (enumerate index as tie-break)
+    order = {id(r): i for i, r in enumerate(ranked)}
+    ranked.sort(key=lambda r: (-_INTENT_RANK[r.intent], -r.score, order[id(r)]))
+    return ranked
+
+
+def ranked_candidates(question: str) -> list[dict]:
+    """Ranked substantive-first change candidates ({intent,score,old,new,...}) for pre-injection.
+
+    Empty when not a diff question / no resolvable pair / nothing readable. Used to pre-inject old/new
+    pairs into the generation agent so it reasons over aligned changed blocks, not the raw documents."""
+    if not is_diff_question(question):
+        return []
+    pair = _resolve_pair_for_render(question)
+    if pair is None:
+        return []
+    ranked = rank_changes(pair)
+    if not ranked:
+        return []
+    return [r.to_dict() for r in ranked]
+
+
+def _rendered_diff_aligned(pair: VersionPair) -> str | None:
+    """Render the substantive-ranked changes top-first (SOT-2588 lane), or None to abstain.
+
+    Precision-first: emit only SUBSTANTIVE/UNCERTAIN changes (drop boilerplate/layout). If none survive,
+    abstain (Missing 0 beats Incorrect -1) rather than surface a footer/relocation as the answer."""
+    ranked = rank_changes(pair)
+    if not ranked:
+        return None
+    substantive = [r for r in ranked if r.intent in (SUBSTANTIVE, UNCERTAIN)]
+    if not substantive:
+        return None
+    # Precision guard (Missing 0 beats Incorrect -1): an xlsx version pair with a large substantive set is
+    # whole-sheet realignment churn (idx22/idx95 schedule sheets), not one locatable edit — abstain rather
+    # than dump scattered cell changes. A small xlsx change (idx9-style single cell) still surfaces. pptx/
+    # docx keep the top bounded set (idx1's one deleted table can span several cells but is one edit).
+    if pair.new.ext == "xlsx" and len(substantive) > _MAX_CHANGES:
+        return None
+    return "、".join(r.change.render() for r in substantive[:_MAX_CHANGES])
+
+
 def _rendered_diff(pair: VersionPair) -> str | None:
     """Render a resolved pair's substantive changes, or None to abstain (no / too-many changes)."""
+    if align_enabled():
+        return _rendered_diff_aligned(pair)
     changes = structural_diff(pair)
     if not changes:
         return None
@@ -497,7 +858,7 @@ def answer_question(question: str) -> str | None:
     substantive changes; otherwise None (no pair / ambiguous / unreadable / no real change)."""
     if not is_diff_question(question):
         return None
-    pair = resolve_pair(question)
+    pair = _resolve_pair_for_render(question)
     if pair is None:
         return None
     return _rendered_diff(pair)
@@ -540,7 +901,7 @@ def answer_question_agent(question: str) -> str | None:
     left unchanged."""
     if not is_diff_question(question):
         return None
-    pair = resolve_pair(question)
+    pair = _resolve_pair_for_render(question)
     if pair is None or not _pair_is_adjacent(pair):
         return None
     return _rendered_diff(pair)
