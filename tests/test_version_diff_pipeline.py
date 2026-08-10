@@ -68,12 +68,12 @@ def test_single_substantive_modify_grounds_value_with_recovered_label(monkeypatc
 
     out = vd.pipeline("q")
     assert out is not None
-    # value carries the deterministically recovered role label + the verbatim before→after values.
-    assert out["value"] == "ビジネスアナリスト：藤田 彩 → 井上 里奈"
+    # value is deterministic gold-shaped prose: recovered role label + verbatim before→after (SOT-2619).
+    assert out["value"] == "ビジネスアナリストが藤田 彩から井上 里奈に変更"
     assert out["evidence"]["before"] == "藤田 彩"
     assert out["evidence"]["after"] == "井上 里奈"
     assert out["evidence"]["structural_location"] == "ビジネスアナリスト"
-    assert out["method"]["naturalize"] is True  # asks Stage3 for one short naturalize call
+    assert out["method"]["naturalize"] is False  # deterministic prose ⇒ Stage3 renders verbatim, no LLM
 
 
 def test_keyed_cell_label_is_used_verbatim(monkeypatch):
@@ -82,7 +82,7 @@ def test_keyed_cell_label_is_used_verbatim(monkeypatch):
     _wire(monkeypatch, pair=_pair(), ranked=[_ranked(change)],
           struct=lambda ref: (_ for _ in ()).throw(AssertionError("must not read structs")))
     out = vd.pipeline("q")
-    assert out["value"] == "担当者：A → B"
+    assert out["value"] == "担当者がAからBに変更"
 
 
 # --------------------------------------------------------------------------- fallbacks (idx1/22/95-shaped)
@@ -138,7 +138,7 @@ def test_label_recovery_skips_when_no_shared_preceding_header(monkeypatch):
     _wire(monkeypatch, pair=_pair(), ranked=[_ranked(change)],
           struct=lambda ref: so if ref.stem.endswith("v1") else sn)
     out = vd.pipeline("q")
-    assert out["value"] == "旧 → 新"
+    assert out["value"] == "旧から新に変更"  # no shared header ⇒ label-free prose
     assert out["evidence"]["structural_location"] == ""
 
 
@@ -147,7 +147,7 @@ def test_resolve_wraps_pipeline_when_forced(monkeypatch):
     change = diffpair.Change(label="担当", before="X", after="Y", kind="modify")
     _wire(monkeypatch, pair=_pair(), ranked=[_ranked(change)])
     out = dp.resolve("q", "version_diff", force=True)
-    assert out is not None and out["value"] == "担当：X → Y"
+    assert out is not None and out["value"] == "担当がXからYに変更"
 
 
 def test_resolve_off_returns_none_even_with_registered_pipeline(monkeypatch):
@@ -158,12 +158,19 @@ def test_resolve_off_returns_none_even_with_registered_pipeline(monkeypatch):
     assert dp.resolve("q", "version_diff") is None
 
 
-def test_end_to_end_through_formatting_with_stub_naturalizer(monkeypatch):
+def test_end_to_end_through_formatting_is_deterministic_no_llm(monkeypatch):
+    # SOT-2619: version_diff now hands Stage3 gold-shaped prose with naturalize=False, so the formatting
+    # layer renders it verbatim and NEVER calls the naturalizer (idx74 の preamble/箇条書き 混入を排除).
     change = diffpair.Change(label="ビジネスアナリスト", before="藤田 彩", after="井上 里奈", kind="modify")
     _wire(monkeypatch, pair=_pair(), ranked=[_ranked(change)])
     contract = dp.resolve("q", "version_diff", force=True)
+
+    def _must_not_be_called(value, q):  # a naturalizer that fails loudly if the layer calls the LLM
+        raise AssertionError("version_diff must not invoke the LLM naturalizer any more")
+
     formatted = formatting.format_contract(
         contract, "q", contract_type="version_diff",
-        naturalizer=lambda value, q: f"ビジネスアナリストの担当者が藤田 彩から井上 里奈に変更", force=True)
-    assert formatted["value"] == "ビジネスアナリストの担当者が藤田 彩から井上 里奈に変更"
-    assert "llm_naturalized" in formatted["method"]["formatting"]["rules"]
+        naturalizer=_must_not_be_called, force=True)
+    assert formatted["value"] == "ビジネスアナリストが藤田 彩から井上 里奈に変更"
+    assert formatted["method"]["formatting"]["template_only"] is True
+    assert "llm_naturalized" not in formatted["method"]["formatting"]["rules"]
