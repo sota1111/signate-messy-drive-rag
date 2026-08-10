@@ -226,7 +226,27 @@ ENUM_SCAN = _bool_env("RAG_ENUM_SCAN", False)
 # :func:`det_pipeline.enabled` inside the router (env-driven), so this constant is only the module-level
 # mirror used by tests; the actual gate reads ``RAG_DET_PIPELINE_ROUTER`` at call time.
 DET_PIPELINE_ROUTER = _bool_env("RAG_DET_PIPELINE_ROUTER", False)
+
+# SOT-2614 — consecutive same-tool spin pivot guard (サイクル2: BUDGET_EXHAUSTED 32件回収). Phase-0 diagnosis
+# (``docs/ai/budget32_trace_classification.md``) found 23/32 budget abstains carry a ≥5-long run of the
+# SAME tool with *tweaked* arguments (idx99 file_grep×16, idx76 17/18 turns search, extraction ゼロ; compute
+# guess-and-check idx47/57/95): the existing SOT-2522 SPIN_CUTOFF only fires on the *identical* (tool,args)
+# key, so it caught 2/23. This guard STRENGTHENS (never replaces) that detector: it tracks the *consecutive
+# run* of one tool whose arguments only fuzzily change (same file target for file tools; any repeat for a
+# search tool that carries no target), and on the ``PIVOT_THRESHOLD``-th consecutive call it does NOT
+# dispatch the redundant call — it cools that tool for the question and feeds back a pivot directive
+# (canonical_route / 逆引き索引 / structure store / 手持ち証拠での確定判断; names only, no corpus fact). When
+# few turns remain it escalates to a definitive-decision directive (answer-or-abstain) so the残予算 is spent
+# on a verdict, not more spinning. A cooled tool re-pivots on a shorter run (threshold-1). Each pivot is
+# counted (``spin_pivots``) into the details log / abstain ledger so the diagnosis can measure capture rate.
+# **Default OFF** (byte-identical answer path, sha256-verified): the directive changes a spinning question's
+# trajectory (nudge risk) so it ships dormant; its net gold-100 effect is measured by the サイクル2 integrated
+# run before any flip. It never touches the commit threshold and injects no answer, so it can never leak a
+# fact nor turn an abstain into a wrong answer directly.
+SPIN_PIVOT = _bool_env("RAG_SPIN_PIVOT", False)
 DEFAULT_SPIN_THRESHOLD = 3        # identical (tool, args) calls that mark a path a dead end
+DEFAULT_PIVOT_THRESHOLD = 3       # SOT-2614 — consecutive same-tool (fuzzy-arg) calls that force a pivot
+PIVOT_LOW_TURNS = 3               # SOT-2614 — remaining tool rounds at/below which a pivot escalates to a verdict
 # Deterministic routes offered as the reallocation target when a spin is cut off (names only, no fact).
 _DETERMINISTIC_ROUTES: tuple[str, ...] = (
     "canonical_route", "compute", "version_diff", "corpus_aggregate",
@@ -480,6 +500,7 @@ class Investigation:
     contract: str | None = None  # SOT-2498 — routing contract this question was classified as (or None)
     calc_record: dict[str, Any] | None = None  # SOT-2506 — in-memory record for the execution gate
     pot_lane: dict[str, Any] | None = None  # SOT-2586 — last verify_formula three-layer verdict (None ⇒ lane not exercised)
+    spin_pivots: int = 0  # SOT-2614 — forced consecutive-spin pivots fired this question (0 ⇒ guard OFF/no spin)
 
     @property
     def confidence(self) -> float:
@@ -504,6 +525,10 @@ class Investigation:
             # lane was actually exercised. When it is None (lane OFF, or NUMERIC question that never called
             # verify_formula) the key is omitted, so the champion/OFF ``.details.jsonl`` stays byte-identical.
             **({"pot_lane": self.pot_lane} if self.pot_lane is not None else {}),
+            # SOT-2614 — spin-pivot count is emitted ONLY when the guard fired (>0). With RAG_SPIN_PIVOT OFF
+            # (default) it is always 0, so the key is omitted and the champion/OFF ``.details.jsonl`` stays
+            # byte-identical; a nonzero count lets the diagnosis measure per-question spin capture rate.
+            **({"spin_pivots": self.spin_pivots} if self.spin_pivots else {}),
         }
 
 
@@ -891,6 +916,68 @@ def _spin_redirect_directive(name: str, tried: "set[str]") -> str:
         "既に試行済みのため、別のファイル/引数での再試行に価値がなければ推測せず棄権してください。")
 
 
+# SOT-2614 — search-style tools that carry a query but no single file target: any consecutive repeat of
+# these (even with a tweaked pattern) is the documented budget waste, so the fuzzy key treats them as
+# "same target" regardless of query variation. File-carrying tools instead key on the file, so re-hitting
+# ONE file spins while walking DIFFERENT files (legitimate enumeration/extraction) resets the run.
+_PIVOT_TARGET_ARG_KEYS: tuple[str, ...] = ("file", "path", "filename", "target")
+
+
+def _spin_soft_target(name: str, args: Mapping[str, Any] | None) -> "tuple[str, str | None]":
+    """A *fuzzy* (tool, target) identity for consecutive-spin detection (SOT-2614).
+
+    Unlike :func:`_spin_key` (exact, byte-for-byte args → SOT-2522), this collapses tweaked arguments so a
+    "keep hammering the same target with varied patterns" run is caught. Returns ``(name, target)`` where
+    ``target`` is the file the call operates on (``None`` for a search tool that carries no file). Two
+    consecutive calls are treated as the same spinning path iff they share this key (see
+    :func:`_spin_soft_similar`).
+    """
+    a = args or {}
+    for k in _PIVOT_TARGET_ARG_KEYS:
+        v = a.get(k)
+        if isinstance(v, str) and v.strip():
+            return (name, v.strip())
+    return (name, None)
+
+
+def _spin_soft_similar(prev: "tuple[str, str | None] | None",
+                       cur: "tuple[str, str | None]") -> bool:
+    """Whether two adjacent tool calls belong to the same spinning run (SOT-2614).
+
+    Same tool name is required. For a file-carrying tool the file target must match (walking different
+    files is progress, not spin); for a search tool (target ``None``) any consecutive repeat counts, since
+    re-searching the corpus with tweaked patterns is the documented dead end. Injects/consults no corpus
+    fact — this is pure call-shape bookkeeping.
+    """
+    if prev is None or prev[0] != cur[0]:
+        return False
+    return prev[1] == cur[1]
+
+
+def _spin_pivot_directive(name: str, tried: "set[str]", *, low_turns: bool) -> str:
+    """The forced-pivot directive emitted when a consecutive same-tool run is cut off (SOT-2614).
+
+    Names still-untried deterministic routes so the freed budget goes to a *different* path, and always
+    offers the registry reverse-index / structure store / 手持ち証拠での確定判断 as escape hatches. When few
+    turns remain (``low_turns``) it escalates to a definitive-decision directive so the残予算 lands on a
+    verdict rather than more spinning. Injects no corpus fact (tool/route names only).
+    """
+    untried = [t for t in _DETERMINISTIC_ROUTES if t != name and t not in tried]
+    routes = "、".join(untried) if untried else "canonical_route / 逆引き索引 / structure store"
+    if low_turns:
+        return (
+            f"同一ツール『{name}』の連発を打ち切りました。残ターンが僅少です。これ以上同じ手段を反復せず、"
+            "今すぐ確定判断してください: 手持ちの証拠で回答を確定できるなら submit_answer で回答し、"
+            "根拠が不足していて別経路でも確定の見込みがないなら推測せず棄権してください。"
+            f"（未試行の決定論経路が残っていれば {routes} を1回だけ試してから判断可）")
+    return (
+        f"同一ツール『{name}』を類似引数で連続呼び出ししており、この経路は空回りです（決定論ツールは同種の"
+        "入力に新しい根拠を返しません）。この経路をこの問いで打ち切ります。同じ手段を反復せず、次のいずれかへ"
+        f"切り替えてください: 未試行の決定論ツール（{routes}）に質問文をそのまま渡す／registry の逆引き索引・"
+        "structure store で対象を直接解決する／既に手元にある証拠だけで回答を確定する。"
+        "いずれでも根拠が確定できない場合に限り、推測せず棄権してください。")
+
+
 def _first_move_directive(name: str, out: Any) -> str:
     """The seed user-message describing a deterministic first-move result (SOT-2521).
 
@@ -1218,6 +1305,7 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 fallback: "object | None" = None,
                 budget_boundary: bool = False,
                 spin_detection: "bool | Mapping[str, Any] | None" = False,
+                pivot_detection: "bool | Mapping[str, Any] | None" = False,
                 preamble: "str | None" = None) -> Investigation:
     """Drive ``model`` through tool-calling until it submits a structured answer.
 
@@ -1313,6 +1401,18 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     (tool names only) and never touches the commit threshold, so the answer path is byte-identical when it
     is ``False`` (default); :func:`answer_question` wires it from ``RAG_SPIN_DETECTION``.
 
+    ``pivot_detection`` (SOT-2614) STRENGTHENS ``spin_detection``: it detects a *consecutive run* of the
+    same tool whose arguments only fuzzily change (same file target for file tools; any repeat for a
+    search tool carrying no target) and, on the ``PIVOT_THRESHOLD``-th consecutive call (default
+    :data:`DEFAULT_PIVOT_THRESHOLD`; a ``Mapping`` may override ``threshold`` / ``low_turns``), does NOT
+    dispatch the redundant call — it cools that tool for the question and feeds back a forced-pivot
+    directive (see :func:`_spin_pivot_directive`), escalating to a definitive-decision directive when few
+    turns remain. A cooled tool re-pivots on a shorter run (threshold−1). Each pivot increments the
+    returned :attr:`Investigation.spin_pivots` (and the abstain-ledger ``spin_pivots``). It injects no
+    corpus fact (tool/route names only) and never touches the commit threshold, so the answer path is
+    byte-identical when it is ``False`` (default); :func:`answer_question` wires it from ``RAG_SPIN_PIVOT``.
+    It composes with ``spin_detection`` (the SOT-2522 exact-identity cut runs first, unchanged).
+
     ``preamble`` (SOT-2584) is an optional plain user directive injected *before the model's first turn*
     — the Evidence Packet (:mod:`src.rag.agent.evidence_packet`): the typed route, the registry-resolved
     target documents, the required evidence slots + which are missing, the deterministic primary lane, and
@@ -1332,6 +1432,25 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     spin_counts: dict[str, int] = {}
     spin_redirected = False   # a reallocation directive has already been emitted once
     spin_cutoff = False       # a spin was detected this question (recorded onto the abstain ledger)
+
+    # SOT-2614 — consecutive same-tool spin pivot guard state (fuzzy-arg run detection; STRENGTHENS the
+    # SOT-2522 exact-identity cut above without replacing it).
+    pivot_enabled = pivot_detection not in (None, False)
+    pivot_threshold = DEFAULT_PIVOT_THRESHOLD
+    pivot_low_turns = PIVOT_LOW_TURNS
+    if isinstance(pivot_detection, Mapping):
+        try:
+            pivot_threshold = max(2, int(pivot_detection.get("threshold", DEFAULT_PIVOT_THRESHOLD)))
+        except (TypeError, ValueError):
+            pivot_threshold = DEFAULT_PIVOT_THRESHOLD
+        try:
+            pivot_low_turns = max(0, int(pivot_detection.get("low_turns", PIVOT_LOW_TURNS)))
+        except (TypeError, ValueError):
+            pivot_low_turns = PIVOT_LOW_TURNS
+    pivot_prev: "tuple[str, str | None] | None" = None   # last non-submit call's fuzzy (tool, target) key
+    pivot_run = 0             # length of the current consecutive same-target run
+    pivot_cooldown: set[str] = set()  # tools already pivoted once this question (re-pivot on a shorter run)
+    pivot_count = 0           # spin_pivots recorded (details log / abstain ledger)
 
     record_enabled = ledger not in (None, False)
     if record_enabled:
@@ -1873,6 +1992,38 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                     # already reallocated once and still spinning → cut off early, freeing the残予算.
                     spin_terminal = True
                     break
+            # SOT-2614 — consecutive same-tool spin pivot guard (STRENGTHENS SOT-2522). The exact-identity
+            # cut above only fires when the args are byte-identical; the phase-0 diagnosis showed the real
+            # waste is a long run of the SAME tool with *tweaked* args (varied grep patterns / guess-and-
+            # check compute exprs on one file). Track the consecutive run of one fuzzy (tool, target) key;
+            # on the threshold-th consecutive call (threshold−1 once the tool is cooled) do NOT dispatch the
+            # redundant call — cool the tool for this question and feed back a forced-pivot directive
+            # (escalating to a verdict when few turns remain). No corpus fact is injected and the commit
+            # threshold is untouched, so an OFF (default) path is byte-identical.
+            if pivot_enabled:
+                pkey = _spin_soft_target(call.name, call.args)
+                if _spin_soft_similar(pivot_prev, pkey):
+                    pivot_run += 1
+                else:
+                    pivot_run = 1
+                pivot_prev = pkey
+                effective_threshold = (pivot_threshold - 1
+                                       if call.name in pivot_cooldown else pivot_threshold)
+                if pivot_run >= max(2, effective_threshold):
+                    pivot_count += 1
+                    pivot_cooldown.add(call.name)
+                    pivot_run = 0            # start the next run fresh; the cooldown persists for the question
+                    pivot_prev = None
+                    tried = {c for c in tool_calls if c != SUBMIT_ANSWER}
+                    low = (max_turns - iterations) <= pivot_low_turns
+                    responses.append(ToolResponse(call.name, {
+                        "spin_pivot": True,
+                        "reason": (f"同一ツール『{call.name}』を類似引数で連続{max(2, effective_threshold)}回以上"
+                                   "呼び出しています。この経路は空回りです。"),
+                        "directive": _spin_pivot_directive(call.name, tried, low_turns=low),
+                    }))
+                    dispatched_tool = True   # count the guided pivot round
+                    continue
             out = cached_dispatch(call.name, call.args)
             if call.name == "read_chart_values" and _contract.is_contract(out):
                 method = out.get("method") or {}
@@ -1955,6 +2106,7 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
         usage=usage, model=model_name, elapsed_s=max(0.0, clock() - start),
         stop_reason=stop_reason, error=error, contract=contract,
         pot_lane=pot_lane_verdict,  # SOT-2586 — persist the forced-lane verdict for details/diagnostics
+        spin_pivots=pivot_count,    # SOT-2614 — forced consecutive-spin pivots (0 ⇒ guard OFF/no spin)
     )
 
     # SOT-2492 — abstain ledger: purely post-decision. The answer above is already final; here we only
@@ -1965,6 +2117,9 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
         # SOT-2522 — attribute a spin-detected abstain to SPIN_CUTOFF (distinct from a plain BUDGET cutoff)
         # whether it ended via early cutoff or by exhausting the cap after the one reallocation directive.
         signals.spin_cutoff = spin_cutoff
+        # SOT-2614 — record how many forced consecutive-spin pivots fired so the diagnosis can measure the
+        # capture rate of the strengthened guard (0 when RAG_SPIN_PIVOT is OFF ⇒ ledger byte-identical).
+        signals.spin_pivots = pivot_count
         signals.evidence_text = " ".join(
             t for t in (answer.evidence, answer.method, answer.answer) if t).strip()
         if director is not None:
@@ -2320,4 +2475,4 @@ def answer_question(question: str, *, model: str | None = None,
                        ledger=ledger, calc_ledger=calc_ledger, research=research,
                        enumeration=enumeration, contract=contract, first_move=first_move,
                        fallback=fallback, budget_boundary=BUDGET_BOUNDARY_RESEARCH,
-                       spin_detection=SPIN_DETECTION, preamble=preamble)
+                       spin_detection=SPIN_DETECTION, pivot_detection=SPIN_PIVOT, preamble=preamble)
