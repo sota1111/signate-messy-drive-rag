@@ -82,6 +82,64 @@ def test_flag_reads_env(monkeypatch):
     assert dp.enabled() is False
 
 
+# --------------------------------------------------------------------------- per-Wave sub-gate (SOT-2618)
+def test_wave_enabled_b1_default_on(monkeypatch):
+    # B1 (document_extract / format_check) is the adopted Wave-B half: default ON under the router.
+    monkeypatch.delenv("RAG_DET_PIPELINE_B1", raising=False)
+    assert dp.wave_enabled("format_check") is True
+    monkeypatch.setenv("RAG_DET_PIPELINE_B1", "0")
+    assert dp.wave_enabled("format_check") is False
+
+
+def test_wave_enabled_b2_default_off(monkeypatch):
+    # B2 (fact_lookup / simple_lookup) regressed in SOT-2613, so it is default OFF (recoverable via flag).
+    monkeypatch.delenv("RAG_DET_PIPELINE_B2", raising=False)
+    assert dp.wave_enabled("simple_lookup") is False
+    monkeypatch.setenv("RAG_DET_PIPELINE_B2", "1")
+    assert dp.wave_enabled("simple_lookup") is True
+
+
+def test_wave_enabled_ungated_contracts_always_on(monkeypatch):
+    # Wave A1〜A4 have no sub-gate: they are governed solely by the master router.
+    monkeypatch.delenv("RAG_DET_PIPELINE_B1", raising=False)
+    monkeypatch.delenv("RAG_DET_PIPELINE_B2", raising=False)
+    for contract in ("version_diff", "numeric", "cross_aggregate", "spatial", None):
+        assert dp.wave_enabled(contract) is True
+
+
+def test_resolve_b2_gated_off_falls_back_even_with_router_on(monkeypatch):
+    # Router ON but B2 OFF (default) ⇒ simple_lookup routes to the LLM loop (Wave A level), not the pipeline.
+    monkeypatch.setenv("RAG_DET_PIPELINE_ROUTER", "1")
+    monkeypatch.delenv("RAG_DET_PIPELINE_B2", raising=False)
+    called = {"ran": False}
+
+    def _spy(q, *, profile=None):
+        called["ran"] = True
+        return _contract.make("v", engine="test")
+
+    dp.register("simple_lookup", _spy, replace=True)
+    assert dp.resolve("q", "simple_lookup") is None
+    assert called["ran"] is False  # the gated-off pipeline is never even invoked
+
+
+def test_resolve_b1_gated_on_by_default_with_router_on(monkeypatch):
+    # Router ON + B1 default ON ⇒ format_check resolves through the pipeline.
+    monkeypatch.setenv("RAG_DET_PIPELINE_ROUTER", "1")
+    monkeypatch.delenv("RAG_DET_PIPELINE_B1", raising=False)
+    dp.register("format_check",
+                lambda q, *, profile=None: _contract.make("v", engine="test"), replace=True)
+    assert dp.resolve("q", "format_check") is not None
+
+
+def test_resolve_b2_force_bypasses_wave_gate(monkeypatch):
+    # ``force`` bypasses BOTH the router and the sub-gate so direct grounding tests work regardless of flags.
+    monkeypatch.delenv("RAG_DET_PIPELINE_ROUTER", raising=False)
+    monkeypatch.delenv("RAG_DET_PIPELINE_B2", raising=False)
+    dp.register("simple_lookup",
+                lambda q, *, profile=None: _contract.make("v", engine="test"), replace=True)
+    assert dp.resolve("q", "simple_lookup", force=True) is not None
+
+
 def test_wave_a1_wires_version_diff():
     # Stage0 shipped the registry empty; Wave A1 (SOT-2605) registers the first per-type pipeline. The
     # router lazily bootstraps the pipelines package, so ``version_diff`` is discovered on lookup.

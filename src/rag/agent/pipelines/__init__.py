@@ -27,12 +27,14 @@ from . import enumeration as enumeration  # noqa: F401
 from . import chart_spatial as chart_spatial  # noqa: F401
 
 # Wave B2 — simple_lookup / fact_lookup (SOT-2612). Deterministic schedule-table / report-page reads;
-# everything else it cannot pin structurally falls back to the LLM loop.
+# everything else it cannot pin structurally falls back to the LLM loop. Gated by ``RAG_DET_PIPELINE_B2``
+# **under** the master router — default OFF (SOT-2618: it regressed in SOT-2613's consolidated gold100).
 from . import fact_lookup as fact_lookup  # noqa: F401
 
 # Wave B1 — document_extract / format_check (SOT-2611). Deterministic highlighted-pivot-cell extraction
 # conditions + aggregation (real-cell outline, embedded-EMF outline, EMF 2D cross-tab); anything it cannot
-# ground structurally falls back to the LLM loop.
+# ground structurally falls back to the LLM loop. Gated by ``RAG_DET_PIPELINE_B1`` under the master router —
+# default ON (SOT-2618: the adopted Wave A + B1 composition; B1 was a local PASS in SOT-2613).
 from . import document_extract as document_extract  # noqa: F401
 
 __all__ = ["version_diff", "numeric", "enumeration", "chart_spatial", "fact_lookup", "document_extract"]
