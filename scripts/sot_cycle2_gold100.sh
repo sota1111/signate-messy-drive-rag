@@ -9,6 +9,12 @@
 set -euo pipefail
 cd /workspaces/signate-messy-drive-rag
 
+# --- flag-manifest preflight (SOT-2624): abort if this script exports a RAG_* no source knows ---
+# Catches the cycle-2 H3 accident class (typo / retired-flag export). It does NOT fail on flags left
+# on their default (that would trip on the many intentionally-implicit defaults); add --strict to a
+# fresh script when you want every code-read flag to be explicitly set. Runs before any measurement.
+.venv/bin/python scripts/check_flag_manifest.py "$0" || exit 1
+
 # Official measurement model (08-10): gemini-3.6-flash on global (no pro on global)
 export VERTEX_LOCATION=global
 export GEN_MODEL=gemini-3.6-flash
