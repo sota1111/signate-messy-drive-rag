@@ -51,6 +51,7 @@ from src.rag.tools.extract_tools import (
 from src.rag.tools import call_budget
 from src.rag.tools.file_grep import file_grep
 from src.rag.agent import pot_lane as _pot_lane
+from src.rag.agent import enum_scan as _enum_scan
 from src.rag.tools import font_emphasis as _font_emphasis
 from src.rag.tools import format_events as _format_events
 from src.rag.tools.highlight_extract import highlight_extract
@@ -201,6 +202,18 @@ EVIDENCE_PACKET = _bool_env("RAG_EVIDENCE_PACKET", False)
 # dedicated A/B before any default flip. Reads ``RAG_POT_HARD_LANE`` via :func:`pot_lane.enabled`. The
 # directive is appended only atop an Evidence Packet preamble (so it requires RAG_EVIDENCE_PACKET too).
 POT_HARD_LANE = _bool_env("RAG_POT_HARD_LANE", False)
+
+# SOT-2587 — whether the ENUM route dispatches through the symbolic exhaustive-scan lane
+# (:mod:`src.rag.agent.enum_scan`): resolve the target document universe from the registry, scan every
+# applicable document (no top-k retrieval cutoff), and return a completeness certificate — with the
+# idx16-type guard forbidding a "該当なし" answer when unsupported documents blocked coverage. When on, the
+# ``enum_scan`` tool is additively exposed and an ENUM Evidence Packet appends the full-scan directive.
+# **Default OFF so the production answer path stays byte-identical** (mirroring RAG_POT_HARD_LANE /
+# RAG_EVIDENCE_PACKET): the extra tool + directive change the model's enumeration trajectory, so the
+# mechanism ships dormant and its net gold-100 effect is measured by a dedicated A/B before any default
+# flip. Reads ``RAG_ENUM_SCAN`` via :func:`enum_scan.enabled`. The directive is appended only atop an
+# Evidence Packet preamble (so it requires RAG_EVIDENCE_PACKET too).
+ENUM_SCAN = _bool_env("RAG_ENUM_SCAN", False)
 DEFAULT_SPIN_THRESHOLD = 3        # identical (tool, args) calls that mark a path a dead end
 # Deterministic routes offered as the reallocation target when a spin is cut off (names only, no fact).
 _DETERMINISTIC_ROUTES: tuple[str, ...] = (
@@ -718,6 +731,19 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
             _pot_lane.TOOL_PARAMETERS,
             lambda candidates=None, simple=None, require_units=False: _pot_lane.verify_formula(
                 candidates, simple=simple, require_units=bool(require_units)),
+        ))
+    # SOT-2587: ENUM symbolic full-scan lane. Additively exposed only when RAG_ENUM_SCAN is on, so the
+    # champion serve tool set / prompt stays byte-identical by default. Resolves the target universe from
+    # the registry and scans every applicable document (no retrieval cutoff), returning a completeness
+    # certificate — never a top-k guess.
+    if _enum_scan.enabled():
+        tools.append(AgentTool(
+            _enum_scan.TOOL_NAME,
+            _enum_scan.TOOL_DESCRIPTION,
+            _enum_scan.TOOL_PARAMETERS,
+            lambda question, predicate=None, entry_types=None, project=None:
+                _enum_scan.enum_scan_tool(question, predicate=predicate,
+                                          entry_types=entry_types, project=project),
         ))
     return tools
 
@@ -2118,6 +2144,13 @@ def answer_question(question: str, *, model: str | None = None,
                 # Injects no corpus fact / no answer — protocol only.
                 if POT_HARD_LANE and _pot_lane.enabled() and decision.route == _query_router.NUMERIC:
                     preamble = f"{preamble}\n\n{_pot_lane.numeric_lane_directive()}"
+                # SOT-2587 — ENUM full-scan forced-lane directive (only when RAG_ENUM_SCAN is on and the
+                # route is ENUM). Tells the agent to resolve the universe and scan every applicable
+                # document via ``enum_scan`` and to honour the completeness certificate / no-match guard,
+                # rather than trusting a retrieval top-k. Injects no corpus fact / no answer — protocol
+                # only. Appended atop the packet preamble (so it requires RAG_EVIDENCE_PACKET too).
+                if ENUM_SCAN and _enum_scan.enabled() and decision.route == _query_router.ENUM:
+                    preamble = f"{preamble}\n\n{_enum_scan.enum_lane_directive(question)}"
             except Exception:  # noqa: BLE001 — packet is additive; never break the answer path
                 preamble = None
         # SOT-2521 — the loop-side deterministic first move (see investigate ``first_move``). Reuses the
