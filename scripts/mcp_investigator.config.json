@@ -1,0 +1,12 @@
+{
+  "_comment": "SOT-2626 mcp-config template for `claude -p --mcp-config scripts/mcp_investigator.config.json`. Run claude from the repo root; the launcher resolves .venv + PYTHONPATH itself. Set RAG_MCP_TOOL_LOG to record a per-call jsonl (SOT-2627 details reconstruction).",
+  "mcpServers": {
+    "investigator": {
+      "command": "bash",
+      "args": ["scripts/mcp_investigator_server.sh"],
+      "env": {
+        "RAG_MCP_TOOL_LOG": "artifacts/mcp_tool_calls.jsonl"
+      }
+    }
+  }
+}
