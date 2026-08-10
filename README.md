@@ -270,6 +270,28 @@ gcloud auth application-default login   # Vertex 用 ADC
 bash scripts/fetch_data.sh      # SIGNATE からデータ取得（要 signate CLI 設定）
 ```
 
+### LLM プロバイダ差し替え（開発コスト回避, SOT-2606）
+
+`llm.generate()` の**テキスト役割**（Stage3 整形 / judge / rerank）は `LLM_PROVIDER` 環境変数で
+バックエンドを切り替えられる。**既定は `gemini`＝本番・現状と byte-identical**。
+
+| `LLM_PROVIDER` | バックエンド | 用途 |
+| --- | --- | --- |
+| `gemini`（既定） | Vertex AI Gemini | 本番 |
+| `claude-cli` | Claude Code 定額 Sonnet（`claude -p` subprocess） | **dev 専用**の課金回避（gold100 等ローカル正答検証） |
+| `anthropic` | 生 Anthropic API | 未実装（選択すると明示エラー） |
+
+```bash
+LLM_PROVIDER=claude-cli python -m ...   # dev: テキスト generate を定額 Sonnet で
+# 任意: CLAUDE_CLI_MODEL=sonnet（既定）で claude -p --model を上書き
+```
+
+- **適用範囲ガード**: `claude-cli` を選んでも **investigator の function-calling ループと vision
+  （画像付き generate）は Gemini に固定**される。claude-cli は tool-free の**テキスト generate 専用**
+  （tools / images 非対応）。認証は既存の Claude Code ログインを流用（API キー不要）。
+- **⚠️ usage limit はアカウント全体で自律ワーカーと共有**。gold100 のような重いループを claude-cli で
+  流すとワーカーが律速される。**dev 専用・限定利用**。本番は Gemini のまま。
+
 ## 使い方（予定）
 
 ```bash

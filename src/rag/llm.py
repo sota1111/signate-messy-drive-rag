@@ -6,6 +6,7 @@ are reproducible, per the competition's reproducibility requirement.
 """
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Sequence
@@ -16,6 +17,34 @@ from google.genai import types
 from config import settings
 
 _client: genai.Client | None = None
+
+
+# --------------------------------------------------- LLM provider selection (SOT-2606) -------------
+# ``LLM_PROVIDER`` picks the backend for tool-free *text* generate() calls (Stage3 formatting / judge
+# / rerank).  Default ``gemini`` == current behaviour, byte-identical.  ``claude-cli`` routes text
+# generate() through the Claude Code fixed-plan Sonnet (`claude -p`) for DEV cost avoidance.
+#
+# GUARD (misroute prevention): this ONLY affects tool-free text generate().  The investigator
+# function-calling loop (``src/rag/agent/investigator.py`` — native Vertex ``tools``) never calls
+# generate(); it uses :func:`client` directly, so it is always Gemini.  Any generate() call carrying
+# ``images`` (vision) is ALSO forced to Gemini regardless of ``LLM_PROVIDER`` — claude-cli is
+# text-only (no tools, no images).
+#
+# WARNING: the claude-cli fixed-plan usage limit is shared account-wide with the autonomous workers,
+# so running heavy loops (e.g. gold100) through it will throttle them.  Dev-only, limited use.
+# Config lives here (not config/settings.py, a hook-protected path) and is read at call time so
+# tests / dev sessions can flip it via the environment.
+_TEXT_PROVIDERS = ("gemini", "claude-cli", "anthropic")
+
+
+def _provider() -> str:
+    """The configured text-role LLM provider (env ``LLM_PROVIDER``; default ``gemini``)."""
+    return (os.getenv("LLM_PROVIDER") or getattr(settings, "LLM_PROVIDER", "gemini") or "gemini").strip().lower()
+
+
+def _claude_cli_model() -> str:
+    """Model passed to ``claude -p --model`` (env ``CLAUDE_CLI_MODEL``; default ``sonnet``)."""
+    return (os.getenv("CLAUDE_CLI_MODEL") or getattr(settings, "CLAUDE_CLI_MODEL", "sonnet") or "sonnet").strip()
 
 
 def client() -> genai.Client:
@@ -60,7 +89,50 @@ def generate(
 
     thinking_budget: Gemini 2.5 reasoning tokens. 0 disables thinking (fast, and avoids
     thinking consuming the whole max_output_tokens budget); raise it for hard reasoning.
+
+    Provider routing (SOT-2606): tool-free *text* prompts honour ``LLM_PROVIDER`` (default
+    ``gemini``). Any call carrying ``images`` (vision) stays on Gemini regardless — claude-cli is
+    text-only. See the module docstring for the guard rationale.
     """
+    provider = _provider()
+    # Vision guard: image prompts are ALWAYS Gemini (claude-cli/anthropic text providers can't see).
+    if provider != "gemini" and not images:
+        if provider == "claude-cli":
+            from src.rag.llm_providers import claude_cli
+
+            return claude_cli.generate_text(
+                prompt, system=system, model=model, temperature=temperature,
+                max_output_tokens=max_output_tokens, response_schema=response_schema,
+                retries=retries,
+            )
+        if provider == "anthropic":
+            raise NotImplementedError(
+                "LLM_PROVIDER=anthropic (raw Anthropic API) is not yet implemented; "
+                "use 'gemini' (default) or 'claude-cli'."
+            )
+        raise ValueError(
+            f"unknown LLM_PROVIDER={provider!r}; expected one of {_TEXT_PROVIDERS}"
+        )
+    return _gemini_generate(
+        prompt, system=system, model=model, images=images, temperature=temperature,
+        max_output_tokens=max_output_tokens, thinking_budget=thinking_budget,
+        response_schema=response_schema, retries=retries,
+    )
+
+
+def _gemini_generate(
+    prompt: str,
+    *,
+    system: str | None = None,
+    model: str | None = None,
+    images: Sequence[Image] | None = None,
+    temperature: float = 0.0,
+    max_output_tokens: int = 2048,
+    thinking_budget: int = 0,
+    response_schema: dict | None = None,
+    retries: int = 4,
+) -> str:
+    """The Vertex AI Gemini text/vision generate path (also the forced path for image prompts)."""
     mdl = model or settings.GEN_MODEL
     cfg = types.GenerateContentConfig(
         temperature=temperature,
