@@ -225,6 +225,105 @@ def test_idx93_verbatim_truncation_completion():
     assert out["value"] == gold
 
 
+# --------------------------------------------------------------------------- SOT-2617 derived 書式契約
+# unit/rounding/verbosity contracts for the derived residual (idx6/64/65 class). Question-cue-driven,
+# value-preserving, gated behind RAG_DERIVED_FORMAT_CONTRACTS (default OFF ⇒ byte-identical).
+@pytest.fixture
+def _derived_on(monkeypatch):
+    monkeypatch.setenv("RAG_DERIVED_FORMAT_CONTRACTS", "1")
+
+
+def _fc(value, question, **kw):
+    return fmt.format_contract(_ct(value), question, force=True, **kw)
+
+
+def test_derived_contracts_flag_default_off(monkeypatch):
+    monkeypatch.delenv("RAG_DERIVED_FORMAT_CONTRACTS", raising=False)
+    assert fmt.derived_contracts_enabled() is False
+    monkeypatch.setenv("RAG_DERIVED_FORMAT_CONTRACTS", "1")
+    assert fmt.derived_contracts_enabled() is True
+
+
+def test_idx6_unit_currency_counter_to_yen(_derived_on):
+    # 差額はいくら (currency ask) answered with a generic counter 「0件」 ⇒ 「0円」; the number 0 is unchanged.
+    out = _fc("0件", "税込み見込み金額と最終請求金額の差額はいくらですか。", contract_type=qc.NUMERIC)
+    assert out["value"] == "0円"
+    assert "unit_currency" in out["method"]["formatting"]["rules"]
+
+
+def test_idx6_unit_off_is_byte_identical(monkeypatch):
+    monkeypatch.delenv("RAG_DERIVED_FORMAT_CONTRACTS", raising=False)
+    out = _fc("0件", "差額はいくらですか。", contract_type=qc.NUMERIC)
+    assert out["value"] == "0件"  # flag off ⇒ untouched
+    assert out["method"]["formatting"]["rules"] == []
+
+
+def test_unit_currency_not_applied_to_count_question(_derived_on):
+    # an explicit count ask (いくつ) keeps 件 — currency contract must not fire.
+    out = _fc("7件", "スコープ対象外としている項目はいくつありますか。", contract_type=qc.NUMERIC)
+    assert out["value"] == "7件"
+
+
+def test_unit_currency_leaves_real_unit_intact(_derived_on):
+    # a genuine domain unit (時間) is never rewritten to 円 even under a currency-ish ask.
+    out = _fc("5時間", "作業費用は何時間ぶんですか。", contract_type=qc.NUMERIC)
+    assert out["value"] == "5時間"
+
+
+def test_idx64_verbosity_summary_quantity_extracted(_derived_on):
+    verbose = ("フェーズA（20〜30時間想定）とフェーズB（60〜100時間想定）をあわせた合計想定工数は、"
+               "80〜130時間（最小80時間、最大130時間）です。")
+    out = _fc(verbose, "フェーズAとフェーズBを実施した場合の想定工数は合計で何時間ですか。",
+              contract_type=qc.NUMERIC)
+    assert out["value"] == "80〜130時間"
+    assert "verbosity_summary" in out["method"]["formatting"]["rules"]
+
+
+def test_verbosity_not_trimmed_when_ambiguous(_derived_on):
+    # multiple distinct spans and no 合計/あわせ marker ⇒ no guessing which one is the answer.
+    v = "AとBは10時間、Cは20時間かかります。"
+    out = _fc(v, "各項目は何時間ですか。", contract_type=qc.NUMERIC)
+    assert out["value"] == v
+
+
+def test_idx65_trailing_count_note_stripped(_derived_on):
+    # a condition ask trailing a redundant 「（該当件数: N件）」 tally ⇒ drop the parenthetical (冗長除去).
+    out = _fc("セルの値 < -0.9（該当件数: 14件）", "黄色ハイライトになっているセルの条件を答えてください。",
+              contract_type=qc.NUMERIC)
+    assert out["value"] == "セルの値 < -0.9"
+    assert "verbosity_count_note" in out["method"]["formatting"]["rules"]
+
+
+def test_count_question_summary_extracts_the_count(_derived_on):
+    # for a 「何件」 ask the count IS the answer — the summary rule reduces prose to that count (not the
+    # condition-strip rule, which is gated away from count asks).
+    out = _fc("該当セル（14件）", "条件に一致するセルは何件ありますか。", contract_type=qc.NUMERIC)
+    assert out["value"] == "14件"
+    assert "verbosity_count_note" not in out["method"]["formatting"]["rules"]
+
+
+def test_rounding_contract_honors_decimal_places(_derived_on):
+    out = _fc("12.34567", "平均値を小数第2位まで四捨五入して答えてください。", contract_type=qc.NUMERIC)
+    assert out["value"] == "12.35"
+    assert "rounding" in out["method"]["formatting"]["rules"]
+
+
+def test_rounding_contract_to_integer(_derived_on):
+    out = _fc("3.6", "件数を整数で答えて。", contract_type=qc.NUMERIC)
+    assert out["value"] == "4"
+
+
+def test_rounding_noop_without_directive(_derived_on):
+    out = _fc("12.34567", "平均値はいくつですか。", contract_type=qc.NUMERIC)
+    assert out["value"] == "12.34567"  # no precision directive ⇒ value untouched
+
+
+def test_derived_contracts_do_not_hardcode_gold(_derived_on):
+    # the contract is class-general: a *different* currency answer flows through the same 件→円 rule.
+    out = _fc("1250件", "請求金額はいくらですか。", contract_type=qc.NUMERIC)
+    assert out["value"] == "1250円"
+
+
 # --------------------------------------------------------------------------- investigator wiring
 @pytest.fixture(autouse=True)
 def _restore_registry():
