@@ -2189,17 +2189,27 @@ def answer_question(question: str, *, model: str | None = None,
         det_started = time.monotonic()
         det_result = _det_pipeline.resolve(question, contract, profile=profile_obj)
         if det_result is not None:
-            return Investigation(
-                question=question,
-                answer=_answer_from_det_contract(det_result),
-                iterations=1,
-                tool_calls=[f"det_pipeline:{contract}"],
-                usage=Usage(),
-                model="deterministic",
-                elapsed_s=max(0.0, time.monotonic() - det_started),
-                stop_reason="answered",
-                contract=contract,
-            )
+            # SOT-2604 (Stage3, PLAN SOT-2602) — deterministic-value → gold-format naturalization. The
+            # single short LLM call the inverted design allows lives here and here only: template-first for
+            # 数値/列挙/週/「該当なし」 (no LLM), one short LLM naturalize only for a free-text type whose value
+            # is still a raw structure. It preserves the value facts (SOT-2544 記号↔文章形の同義, SOT-2545 粒度
+            # トリム/truncation 補完 are all evidence-bound, no invention). ``format_contract`` returns None only
+            # when the deterministic value is blank — then we fall through to the LLM loop rather than
+            # committing an empty answer (回答数を減らさない). Same gate (RAG_DET_PIPELINE_ROUTER) as the router.
+            from src.rag.agent import formatting as _formatting
+            formatted = _formatting.format_contract(det_result, question, contract_type=contract)
+            if formatted is not None:
+                return Investigation(
+                    question=question,
+                    answer=_answer_from_det_contract(formatted),
+                    iterations=1,
+                    tool_calls=[f"det_pipeline:{contract}"],
+                    usage=Usage(),
+                    model="deterministic",
+                    elapsed_s=max(0.0, time.monotonic() - det_started),
+                    stop_reason="answered",
+                    contract=contract,
+                )
         # SOT-2584 — Evidence Packet pre-inject (typed route → registry-resolved docs → slots → budget).
         # Built only behind RAG_EVIDENCE_PACKET; reuses the just-computed contract so the question is not
         # re-classified. Fail-open: any build error leaves ``preamble`` None so the answer path is
