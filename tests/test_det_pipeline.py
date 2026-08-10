@@ -67,9 +67,10 @@ def test_flag_reads_env(monkeypatch):
     assert dp.enabled() is False
 
 
-def test_stage0_registry_ships_empty():
-    # Stage0 wires no per-type pipeline — the router is skeleton + registry only.
-    assert dp.registered_contracts() == frozenset()
+def test_wave_a1_wires_version_diff():
+    # Stage0 shipped the registry empty; Wave A1 (SOT-2605) registers the first per-type pipeline. The
+    # router lazily bootstraps the pipelines package, so ``version_diff`` is discovered on lookup.
+    assert "version_diff" in dp.registered_contracts()
 
 
 def test_register_and_lookup():

@@ -43,6 +43,24 @@ Pipeline = Callable[..., "Mapping[str, Any] | None"]
 # Stage0 (see the module docstring); Wave A1〜B2 register their per-type pipelines here.
 _REGISTRY: "dict[str, Pipeline]" = {}
 
+# One-time lazy discovery of the per-type pipelines. The pipelines self-register on import (Wave A1〜B2
+# live in :mod:`src.rag.agent.pipelines`); importing that package here — rather than at investigator
+# import time — keeps this module dependency-light and the import graph acyclic. Only ever triggered on
+# the enabled router path, so the flag-OFF serve path takes on no extra work.
+_BOOTSTRAPPED = False
+
+
+def _bootstrap_pipelines() -> None:
+    """Import the pipelines package once so its per-type pipelines register (fail-open)."""
+    global _BOOTSTRAPPED
+    if _BOOTSTRAPPED:
+        return
+    _BOOTSTRAPPED = True
+    try:
+        import src.rag.agent.pipelines  # noqa: F401 — import side effect: per-type registration
+    except Exception:  # noqa: BLE001 — a broken pipeline package must never break the answer path
+        pass
+
 
 def _env_flag(key: str, default: bool) -> bool:
     raw = os.getenv(key)
@@ -83,6 +101,7 @@ def unregister(contract_type: str) -> None:
 
 def registered_contracts() -> "frozenset[str]":
     """The contract types that currently have a deterministic pipeline registered."""
+    _bootstrap_pipelines()
     return frozenset(_REGISTRY)
 
 
@@ -102,6 +121,7 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
         return None
     if not contract:
         return None
+    _bootstrap_pipelines()
     pipeline = _REGISTRY.get(contract)
     if pipeline is None:
         return None
