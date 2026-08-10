@@ -37,6 +37,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.rag.agent import early_abstain as _early
 from src.rag.agent import query_router as _router
 from src.rag.index import document_registry as _dr
 
@@ -191,6 +192,10 @@ def packet_directive(packet: EvidencePacket) -> str:
         "せず submit_answer で確定してください。\n"
         "予算切れ(BUDGET_EXHAUSTED)は『答えられない』ではなく制御上の失敗です。予算内でスロットを埋め、"
         "根拠が本当に存在しない場合のみ棄権してください。")
+    # SOT-2599 — relax the *原則追加探索なし* budget contract to *安価な決定論探索は許す* (free chunk search
+    # is still not grown). Byte-identical when the recalibration is OFF: the clause is only appended then.
+    if _early.enabled():
+        slot_block = f"{slot_block}\n{_early.packet_relaxation_clause()}"
     packet_json = packet.to_json()
     return (
         "【Evidence Packet（回答ループ前・決定論フェーズ）】\n"
