@@ -104,6 +104,21 @@ def _pivot_facts(ref: FileRef) -> list[str] | None:
     return rows or None
 
 
+# Office formats whose OOXML semantic FORMAT_EVENTs (conditional formats, effective style, comments) are
+# read deterministically (SOT-2585). PDF is excluded for the same reason as highlights (vision fallback).
+_FORMAT_EVENT_EXTS = {"xlsx", "xlsm", "docx"}
+
+
+def _format_events(ref: FileRef) -> list[dict[str, Any]] | None:
+    """Deterministic FORMAT_EVENT records (Excel cfRule/dxf + Word effective-style/comments), else None."""
+    if ref.ext not in _FORMAT_EVENT_EXTS or ref.name.startswith("~$"):
+        return None
+    from src.rag.tools.format_events import _all_events
+
+    events = _all_events(ref, None)
+    return events or None
+
+
 def _file_payload(ref: FileRef) -> dict[str, Any]:
     """Every deterministic structure payload for one file, keyed for staleness by ``content_sha``.
 
@@ -112,7 +127,7 @@ def _file_payload(ref: FileRef) -> dict[str, Any]:
     """
     payload: dict[str, Any] = {"content_sha": content_sha(ref.path)}
     for key, fn in (("highlights", _highlight_items), ("charts", _chart_contract),
-                    ("pivots", _pivot_facts)):
+                    ("pivots", _pivot_facts), ("format_events", _format_events)):
         try:
             value = fn(ref)
         except Exception:
@@ -222,6 +237,7 @@ def write_store(files: dict[str, dict[str, Any]], corpus_payload: dict[str, Any]
         "highlights": sum(1 for f in files.values() if f.get("highlights")),
         "charts": sum(1 for f in files.values() if f.get("charts")),
         "pivots": sum(1 for f in files.values() if f.get("pivots")),
+        "format_events": sum(1 for f in files.values() if f.get("format_events")),
         "seating": 1 if corpus_payload.get("seating") else 0,
         "version_pairs": len(corpus_payload.get("version_diffs") or []),
     }
@@ -281,6 +297,15 @@ def lookup_chart_contract(ref: FileRef, path: Path | None = None) -> dict[str, A
     entry = _fresh_file_entry(ref, path)
     contract = entry.get("charts") if entry else None
     return copy.deepcopy(contract) if contract else None
+
+
+def lookup_format_events(ref: FileRef, path: Path | None = None) -> list[dict[str, Any]] | None:
+    """Cached deterministic FORMAT_EVENT records for ``ref``, or None (disabled / miss / stale)."""
+    if not enabled():
+        return None
+    entry = _fresh_file_entry(ref, path)
+    events = entry.get("format_events") if entry else None
+    return copy.deepcopy(events) if events else None
 
 
 def lookup_pivot_facts(ref: FileRef, path: Path | None = None) -> list[str] | None:
