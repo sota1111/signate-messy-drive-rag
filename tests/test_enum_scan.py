@@ -137,14 +137,49 @@ def test_guard_not_triggered_when_matches_exist_despite_unsupported():
     assert res.may_answer_none is True
 
 
-def test_incomplete_empty_without_unsupported_is_evidence_incomplete():
-    # Applicable universe fully scannable but the scan matched nothing under a strict predicate:
+def test_evidence_based_empty_forbids_none_even_when_complete():
+    # SOT-2600 (idx70): an evidence-based enumeration (person/task/…) whose single-path index scan matched
+    # nothing must NOT be concluded as "該当なし", even over a fully-scannable (complete) universe — index
+    # absence is not proof of non-existence. The guard fires and codes EVIDENCE_INCOMPLETE (not the
+    # parser-miss code, since no document was unreadable).
     rows = [_reg("案件E/a.xlsx", case_id="案件E")]
     res = es.scan("案件Eの担当者をすべて挙げて", predicate="不一致", project="案件E",
                   registry_rows=rows, index_rows=[])
     assert res.matched == ()
-    assert res.guard_triggered is False          # no unsupported docs → not the parser-miss guard
-    # complete universe with no match is a genuine "該当なし" candidate, so no incomplete code.
+    assert res.universe.complete is True         # no unsupported docs
+    assert res.negative_certifiable is False     # …but a person population is not self-certifying
+    assert res.guard_triggered is True
+    assert es.forbids_none_answer(res) is True
+    assert res.may_answer_none is False
+    assert res.state_code == _tax.EVIDENCE_INCOMPLETE
+
+
+def test_idx70_task_id_enumeration_empty_is_not_none_answer():
+    # idx70-shape: a TASK-ID enumeration filtered by a predicate that matches no persisted row. Even though
+    # the universe is fully scannable, the empty result must degrade (may_answer_none=False), never assert
+    # "該当なし" — the real answer (AI-05) lives in evidence the single index path did not surface.
+    rows = [_reg("白峰信用リスク評価/報告_0527.docx", case_id="白峰信用リスク評価", ext="docx")]
+    res = es.scan("白峰信用リスク評価の未完了のアクションIDを挙げて", predicate=r"^AI-\d+$",
+                  project="白峰信用リスク評価", population_kind=_enum.TASK,
+                  registry_rows=rows, index_rows=[])
+    assert res.matched == ()
+    assert res.population_kind == _enum.TASK
+    assert res.may_answer_none is False
+    assert res.state_code == _tax.EVIDENCE_INCOMPLETE
+
+
+def test_document_population_empty_over_complete_universe_may_answer_none():
+    # The one self-certifying case: a *document* enumeration whose members ARE the scanned universe. Over a
+    # complete universe, an empty match genuinely certifies "該当なし" — the guard must NOT fire (otherwise
+    # a legitimate document non-existence answer would be wrongly suppressed).
+    rows = [_reg("案件D/報告1.docx", case_id="案件D", ext="docx")]
+    res = es.scan("案件Dの Excel ファイルをすべて挙げて", predicate=r"\.xlsx$",
+                  project="案件D", population_kind=_enum.DOCUMENT, registry_rows=rows, index_rows=[])
+    assert res.matched == ()
+    assert res.universe.complete is True
+    assert res.negative_certifiable is True
+    assert res.guard_triggered is False
+    assert res.may_answer_none is True
     assert res.state_code == ""
 
 

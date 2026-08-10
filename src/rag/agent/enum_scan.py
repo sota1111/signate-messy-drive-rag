@@ -27,10 +27,17 @@ protocol) to a **router-directly-called primary lane** that:
                      "documents_scanned": S, "unsupported_documents": U},
         "complete": (S == A and U == 0)}
 
-4. **Forbids a "該当なし" (no-match) answer when the scan was not complete** — specifically when
-   ``unsupported_documents > 0`` and ``matched`` is empty (the idx16-style "見えていない=存在しない" error,
-   applied to enumeration): the lane returns a :data:`~src.rag.agent.failure_taxonomy.PARSER_CAPABILITY_MISS`
-   signal instead of an empty "no such element" result. This is :func:`forbids_none_answer`.
+4. **Forbids a "該当なし" (no-match) answer unless the universe is certified fully scanned** (SOT-2600).
+   An empty ``matched`` may be concluded as "該当なし"/complete-enumeration ONLY when the scan self-certifies
+   the negative: a *complete* universe (``unsupported_documents == 0``) of a population whose members ARE
+   the universe itself (``document`` — its members are the scanned filenames). Every other empty result is
+   guarded: ``unsupported_documents > 0`` is the idx16-style parser-capability miss
+   (:data:`~src.rag.agent.failure_taxonomy.PARSER_CAPABILITY_MISS`); an evidence-based enumeration whose
+   single-path index scan matched nothing (the idx70-type "見えていない=存在しない" applied to typed rows) is
+   :data:`~src.rag.agent.failure_taxonomy.EVIDENCE_INCOMPLETE` — a single-path index absence cannot prove
+   non-existence (SOT-2500 ``alt_path_zero_new`` / ``count_match`` were never certified). In both guarded
+   cases the lane degrades to continue-search/abstain instead of a wrong "no such element". This is
+   :func:`forbids_none_answer`.
 
 Design invariants (mirroring the sibling opt-ins — document_registry #1, evidence_packet / pot_lane):
   * **Opt-in, byte-identical OFF.** :func:`enabled` (``RAG_ENUM_SCAN``) gates the whole lane; the
@@ -186,6 +193,16 @@ def resolve_universe(question: str, *, project: str | None = None,
 
 
 # --------------------------------------------------------------------------- element scan
+# Population kinds whose enumeration members ARE the deterministically-resolved universe itself, so a full
+# scan of a *complete* universe certifies a negative ("該当なし"): only DOCUMENT, whose members are the
+# universe's own scanned filenames (:func:`_document_members`). For every other kind the members come from
+# the persisted typed evidence rows (:func:`_evidence_members`), where an empty result means only "no such
+# typed row was extracted" — a single-path index scan cannot prove non-existence (SOT-2500 closure:
+# alt_path_zero_new / count_match), so a "該当なし" conclusion is forbidden and the lane degrades to
+# continue-search or abstain (safer than a wrong assertion). SOT-2600 (較正4 / idx70).
+_NEGATIVE_SELF_CERTIFYING: frozenset[str] = frozenset({_enum.DOCUMENT})
+
+
 # Which typed evidence-index rows carry the members of each enumeration population (SOT-2500 kinds).
 # ``document`` is handled separately (its members are the universe's own filenames, not evidence rows).
 _KIND_ENTRY_TYPES: dict[str, tuple[str, ...]] = {
@@ -255,9 +272,27 @@ class EnumScanResult:
         return self.universe.complete
 
     @property
+    def negative_certifiable(self) -> bool:
+        """Whether an *empty* scan may be concluded as "該当なし" (SOT-2600).
+
+        Only a full scan of a *complete* universe whose population members ARE the universe itself
+        (:data:`~src.rag.agent.enumeration.DOCUMENT`, whose members are the scanned filenames) certifies a
+        negative. For an evidence-based population (person/alias/number/…) the members come from the
+        persisted typed evidence rows, where an empty result means "no such typed row was extracted", NOT
+        "no such element exists" — a single-path index scan cannot prove closure (SOT-2500
+        ``alt_path_zero_new`` / ``count_match``), so a "該当なし" conclusion is never certified from it.
+        """
+        return self.universe.complete and self.population_kind in _NEGATIVE_SELF_CERTIFYING
+
+    @property
     def guard_triggered(self) -> bool:
-        """The no-match guard: unsupported documents blocked coverage AND nothing matched (idx16-type)."""
-        return self.universe.unsupported_documents > 0 and not self.matched
+        """The no-match guard: nothing matched AND the scan cannot certify a negative ("該当なし").
+
+        Fires (a) for the idx16-type parser-capability miss (unsupported documents blocked coverage) and
+        (b) for the idx70-type evidence-based enumeration whose single-path index scan matched nothing —
+        index absence is not proof of non-existence. It never fires while ``matched`` is non-empty (a
+        positive enumeration is unaffected: wrong→abstain is allowed, match→abstain is not)."""
+        return not self.matched and not self.negative_certifiable
 
     def certificate(self) -> dict[str, Any]:
         """The research-shape completeness certificate: ``{matched, universe, complete}``."""
@@ -319,14 +354,16 @@ def scan(question: str, *, predicate: str | None = None, project: str | None = N
 
     matched = tuple(_enum.apply_ordering(raw_members, ordering))
 
-    # Certificate state: an unsupported-document-blocked empty result must NOT become "該当なし"
-    # (idx16-type "見えていない=存在しない"): flag it PARSER_CAPABILITY_MISS. An otherwise-incomplete
-    # universe with no match is EVIDENCE_INCOMPLETE (still not a trustworthy "no such element").
+    # Certificate state for an empty result. A "該当なし" is trustworthy ONLY from a complete-universe full
+    # scan of a self-certifying population (DOCUMENT — members are the universe's own filenames); otherwise
+    # the empty result must NOT become "該当なし" and the lane degrades to continue-search/abstain:
+    #   * unsupported documents blocked coverage → PARSER_CAPABILITY_MISS (idx16-type "見えていない=存在しない").
+    #   * evidence-based / otherwise-incomplete scan with no match → EVIDENCE_INCOMPLETE (idx70-type:
+    #     single-path index absence is not proof of non-existence — SOT-2500 closure was never certified).
     state_code = ""
-    if universe.unsupported_documents > 0 and not matched:
-        state_code = _tax.PARSER_CAPABILITY_MISS
-    elif not universe.complete and not matched:
-        state_code = _tax.EVIDENCE_INCOMPLETE
+    if not matched and not (universe.complete and kind in _NEGATIVE_SELF_CERTIFYING):
+        state_code = (_tax.PARSER_CAPABILITY_MISS if universe.unsupported_documents > 0
+                      else _tax.EVIDENCE_INCOMPLETE)
 
     return EnumScanResult(
         matched=matched, universe=universe, population_kind=kind, ordering_rule=ordering,
@@ -334,12 +371,14 @@ def scan(question: str, *, predicate: str | None = None, project: str | None = N
 
 
 def forbids_none_answer(result: EnumScanResult) -> bool:
-    """True when the certificate forbids a "該当なし" (no-match) conclusion.
+    """True when the certificate forbids a "該当なし" (no-match) conclusion (SOT-2600).
 
-    The idx16-type guard, applied to enumeration: when the applicable universe contained documents the
-    scan could not read (``unsupported_documents > 0``) and the scan matched nothing, the empty result is
-    an *artifact of incomplete coverage*, not evidence of non-existence — so the lane must not let the
-    agent answer "該当なし".
+    A "該当なし" is only certified by a *complete* full scan of a self-certifying population (``document`` —
+    its members are the universe's own filenames). Every other empty result is an artifact of incomplete
+    coverage, not evidence of non-existence, so the lane must not let the agent answer "該当なし":
+    documents the scan could not read (``unsupported_documents > 0``, idx16-type) OR an evidence-based
+    enumeration whose single-path index scan simply matched nothing (idx70-type) — index absence does not
+    prove non-existence (SOT-2500 ``alt_path_zero_new`` / ``count_match`` uncertified).
     """
     return result.guard_triggered
 
@@ -352,8 +391,11 @@ TOOL_DESCRIPTION = (
     "ため、列挙は database query として扱う。質問文から対象 universe(母集団の全文書)を registry で決定論解決し、"
     "走査可能な全文書を評価して predicate に一致する要素を漏れなく返す。返り値には completeness certificate "
     "{matched, universe:{documents_total, documents_applicable, documents_scanned, unsupported_documents}, "
-    "complete} が付く。complete=false かつ unsupported_documents>0 で 0件のときは『該当なし』と答えてはならない"
-    "(見えていない=存在しない の誤りを防ぐ。抽出不能な文書があるだけで不存在ではない)。\n"
+    "complete} が付く。0件のとき『該当なし』と答えてよいのは、母集団の要素が文書そのもの(文書列挙)で universe が"
+    "complete(documents_scanned==documents_applicable かつ unsupported_documents==0)のときだけ。"
+    "それ以外(unsupported_documents>0、または人物/略称/番号など証拠行ベースの列挙)で 0件のときは『該当なし』と"
+    "断定してはならない(証拠索引に無い=存在しない ではない。単一経路の不在は不存在の証明にならない)。返り値の "
+    "may_answer_none=false のときは断定せず、探索継続または棄権にデグレードする。\n"
     "引数: question=質問文(必須)、predicate=各要素値に対する任意の正規表現フィルタ、"
     "entry_types=走査する証拠種別の上書き(person/alias/number/column/heading/highlight/bold)、project=案件スコープ。")
 
@@ -405,9 +447,11 @@ def enum_lane_directive(question: str) -> str:
         "registry で決定論解決し、走査可能な全文書を全数走査した matched を得る。\n"
         "2) 返り値の completeness certificate を必ず確認する: complete=true(documents_scanned == "
         "documents_applicable かつ unsupported_documents==0)のときだけ matched を最終列挙として採用してよい。\n"
-        "3) **禁止**: complete=false かつ unsupported_documents>0 かつ matched が空のとき『該当なし』と答えない"
-        "(抽出不能な文書があるだけで不存在ではない)。その場合は unsupported を解消する経路(復号/別抽出)を試すか、"
-        "根拠不足として棄権する。\n"
+        "3) **禁止(該当なし断定)**: matched が空のとき『該当なし』と答えてよいのは、母集団が文書列挙で "
+        "complete=true のとき(may_answer_none=true)だけ。unsupported_documents>0、または人物/略称/番号/タスクID"
+        "など証拠行ベースの列挙で空(may_answer_none=false)のときは『該当なし』と断定しない(証拠索引に無い=不存在 "
+        "ではない。単一経路の不在は不存在の証明にならない)。その場合は別経路(復号/別抽出/別索引/近傍走査)で探索を"
+        "継続するか、根拠不足として棄権する(誤断定より安全)。\n"
         f"4) 列挙は重複0・順序規則【{order}】で submit_answer する。ENUM の自由探索予算は0(全数走査で確定する)。")
 
 
