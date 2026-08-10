@@ -178,6 +178,17 @@ CONFLICT_RESOLUTION = _bool_env("RAG_CONFLICT_RESOLUTION", False)
 # byte-identical** (mirroring RAG_GRANULARITY_NORMALIZATION / RAG_CONFLICT_RESOLUTION).
 NUMERIC_FEATURE_CORR = _bool_env("RAG_NUMERIC_FEATURE_CORR", False)
 RELEVANCE_STRICT = _bool_env("RAG_RELEVANCE_STRICT", False)
+
+# SOT-2584 — whether :func:`answer_question` builds an Evidence Packet (typed route → registry-resolved
+# documents → required evidence slots → per-route budget contract) and pre-injects it into the generation
+# agent before its first turn (see :func:`investigate`'s ``preamble``). This reverses "検索→考える→また
+# 検索" into "型判定→文書確定→不足スロットだけ探索", targeting the dominant BUDGET_EXHAUSTED loss. **Default
+# OFF so the production answer path stays byte-identical** (mirroring RAG_FIRST_MOVE_ROUTING /
+# RAG_DOCUMENT_REGISTRY): the packet changes the model's first-turn trajectory (nudge risk), so it ships
+# dormant and its net gold-100 effect is measured by a dedicated A/B before any default flip. It injects
+# no corpus fact and no answer (document identity + slot names + budget only). Reads
+# ``RAG_EVIDENCE_PACKET`` via :func:`src.rag.agent.evidence_packet.enabled`.
+EVIDENCE_PACKET = _bool_env("RAG_EVIDENCE_PACKET", False)
 DEFAULT_SPIN_THRESHOLD = 3        # identical (tool, args) calls that mark a path a dead end
 # Deterministic routes offered as the reallocation target when a spin is cut off (names only, no fact).
 _DETERMINISTIC_ROUTES: tuple[str, ...] = (
@@ -1084,7 +1095,8 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 first_move: "tuple[str, Mapping[str, Any]] | None" = None,
                 fallback: "object | None" = None,
                 budget_boundary: bool = False,
-                spin_detection: "bool | Mapping[str, Any] | None" = False) -> Investigation:
+                spin_detection: "bool | Mapping[str, Any] | None" = False,
+                preamble: "str | None" = None) -> Investigation:
     """Drive ``model`` through tool-calling until it submits a structured answer.
 
     The loop ends on the first of: the model calls ``submit_answer`` (→ ``answered``); ``max_turns`` is
@@ -1178,6 +1190,15 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     abstain is attributed to :data:`~src.rag.agent.abstain_ledger.SPIN_CUTOFF`. It injects no corpus fact
     (tool names only) and never touches the commit threshold, so the answer path is byte-identical when it
     is ``False`` (default); :func:`answer_question` wires it from ``RAG_SPIN_DETECTION``.
+
+    ``preamble`` (SOT-2584) is an optional plain user directive injected *before the model's first turn*
+    — the Evidence Packet (:mod:`src.rag.agent.evidence_packet`): the typed route, the registry-resolved
+    target documents, the required evidence slots + which are missing, the deterministic primary lane, and
+    the per-route free-exploration budget. It reverses "検索→考える→また検索" into "型判定→文書確定→
+    不足スロットだけ探索". It injects no corpus fact and no answer (document identity + slot names + budget
+    only) and never touches the commit threshold, so the answer path is byte-identical when it is ``None``
+    (default); :func:`answer_question` wires it from ``RAG_EVIDENCE_PACKET``. It composes with
+    ``first_move`` (both seed the pre-first-turn directive; the packet is prepended).
     """
     spin_enabled = spin_detection not in (None, False)
     spin_threshold = DEFAULT_SPIN_THRESHOLD
@@ -1277,6 +1298,15 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     # turn and seed its evidence, so the model starts from the canonical needle instead of wandering
     # through chunk search until BUDGET_EXHAUSTED. Only seeds on a useful (non-empty) result; the
     # observe-only ledgers see it exactly as a normal tool round would, and no answer is injected.
+    # SOT-2584 — Evidence Packet pre-inject. When a ``preamble`` is supplied it is injected as a plain
+    # user directive before the model's first turn (the typed route + registry-resolved documents +
+    # required/missing evidence slots + primary lane + free-exploration budget). ``None`` (default) is a
+    # pure no-op so the answer path is byte-identical. It composes with ``first_move`` (below): the packet
+    # is prepended to the first-move directive so both seeds reach the model on turn 1.
+    preamble_text = preamble.strip() if isinstance(preamble, str) and preamble.strip() else None
+    if preamble_text:
+        responses = [ToolResponse(DIRECTIVE_MESSAGE, preamble_text)]
+
     if first_move is not None:
         fm_name, fm_args = first_move
         if fm_name in by_name:
@@ -1293,7 +1323,9 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 if director is not None:
                     director.observe(fm_name, fm_out)
                 iterations += 1
-                responses = [ToolResponse(DIRECTIVE_MESSAGE, _first_move_directive(fm_name, fm_out))]
+                fm_directive = _first_move_directive(fm_name, fm_out)
+                combined = f"{preamble_text}\n\n{fm_directive}" if preamble_text else fm_directive
+                responses = [ToolResponse(DIRECTIVE_MESSAGE, combined)]
 
     # SOT-2524 — the model-turn cap is a mutable `turn_limit` (not a fixed range) so the budget-exhaustion
     # boundary hook can grant a bounded number of extra turns exactly once, when the cap is reached without
@@ -1971,12 +2003,31 @@ def answer_question(question: str, *, model: str | None = None,
     contract: str | None = None
     first_move: "tuple[str, Mapping[str, Any]] | None" = None
     fallback: "object | None" = None
+    preamble: "str | None" = None
     if routing not in (None, False):
         from src.rag.agent import question_contract as _question_contract
         from src.rag.agent import routing as _routing  # lazy: keeps import free of the classifier deps
         qc = _routing.classify_for_routing(question, flash=contract_flash)
         system = _routing.routed_system_prompt(SYSTEM_PROMPT, qc, question)
         contract = qc.contract
+        # SOT-2584 — Evidence Packet pre-inject (typed route → registry-resolved docs → slots → budget).
+        # Built only behind RAG_EVIDENCE_PACKET; reuses the just-computed contract so the question is not
+        # re-classified. Fail-open: any build error leaves ``preamble`` None so the answer path is
+        # byte-identical (回帰ゼロ). Injects no corpus fact / no answer.
+        if EVIDENCE_PACKET:
+            try:
+                from src.rag.agent import evidence_packet as _evidence_packet
+                from src.rag.agent import query_router as _query_router
+                # Import the submodule by full path — ``src.rag.tools.canonical_route`` the *name* in the
+                # tools package is re-exported as the function (shadowing), so a bare package import would
+                # not expose ``resolve_project`` (known tools-shadow gotcha).
+                from src.rag.tools.canonical_route import resolve_project as _resolve_project
+                packet_project = _resolve_project(question, None)
+                decision = _query_router.classify_route(question, contract=qc)
+                _packet, preamble = _evidence_packet.build_directive(
+                    question, project=packet_project, decision=decision)
+            except Exception:  # noqa: BLE001 — packet is additive; never break the answer path
+                preamble = None
         # SOT-2521 — the loop-side deterministic first move (see investigate ``first_move``). Reuses the
         # same first-tool decision as the prompt hint so they can never disagree. Gated OFF by default
         # (``FIRST_MOVE_ROUTING``): the always-on variant regressed gold-100, so the wiring stays dormant
@@ -2056,4 +2107,4 @@ def answer_question(question: str, *, model: str | None = None,
                        ledger=ledger, calc_ledger=calc_ledger, research=research,
                        enumeration=enumeration, contract=contract, first_move=first_move,
                        fallback=fallback, budget_boundary=BUDGET_BOUNDARY_RESEARCH,
-                       spin_detection=SPIN_DETECTION)
+                       spin_detection=SPIN_DETECTION, preamble=preamble)
