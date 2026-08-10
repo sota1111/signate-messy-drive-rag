@@ -50,6 +50,7 @@ from src.rag.tools.extract_tools import (
 )
 from src.rag.tools import call_budget
 from src.rag.tools.file_grep import file_grep
+from src.rag.agent import pot_lane as _pot_lane
 from src.rag.tools import font_emphasis as _font_emphasis
 from src.rag.tools import format_events as _format_events
 from src.rag.tools.highlight_extract import highlight_extract
@@ -190,6 +191,16 @@ RELEVANCE_STRICT = _bool_env("RAG_RELEVANCE_STRICT", False)
 # no corpus fact and no answer (document identity + slot names + budget only). Reads
 # ``RAG_EVIDENCE_PACKET`` via :func:`src.rag.agent.evidence_packet.enabled`.
 EVIDENCE_PACKET = _bool_env("RAG_EVIDENCE_PACKET", False)
+
+# SOT-2586 — whether the NUMERIC route dispatches through the PoT forced compute lane (Evidence Binder →
+# 制限AST → Decimal 実行 → 独立検算 → N-sample majority; :mod:`src.rag.agent.pot_lane`). When on, the
+# ``verify_formula`` tool is additively exposed and a NUMERIC Evidence Packet appends the forced-lane
+# directive. **Default OFF so the production answer path stays byte-identical** (mirroring
+# RAG_EVIDENCE_PACKET / RAG_FONT_EMPHASIS / RAG_FORMAT_EVENTS): the extra tool + directive change the
+# model's numeric trajectory, so the mechanism ships dormant and its net gold-100 effect is measured by a
+# dedicated A/B before any default flip. Reads ``RAG_POT_HARD_LANE`` via :func:`pot_lane.enabled`. The
+# directive is appended only atop an Evidence Packet preamble (so it requires RAG_EVIDENCE_PACKET too).
+POT_HARD_LANE = _bool_env("RAG_POT_HARD_LANE", False)
 DEFAULT_SPIN_THRESHOLD = 3        # identical (tool, args) calls that mark a path a dead end
 # Deterministic routes offered as the reallocation target when a spin is cut off (names only, no fact).
 _DETERMINISTIC_ROUTES: tuple[str, ...] = (
@@ -690,6 +701,18 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
                 _format_events.format_events(
                     file, fill=fill, font_color=font_color, source=source, kind=kind,
                     profile=profile),
+        ))
+    # SOT-2586: NUMERIC PoT forced compute lane. Additively exposed only when RAG_POT_HARD_LANE is on, so
+    # the champion serve tool set / prompt stays byte-identical by default. Runs the LLM-emitted candidate
+    # specs through binder→制限AST→Decimal→独立検算→N-sample majority and returns a three-layer verdict —
+    # never eval/parse_expr on a model string (no arbitrary-code path).
+    if _pot_lane.enabled():
+        tools.append(AgentTool(
+            _pot_lane.TOOL_NAME,
+            _pot_lane.TOOL_DESCRIPTION,
+            _pot_lane.TOOL_PARAMETERS,
+            lambda candidates=None, simple=None, require_units=False: _pot_lane.verify_formula(
+                candidates, simple=simple, require_units=bool(require_units)),
         ))
     return tools
 
@@ -2047,6 +2070,12 @@ def answer_question(question: str, *, model: str | None = None,
                 decision = _query_router.classify_route(question, contract=qc)
                 _packet, preamble = _evidence_packet.build_directive(
                     question, project=packet_project, decision=decision)
+                # SOT-2586 — NUMERIC PoT forced-lane directive (only when RAG_POT_HARD_LANE is on and the
+                # route is NUMERIC). Appended to the packet preamble so the agent is told to route its
+                # arithmetic through ``verify_formula`` (binder→制限AST→Decimal→独立検算) rather than 暗算.
+                # Injects no corpus fact / no answer — protocol only.
+                if POT_HARD_LANE and _pot_lane.enabled() and decision.route == _query_router.NUMERIC:
+                    preamble = f"{preamble}\n\n{_pot_lane.numeric_lane_directive()}"
             except Exception:  # noqa: BLE001 — packet is additive; never break the answer path
                 preamble = None
         # SOT-2521 — the loop-side deterministic first move (see investigate ``first_move``). Reuses the
