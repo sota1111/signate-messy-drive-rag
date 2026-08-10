@@ -214,6 +214,18 @@ POT_HARD_LANE = _bool_env("RAG_POT_HARD_LANE", False)
 # flip. Reads ``RAG_ENUM_SCAN`` via :func:`enum_scan.enabled`. The directive is appended only atop an
 # Evidence Packet preamble (so it requires RAG_EVIDENCE_PACKET too).
 ENUM_SCAN = _bool_env("RAG_ENUM_SCAN", False)
+
+# SOT-2603 (Stage0, PLAN SOT-2602) — whether :func:`answer_question` promotes the contract classifier
+# from an in-loop *hint* to a deterministic **router (入口ゲート)**. When on, a question whose contract
+# type has a deterministic pipeline registered in :mod:`src.rag.agent.det_pipeline` is answered by that
+# pipeline WITHOUT the LLM loop; a question with no registered pipeline — or one whose pipeline cannot
+# ground a ``{value, evidence, method}`` result — falls through to the unchanged loop (回答数を減らさない).
+# **Default OFF so the production answer path stays byte-identical** (mirroring RAG_EVIDENCE_PACKET /
+# RAG_FIRST_MOVE_ROUTING). On top of that, Stage0 ships the registry EMPTY, so even with the flag ON every
+# question routes to the LLM loop — the per-type pipelines land in Wave A1〜B2. The flag is read fresh via
+# :func:`det_pipeline.enabled` inside the router (env-driven), so this constant is only the module-level
+# mirror used by tests; the actual gate reads ``RAG_DET_PIPELINE_ROUTER`` at call time.
+DET_PIPELINE_ROUTER = _bool_env("RAG_DET_PIPELINE_ROUTER", False)
 DEFAULT_SPIN_THRESHOLD = 3        # identical (tool, args) calls that mark a path a dead end
 # Deterministic routes offered as the reallocation target when a spin is cut off (names only, no fact).
 _DETERMINISTIC_ROUTES: tuple[str, ...] = (
@@ -336,6 +348,30 @@ def _answer_from_args(args: Mapping[str, Any] | None) -> Answer:
     return Answer(answer=text, confidence=conf,
                   evidence=str(a.get("evidence", "") or ""),
                   method=str(a.get("method", "") or ""))
+
+
+def _answer_from_det_contract(result: Mapping[str, Any]) -> Answer:
+    """Build an :class:`Answer` from a deterministic pipeline's ``{value, evidence, method}`` contract.
+
+    SOT-2603 (Stage0). The pipeline value is rendered to the answer text (a plain string verbatim, any
+    other JSON value serialized deterministically); ``evidence``/``method`` are serialized compactly into
+    the Answer's string fields. Confidence is taken from ``method.confidence`` when the pipeline supplied
+    one (deterministic answers default to full confidence), and forced to 0.0 for an abstain-shaped value.
+    """
+    value = result.get("value")
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
+    text = str(text).strip()
+    evidence = result.get("evidence") or {}
+    method = result.get("method") or {}
+    conf = _coerce_confidence(method.get("confidence", 1.0) if isinstance(method, Mapping) else 1.0)
+    if is_abstain(text):
+        conf = 0.0
+    return Answer(
+        answer=text,
+        confidence=conf,
+        evidence=json.dumps(evidence, ensure_ascii=False, sort_keys=True),
+        method=json.dumps(method, ensure_ascii=False, sort_keys=True),
+    )
 
 
 def is_abstain(answer: str) -> bool:
@@ -2140,6 +2176,30 @@ def answer_question(question: str, *, model: str | None = None,
         qc = _routing.classify_for_routing(question, flash=contract_flash)
         system = _routing.routed_system_prompt(SYSTEM_PROMPT, qc, question)
         contract = qc.contract
+        # SOT-2603 (Stage0, PLAN SOT-2602) — deterministic router (入口ゲート). Promote the just-computed
+        # contract from an in-loop hint to an entry gate: when RAG_DET_PIPELINE_ROUTER is on AND a
+        # deterministic pipeline is registered for this contract type AND that pipeline grounds a
+        # ``{value, evidence, method}`` result, answer it here WITHOUT ever entering the LLM loop. Every
+        # other case — flag OFF (default), no pipeline registered (Stage0 ships the registry EMPTY ⇒ 全問
+        # LLM ループ = champion byte-identical), or a pipeline that cannot ground a value — leaves
+        # ``det_result`` None and falls through to the unchanged loop below (回答数を減らさない). No corpus
+        # fact / no answer is hardcoded here; the registered pipelines self-derive from the question. The
+        # import is lazy (mirrors the routing import) so the module graph is untouched when routing is off.
+        from src.rag.agent import det_pipeline as _det_pipeline
+        det_started = time.monotonic()
+        det_result = _det_pipeline.resolve(question, contract, profile=profile_obj)
+        if det_result is not None:
+            return Investigation(
+                question=question,
+                answer=_answer_from_det_contract(det_result),
+                iterations=1,
+                tool_calls=[f"det_pipeline:{contract}"],
+                usage=Usage(),
+                model="deterministic",
+                elapsed_s=max(0.0, time.monotonic() - det_started),
+                stop_reason="answered",
+                contract=contract,
+            )
         # SOT-2584 — Evidence Packet pre-inject (typed route → registry-resolved docs → slots → budget).
         # Built only behind RAG_EVIDENCE_PACKET; reuses the just-computed contract so the question is not
         # re-classified. Fail-open: any build error leaves ``preamble`` None so the answer path is
