@@ -247,6 +247,27 @@ SPIN_PIVOT = _bool_env("RAG_SPIN_PIVOT", False)
 DEFAULT_SPIN_THRESHOLD = 3        # identical (tool, args) calls that mark a path a dead end
 DEFAULT_PIVOT_THRESHOLD = 3       # SOT-2614 — consecutive same-tool (fuzzy-arg) calls that force a pivot
 PIVOT_LOW_TURNS = 3               # SOT-2614 — remaining tool rounds at/below which a pivot escalates to a verdict
+
+# SOT-2620 — per-route search-call cap (サイクル2: BUDGET_EXHAUSTED 32件回収). Phase-0 diagnosis
+# (`docs/ai/budget32_trace_classification.md`): of the 486 tool calls across the 32 BUDGET_EXHAUSTED
+# abstains, **70% (340) were search** (file_grep 285), ~10.6/問; retrieval itself succeeds 69% of the
+# time, so the waste is the *iteration count* of "hit返るが針が無い→パターン変えて再grep", not search
+# failure. The existing 型別予算契約 (`ROUTE_BUDGET`) already models this but is gated behind the
+# opt-in `RAG_EVIDENCE_PACKET` and so never bounds the champion fallback LLM loop. This flag wires a
+# **search上限** into the default path independently: it caps the *total* file_grep/find_files calls per
+# question by route type, and on the over-cap call feeds back a switch-lane directive (canonical_route /
+# 逆引き索引 / structure store / 手持ち証拠での確定判断) instead of dispatching another search. It
+# STRENGTHENS the SOT-2614 pivot guard (which only cuts a *consecutive* same-tool run) by also catching
+# search reflexes spread *non-consecutively* across interleaved reads. Total turns are NOT changed
+# (adaptive 18/240s のまま) — only the repeated-search axis. **Default OFF** (byte-identical answer path,
+# sha256-verified): a cap changes a search-heavy question's trajectory, which — like SOT-2614 — must be
+# net-measured (match非劣化・wrong非増加) before any default flip. Wired into :func:`answer_question`.
+SEARCH_CAP = _bool_env("RAG_SEARCH_CAP", False)
+# The search-style tools the cap counts: a query-carrying scan with no single value lane (the documented
+# re-grep waste). read_office/compute/registry/canonical_route stay uncapped so the model can always
+# still act on evidence in hand after the cap is hit.
+_SEARCH_TOOLS: frozenset[str] = frozenset({"file_grep", "find_files"})
+
 # Deterministic routes offered as the reallocation target when a spin is cut off (names only, no fact).
 _DETERMINISTIC_ROUTES: tuple[str, ...] = (
     "canonical_route", "compute", "version_diff", "corpus_aggregate",
@@ -501,6 +522,7 @@ class Investigation:
     calc_record: dict[str, Any] | None = None  # SOT-2506 — in-memory record for the execution gate
     pot_lane: dict[str, Any] | None = None  # SOT-2586 — last verify_formula three-layer verdict (None ⇒ lane not exercised)
     spin_pivots: int = 0  # SOT-2614 — forced consecutive-spin pivots fired this question (0 ⇒ guard OFF/no spin)
+    search_cap_hits: int = 0  # SOT-2620 — over-cap search calls intercepted this question (0 ⇒ cap OFF/not hit)
 
     @property
     def confidence(self) -> float:
@@ -529,6 +551,11 @@ class Investigation:
             # (default) it is always 0, so the key is omitted and the champion/OFF ``.details.jsonl`` stays
             # byte-identical; a nonzero count lets the diagnosis measure per-question spin capture rate.
             **({"spin_pivots": self.spin_pivots} if self.spin_pivots else {}),
+            # SOT-2620 — search-cap hits are emitted ONLY when the cap actually intercepted a call (>0).
+            # With RAG_SEARCH_CAP OFF (default) it is always 0, so the key is omitted and the champion/OFF
+            # ``.details.jsonl`` stays byte-identical; a nonzero count lets the diagnosis measure how often
+            # the search 上限 fired per question.
+            **({"search_cap_hits": self.search_cap_hits} if self.search_cap_hits else {}),
         }
 
 
@@ -978,6 +1005,26 @@ def _spin_pivot_directive(name: str, tried: "set[str]", *, low_turns: bool) -> s
         "いずれでも根拠が確定できない場合に限り、推測せず棄権してください。")
 
 
+def _search_cap_directive(name: str, cap: int, tried: "set[str]") -> str:
+    """The directive emitted when a question's search-call cap is exhausted (SOT-2620).
+
+    Names still-untried *non-search* deterministic routes so the freed budget goes to a value/registry
+    lane instead of another re-grep, and always offers the registry reverse-index / structure store /
+    手持ち証拠での確定判断 as escape hatches. Injects no corpus fact (tool/route names only); never touches
+    the commit threshold, so the answer path is byte-identical when the cap is disabled.
+    """
+    untried = [t for t in _DETERMINISTIC_ROUTES
+               if t != name and t not in tried and t not in _SEARCH_TOOLS]
+    routes = "、".join(untried) if untried else "canonical_route / 逆引き索引 / structure store"
+    return (
+        f"検索系ツール『{name}』の呼び出しがこの問いの型別上限（{cap}回）に達しました。検索の反復では"
+        "既に必要な根拠は出ておらず（ヒットは返るが針が含まれない反復）、これ以上の再検索は浪費です。"
+        "検索を止め、次のいずれかに切り替えてください: "
+        f"未試行の決定論ツール（{routes}）に質問文をそのまま渡す／registry の逆引き索引・canonical_route・"
+        "structure store で対象を直接解決する／既に手元にある証拠だけで回答を確定する。"
+        "いずれでも根拠が確定できない場合に限り、推測せず棄権してください。")
+
+
 def _first_move_directive(name: str, out: Any) -> str:
     """The seed user-message describing a deterministic first-move result (SOT-2521).
 
@@ -1306,6 +1353,7 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 budget_boundary: bool = False,
                 spin_detection: "bool | Mapping[str, Any] | None" = False,
                 pivot_detection: "bool | Mapping[str, Any] | None" = False,
+                search_cap: "bool | Mapping[str, Any] | None" = None,
                 preamble: "str | None" = None) -> Investigation:
     """Drive ``model`` through tool-calling until it submits a structured answer.
 
@@ -1413,6 +1461,20 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     byte-identical when it is ``False`` (default); :func:`answer_question` wires it from ``RAG_SPIN_PIVOT``.
     It composes with ``spin_detection`` (the SOT-2522 exact-identity cut runs first, unchanged).
 
+    ``search_cap`` (SOT-2620) bounds the *total* number of search-style tool calls (``file_grep`` /
+    ``find_files``) this question may make, by route type — the 型別 search 上限 wired into the default
+    fallback loop (independent of the opt-in ``RAG_EVIDENCE_PACKET``). When it is not ``None``/``False``,
+    the per-route cap is resolved from ``contract`` via
+    :func:`~src.rag.agent.query_router.search_cap_for_contract` (a ``Mapping`` with a ``cap`` key overrides
+    it directly); the (cap+1)-th search call is NOT dispatched — the loop feeds back a switch-lane
+    directive (:func:`_search_cap_directive`: canonical_route / 逆引き索引 / structure store / 手持ち証拠で
+    の確定判断) and records a ``search_cap_hits`` count. It STRENGTHENS ``pivot_detection`` and shares its
+    budget: the cap check runs *after* the pivot guard, so a call the pivot guard already intercepted never
+    double-counts here (no duplicate intervention). Total turns are never raised — only the repeated-search
+    axis is bounded. It injects no corpus fact (tool/route names only) and never touches the commit
+    threshold, so the answer path is byte-identical when it is ``None`` (default); :func:`answer_question`
+    wires it from ``RAG_SEARCH_CAP``.
+
     ``preamble`` (SOT-2584) is an optional plain user directive injected *before the model's first turn*
     — the Evidence Packet (:mod:`src.rag.agent.evidence_packet`): the typed route, the registry-resolved
     target documents, the required evidence slots + which are missing, the deterministic primary lane, and
@@ -1451,6 +1513,22 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     pivot_run = 0             # length of the current consecutive same-target run
     pivot_cooldown: set[str] = set()  # tools already pivoted once this question (re-pivot on a shorter run)
     pivot_count = 0           # spin_pivots recorded (details log / abstain ledger)
+
+    # SOT-2620 — per-route search-call cap state (STRENGTHENS the SOT-2614 pivot guard; shares its budget
+    # because the cap check runs AFTER the pivot block below, so a pivoted call never reaches it).
+    search_cap_enabled = search_cap not in (None, False)
+    search_cap_limit = 0
+    if search_cap_enabled:
+        from src.rag.agent import query_router as _query_router
+        if isinstance(search_cap, Mapping) and "cap" in search_cap:
+            try:
+                search_cap_limit = max(1, int(search_cap["cap"]))
+            except (TypeError, ValueError):
+                search_cap_limit = _query_router.search_cap_for_contract(contract)
+        else:
+            search_cap_limit = _query_router.search_cap_for_contract(contract)
+    search_calls = 0          # dispatched search-tool calls this question
+    search_cap_hits = 0       # over-cap search attempts intercepted (details log / abstain ledger)
 
     record_enabled = ledger not in (None, False)
     if record_enabled:
@@ -2024,6 +2102,28 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                     }))
                     dispatched_tool = True   # count the guided pivot round
                     continue
+            # SOT-2620 — per-route search-call cap. STRENGTHENS the SOT-2614 pivot guard: the pivot guard
+            # cuts a *consecutive* same-tool run, but the phase-0 diagnosis showed search waste is also
+            # spread *non-consecutively* (a re-grep after a read never trips the consecutive guard yet still
+            # burns a search turn). This bounds the TOTAL search-tool (file_grep/find_files) calls per
+            # question by route type; on the over-cap call it does NOT dispatch — it feeds back a switch-lane
+            # directive (canonical_route / 逆引き索引 / structure store / 手持ち証拠での確定判断). Placed AFTER
+            # the pivot guard so a pivoted call (which `continue`d above) never double-counts here — the two
+            # guards share one budget. No corpus fact is injected and the commit threshold is untouched, so an
+            # OFF (default) path is byte-identical.
+            if search_cap_enabled and call.name in _SEARCH_TOOLS:
+                if search_calls >= search_cap_limit:
+                    search_cap_hits += 1
+                    tried = {c for c in tool_calls if c != SUBMIT_ANSWER}
+                    responses.append(ToolResponse(call.name, {
+                        "search_cap_exceeded": True,
+                        "reason": (f"検索系ツール『{call.name}』の呼び出しが型別上限（{search_cap_limit}回）に"
+                                   "達しました。検索の反復では新しい根拠は得られません。"),
+                        "directive": _search_cap_directive(call.name, search_cap_limit, tried),
+                    }))
+                    dispatched_tool = True   # count the guided switch round
+                    continue
+                search_calls += 1
             out = cached_dispatch(call.name, call.args)
             if call.name == "read_chart_values" and _contract.is_contract(out):
                 method = out.get("method") or {}
@@ -2107,6 +2207,7 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
         stop_reason=stop_reason, error=error, contract=contract,
         pot_lane=pot_lane_verdict,  # SOT-2586 — persist the forced-lane verdict for details/diagnostics
         spin_pivots=pivot_count,    # SOT-2614 — forced consecutive-spin pivots (0 ⇒ guard OFF/no spin)
+        search_cap_hits=search_cap_hits,  # SOT-2620 — over-cap search calls intercepted (0 ⇒ cap OFF/not hit)
     )
 
     # SOT-2492 — abstain ledger: purely post-decision. The answer above is already final; here we only
@@ -2120,6 +2221,9 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
         # SOT-2614 — record how many forced consecutive-spin pivots fired so the diagnosis can measure the
         # capture rate of the strengthened guard (0 when RAG_SPIN_PIVOT is OFF ⇒ ledger byte-identical).
         signals.spin_pivots = pivot_count
+        # SOT-2620 — record how many over-cap search calls were intercepted so the diagnosis can measure how
+        # often the search 上限 fired (0 when RAG_SEARCH_CAP is OFF ⇒ ledger byte-identical).
+        signals.search_cap_hits = search_cap_hits
         signals.evidence_text = " ".join(
             t for t in (answer.evidence, answer.method, answer.answer) if t).strip()
         if director is not None:
@@ -2475,4 +2579,5 @@ def answer_question(question: str, *, model: str | None = None,
                        ledger=ledger, calc_ledger=calc_ledger, research=research,
                        enumeration=enumeration, contract=contract, first_move=first_move,
                        fallback=fallback, budget_boundary=BUDGET_BOUNDARY_RESEARCH,
-                       spin_detection=SPIN_DETECTION, pivot_detection=SPIN_PIVOT, preamble=preamble)
+                       spin_detection=SPIN_DETECTION, pivot_detection=SPIN_PIVOT,
+                       search_cap=SEARCH_CAP, preamble=preamble)

@@ -1193,3 +1193,107 @@ def test_spin_pivot_records_spin_pivots_to_ledger(tmp_path: Path):
     rows = [json.loads(x) for x in ledger_path.read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 1
     assert rows[0]["missing"][0]["signals"]["spin_pivots"] == res.spin_pivots
+
+
+# ----------------------------------------------------------------- SOT-2620 per-route search-call cap
+def _cap_msgs(model):
+    return [tr for turn in model.calls_seen if turn for tr in turn
+            if isinstance(tr.response, dict) and tr.response.get("search_cap_exceeded")]
+
+
+def test_search_cap_off_by_default_is_byte_identical():
+    # Cap off (default: search_cap=None): a model that issues many varied greps executes every one, no
+    # cap directive is injected, and search_cap_hits is absent from the details → byte-identical path.
+    sink = []
+    tools = [_counting_tool(sink, name="file_grep"), inv.SUBMIT_ANSWER_TOOL]
+    steps = [_grep_step(q) for q in ("a", "b", "c", "d", "e", "f", "g", "h")]
+    res = investigate(model := ScriptedModel(steps), "…", tools, max_turns=5)
+    assert res.stop_reason == "max_turns"
+    assert res.tool_calls == ["file_grep"] * 5     # every varied grep dispatched, no cap
+    assert not _cap_msgs(model)
+    assert res.search_cap_hits == 0
+    assert "search_cap_hits" not in res.to_dict()  # omitted when the cap never fired → byte-identical
+
+
+def test_search_cap_caps_total_search_calls():
+    # With an explicit cap, the (cap+1)-th search call is NOT dispatched — a switch-lane directive is fed
+    # back instead — even though the greps are all distinct (so SOT-2522/2614 would never cut them).
+    sink = []
+    tools = [_counting_tool(sink, name="file_grep"), inv.SUBMIT_ANSWER_TOOL]
+    steps = [_grep_step(q) for q in ("a", "b", "c", "d", "e", "f")] + [_submit("答")]
+    model = ScriptedModel(steps)
+    res = investigate(model, "対象の値は？", tools, max_turns=12, search_cap={"cap": 4})
+    assert res.stop_reason == "answered"
+    assert len(sink) == 4                            # only the first 4 searches actually ran
+    caps = _cap_msgs(model)
+    assert len(caps) == 2                            # 5th and 6th were intercepted
+    assert "上限" in caps[0].response["reason"]
+    assert "canonical_route" in caps[0].response["directive"]
+    assert res.search_cap_hits == 2
+    assert res.to_dict()["search_cap_hits"] == 2
+
+
+def test_search_cap_lets_model_switch_lane_and_commit():
+    # After the cap directive, a model that switches to a value/registry lane and commits finishes
+    # normally — the cap redirected the budget instead of dead-ending the question.
+    sink = []
+    tools = [_counting_tool(sink, name="file_grep"),
+             _counting_tool(sink, name="canonical_route"), inv.SUBMIT_ANSWER_TOOL]
+    steps = [
+        _grep_step("a"), _grep_step("b"),            # cap=2 → next grep is capped
+        _grep_step("c"),                             # intercepted (not dispatched)
+        Step(function_calls=(Call("canonical_route", {"question": "q"}),), usage=Usage(1, 1)),
+        _submit("回答42", confidence=0.9, evidence="canonical_route", method="route"),
+    ]
+    model = ScriptedModel(steps)
+    res = investigate(model, "対象の値は？", tools, max_turns=12, search_cap={"cap": 2})
+    assert res.stop_reason == "answered"
+    assert res.answer.answer == "回答42"
+    assert "canonical_route" in res.tool_calls
+    assert res.search_cap_hits == 1
+
+
+def test_search_cap_resolves_per_route_from_contract():
+    # search_cap=True (no explicit cap) resolves the cap from the question's contract via query_router:
+    # a version_diff question gets the DIFF cap (3), so the 4th+ grep is capped.
+    sink = []
+    tools = [_counting_tool(sink, name="file_grep"), inv.SUBMIT_ANSWER_TOOL]
+    steps = [_grep_step(q) for q in ("a", "b", "c", "d", "e")] + [_submit("答")]
+    model = ScriptedModel(steps)
+    res = investigate(model, "…", tools, max_turns=12, search_cap=True, contract="version_diff")
+    assert len(sink) == 3                            # DIFF cap = 3
+    assert res.search_cap_hits == 2
+
+
+def test_search_cap_shares_budget_with_pivot_guard():
+    # SOT-2614 の pivot ガードと重複介入しない: the cap check runs AFTER the pivot guard, so a call the
+    # pivot guard already intercepted never also trips the cap (shared budget, no double directive).
+    sink = []
+    tools = [_counting_tool(sink, name="file_grep"), inv.SUBMIT_ANSWER_TOOL]
+    steps = [_grep_step("a"), _grep_step("b"), _grep_step("c")] + [_submit("答")]
+    model = ScriptedModel(steps)
+    res = investigate(model, "…", tools, max_turns=12,
+                      pivot_detection={"threshold": 3, "low_turns": 0}, search_cap={"cap": 2})
+    # The 3rd consecutive grep is intercepted by the pivot guard, not the cap — so no cap directive fires
+    # on it and search_cap_hits stays 0 even though 3 greps were issued against a cap of 2.
+    assert res.spin_pivots == 1
+    assert not _cap_msgs(model)
+    assert res.search_cap_hits == 0
+    assert len(sink) == 2                            # a,b dispatched; c pivoted (not dispatched)
+
+
+def test_search_cap_records_hits_to_ledger(tmp_path: Path):
+    # The cap-hit count is recorded onto the abstain ledger only when it fired (>0) so the diagnosis can
+    # measure how often the search 上限 fired; omitted otherwise → byte-identical.
+    sink = []
+    tools = [_counting_tool(sink, name="file_grep"), inv.SUBMIT_ANSWER_TOOL]
+    steps = [_grep_step(q) for q in ("a", "b", "c", "d", "e", "f")]
+    model = ScriptedModel(steps)
+    ledger_path = tmp_path / "abstain.jsonl"
+    res = investigate(model, "…", tools, max_turns=8,
+                      search_cap={"cap": 3}, ledger=str(ledger_path))
+    assert res.answer.answer == ABSTAIN
+    assert res.search_cap_hits >= 1
+    rows = [json.loads(x) for x in ledger_path.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["missing"][0]["signals"]["search_cap_hits"] == res.search_cap_hits
