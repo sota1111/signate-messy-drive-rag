@@ -144,6 +144,11 @@ class AbstainSignals:
     # answer path; it only lets :func:`classify` attribute the abstain to :data:`SPIN_CUTOFF` distinctly
     # from a plain :data:`BUDGET_EXHAUSTED` cutoff.
     spin_cutoff: bool = False
+    # SOT-2614 — how many forced consecutive-spin pivots the investigator fired on this question (the
+    # strengthened spin guard, RAG_SPIN_PIVOT). Observer-only: it never changes the answer path; it is
+    # emitted into the record's signal block ONLY when nonzero so an OFF-default run stays byte-identical,
+    # and lets the phase-0 diagnosis measure the guard's per-question capture rate.
+    spin_pivots: int = 0
     # SOT-2502 — obligation-driven re-search phase results (empty unless the research loop ran):
     research_trace: tuple[dict[str, Any], ...] = ()  # ordered targeted re-search rounds
     research_terminal: str = ""        # why re-search stopped: "budget" | "unanswerable" | "answered"
@@ -181,6 +186,9 @@ class AbstainSignals:
             "extraction_attempts": self.extraction_attempts, "extraction_ok": self.extraction_ok,
             "derivation_attempts": self.derivation_attempts, "derivation_ok": self.derivation_ok,
             "ambiguous": self.ambiguous, "errors": self.errors,
+            # SOT-2614 — emitted ONLY when the strengthened spin guard actually fired (>0); omitted by
+            # default so an OFF (RAG_SPIN_PIVOT unset) run's ledger stays byte-identical.
+            **({"spin_pivots": self.spin_pivots} if self.spin_pivots else {}),
         }
 
 

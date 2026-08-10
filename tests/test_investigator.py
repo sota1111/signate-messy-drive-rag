@@ -1071,3 +1071,125 @@ def test_spin_detection_ignores_varied_arguments():
     spin_msgs = [tr for turn in model.calls_seen if turn for tr in turn
                  if isinstance(tr.response, dict) and tr.response.get("spin_detected")]
     assert not spin_msgs  # varied args → no spin directive
+
+
+# ----------------------------------------------------------------- SOT-2614 consecutive-spin pivot guard
+def _pivot_msgs(model):
+    return [tr for turn in model.calls_seen if turn for tr in turn
+            if isinstance(tr.response, dict) and tr.response.get("spin_pivot")]
+
+
+def test_spin_pivot_off_by_default_is_byte_identical():
+    # Guard off (default): a model that hammers one tool with *varied* queries spins to max_turns exactly
+    # as before — every call executes, no pivot directive, and spin_pivots is absent from the details.
+    sink = []
+    tools = [_counting_tool(sink, name="file_grep"), inv.SUBMIT_ANSWER_TOOL]
+    steps = [_grep_step(q) for q in ("a", "b", "c", "d", "e", "f", "g", "h")]
+    res = investigate(model := ScriptedModel(steps), "…", tools, max_turns=5)
+    assert res.stop_reason == "max_turns"
+    assert res.tool_calls == ["file_grep"] * 5     # every varied grep dispatched, no pivot
+    assert not _pivot_msgs(model)
+    assert res.spin_pivots == 0
+    assert "spin_pivots" not in res.to_dict()      # omitted when the guard never fired → byte-identical
+
+
+def test_spin_pivot_fires_on_consecutive_varied_search():
+    # The strengthened guard catches what SOT-2522 misses: a consecutive run of ONE search tool whose
+    # query is tweaked each call. On the 3rd consecutive call the redundant dispatch is withheld and a
+    # pivot directive is fed back instead; the pivot is counted into the details log.
+    sink = []
+    tools = [_counting_tool(sink, name="file_grep"), inv.SUBMIT_ANSWER_TOOL]
+    steps = [_grep_step("a"), _grep_step("b"), _grep_step("c")]
+    model = ScriptedModel(steps)
+    res = investigate(model, "対象の値は？", tools, max_turns=12,
+                      pivot_detection={"threshold": 3, "low_turns": 0})
+    pivots = _pivot_msgs(model)
+    assert len(pivots) == 1
+    assert "空回り" in pivots[0].response["reason"]
+    assert "canonical_route" in pivots[0].response["directive"]
+    assert len(sink) == 2                           # 3rd consecutive call was NOT dispatched (pivoted)
+    assert res.spin_pivots == 1
+    assert res.to_dict()["spin_pivots"] == res.spin_pivots
+
+
+def test_spin_pivot_lets_model_recover_via_another_route():
+    # After the pivot directive, a model that switches routes and commits finishes normally — the guard
+    # reallocated the budget instead of dead-ending the question.
+    sink = []
+    tools = [_counting_tool(sink, name="file_grep"),
+             _counting_tool(sink, name="canonical_route"), inv.SUBMIT_ANSWER_TOOL]
+    steps = [
+        _grep_step("a"), _grep_step("b"), _grep_step("c"),   # 3 consecutive varied greps → pivot
+        Step(function_calls=(Call("canonical_route", {"question": "q"}),), usage=Usage(1, 1)),
+        _submit("回答42", confidence=0.9, evidence="canonical_route", method="route"),
+    ]
+    model = ScriptedModel(steps)
+    res = investigate(model, "対象の値は？", tools, max_turns=12, pivot_detection=True)
+    assert res.stop_reason == "answered"
+    assert res.answer.answer == "回答42"
+    assert "canonical_route" in res.tool_calls
+    assert res.spin_pivots >= 1
+
+
+def test_spin_pivot_different_file_targets_not_flagged():
+    # Walking DIFFERENT files with a file-carrying tool is legitimate progress, not spin: the run resets
+    # on each new target, so no pivot fires.
+    sink = []
+    tools = [_counting_tool(sink, name="read_office"), inv.SUBMIT_ANSWER_TOOL]
+    steps = [
+        Step(function_calls=(Call("read_office", {"file": f}),), usage=Usage(1, 1))
+        for f in ("a.xlsx", "b.xlsx", "c.xlsx", "d.xlsx")
+    ] + [_submit("見つけた", evidence="read_office", method="x")]
+    model = ScriptedModel(steps)
+    res = investigate(model, "…", tools, max_turns=12, pivot_detection={"threshold": 3})
+    assert res.stop_reason == "answered"
+    assert not _pivot_msgs(model)
+    assert res.spin_pivots == 0
+
+
+def test_spin_pivot_same_file_guess_and_check_is_flagged():
+    # Hammering ONE file with tweaked compute exprs (the idx47/57/95 guess-and-check pattern SOT-2522
+    # misses because the args differ) is caught: same file target across the consecutive run → pivot.
+    sink = []
+    tools = [_counting_tool(sink, name="compute"), inv.SUBMIT_ANSWER_TOOL]
+    steps = [
+        Step(function_calls=(Call("compute", {"file": "t.xlsx", "expr": e}),), usage=Usage(1, 1))
+        for e in ("df.a.mean()", "df.b.sum()", "df.c.max()")
+    ]
+    model = ScriptedModel(steps)
+    res = investigate(model, "…", tools, max_turns=12, pivot_detection={"threshold": 3, "low_turns": 0})
+    assert _pivot_msgs(model)
+    assert len(sink) == 2                            # 3rd same-file compute withheld
+    assert res.spin_pivots == 1
+
+
+def test_spin_pivot_low_turns_escalates_to_verdict():
+    # When few turns remain, the pivot escalates to a definitive-decision directive (answer-or-abstain)
+    # so the freed budget lands on a verdict rather than more spinning.
+    sink = []
+    tools = [_counting_tool(sink, name="file_grep"), inv.SUBMIT_ANSWER_TOOL]
+    steps = [_grep_step(q) for q in ("a", "b", "c", "d")]
+    model = ScriptedModel(steps)
+    res = investigate(model, "…", tools, max_turns=12,
+                      pivot_detection={"threshold": 3, "low_turns": 99})
+    pivots = _pivot_msgs(model)
+    assert pivots
+    assert "残ターンが僅少" in pivots[0].response["directive"]
+    assert "棄権" in pivots[0].response["directive"]
+
+
+def test_spin_pivot_records_spin_pivots_to_ledger(tmp_path: Path):
+    # A pivot count is recorded onto the abstain ledger only when it fired (>0), so the diagnosis can
+    # measure the guard's capture rate; the state code is unchanged when no early cutoff occurred.
+    sink = []
+    tools = [_counting_tool(sink, name="file_grep"), inv.SUBMIT_ANSWER_TOOL]
+    steps = [_grep_step(q) for q in ("a", "b", "c", "d", "e", "f")]
+    model = ScriptedModel(steps)
+    ledger_path = tmp_path / "abstain.jsonl"
+    res = investigate(model, "…", tools, max_turns=6,
+                      pivot_detection={"threshold": 3, "low_turns": 0}, ledger=str(ledger_path))
+    assert res.answer.answer == ABSTAIN
+    assert res.spin_pivots >= 1
+    rows = [json.loads(x) for x in ledger_path.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["missing"][0]["signals"]["spin_pivots"] == res.spin_pivots
