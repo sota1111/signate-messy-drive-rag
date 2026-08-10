@@ -660,6 +660,30 @@ def has_explicit_file_reference(question: str) -> bool:
     return bool(explicit_file_tokens(question))
 
 
+def rels_for_project(project: str | None, *, extensions: Iterable[str] | None = None,
+                     path: Path | None = None) -> list[str]:
+    """Corpus-relative paths whose ``case_id`` matches ``project`` (read-only helper; SOT-2616).
+
+    Reads the *already-built* registry (the build is unchanged) and returns the doc_ids in the named
+    project, optionally filtered to ``extensions`` (e.g. ``{"xlsx", "xlsm"}`` for the data spreadsheets an
+    operand prefill scans). Matching is NFKC-folded and lenient in both directions so a project alias
+    resolves. Returns ``[]`` when the registry is absent or the project is empty — the operand prefill's
+    project-scoped fallback then simply finds nothing (no degradation).
+    """
+    if not project:
+        return []
+    key = fold(project)
+    exts = set(extensions) if extensions else None
+    out: list[str] = []
+    for r in load(path):
+        if exts is not None and r.get("extension") not in exts:
+            continue
+        cid = fold(r.get("case_id", ""))
+        if key and cid and (key in cid or cid in key):
+            out.append(r["doc_id"])
+    return out
+
+
 def get_resolver(path: Path | None = None) -> Resolver | None:
     """A memoized :class:`Resolver` over the persisted registry, or None when it is unavailable."""
     out = path or default_out_path()

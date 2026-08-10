@@ -51,6 +51,7 @@ from src.rag.tools.extract_tools import (
 from src.rag.tools import call_budget
 from src.rag.tools.file_grep import file_grep
 from src.rag.agent import pot_lane as _pot_lane
+from src.rag.agent import operand_prefill as _operand_prefill
 from src.rag.agent import enum_scan as _enum_scan
 from src.rag.tools import font_emphasis as _font_emphasis
 from src.rag.tools import format_events as _format_events
@@ -824,12 +825,19 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
     # specs through binder→制限AST→Decimal→独立検算→N-sample majority and returns a three-layer verdict —
     # never eval/parse_expr on a model string (no arbitrary-code path).
     if _pot_lane.enabled():
+        # SOT-2616 — when operand prefill is on, expose the augmented schema (operands may ``select`` from
+        # the injected catalog by id) and forward the ``catalog`` through to the lane so value/unit/source
+        # are bound from the enumerated cell verbatim. Prefill OFF ⇒ base schema + no catalog kwarg, so the
+        # tool definition and call surface are byte-identical to the champion path.
+        _pot_params = (_pot_lane.TOOL_PARAMETERS_PREFILL
+                       if _operand_prefill.enabled() else _pot_lane.TOOL_PARAMETERS)
         tools.append(AgentTool(
             _pot_lane.TOOL_NAME,
             _pot_lane.TOOL_DESCRIPTION,
-            _pot_lane.TOOL_PARAMETERS,
-            lambda candidates=None, simple=None, require_units=False: _pot_lane.verify_formula(
-                candidates, simple=simple, require_units=bool(require_units)),
+            _pot_params,
+            lambda candidates=None, simple=None, require_units=False, catalog=None:
+                _pot_lane.verify_formula(
+                    candidates, simple=simple, require_units=bool(require_units), catalog=catalog),
         ))
     # SOT-2587: ENUM symbolic full-scan lane. Additively exposed only when RAG_ENUM_SCAN is on, so the
     # champion serve tool set / prompt stays byte-identical by default. Resolves the target universe from
@@ -2491,6 +2499,9 @@ def answer_question(question: str, *, model: str | None = None,
                 # Injects no corpus fact / no answer — protocol only.
                 if POT_HARD_LANE and _pot_lane.enabled() and decision.route == _query_router.NUMERIC:
                     preamble = f"{preamble}\n\n{_pot_lane.numeric_lane_directive()}"
+                # SOT-2616 — operand candidate prefill is built *inside* the Evidence Packet
+                # (build_directive → build_packet) so the catalog is embedded in the packet JSON and
+                # rendered in the preamble in one place; nothing to append here.
                 # SOT-2587 — ENUM full-scan forced-lane directive (only when RAG_ENUM_SCAN is on and the
                 # route is ENUM). Tells the agent to resolve the universe and scan every applicable
                 # document via ``enum_scan`` and to honour the completeness certificate / no-match guard,

@@ -329,6 +329,74 @@ def lookup_seating(ref: FileRef, path: Path | None = None) -> dict[str, Any] | N
     return copy.deepcopy(seating)
 
 
+def stored_numeric_cells(rel: str, path: Path | None = None) -> list[dict[str, Any]]:
+    """Numeric-bearing highlighted cells for a corpus-relative doc, read from the persisted store.
+
+    Read-only accessor over the *already-built* structure store (SOT-2616 — the build itself is
+    unchanged). For one document (``rel`` = NFC corpus-relative path) it returns the stored highlighted
+    cells whose value is a number, each as ``{value, sheet, cell, doc, column, group, color}`` — the raw
+    material an operand-candidate prefill needs (value + cell coordinate + sheet + document provenance).
+
+    Unlike :func:`lookup_highlight_items` this does *not* gate on :func:`enabled` or on ``content_sha``
+    freshness: the caller (:mod:`src.rag.agent.operand_prefill`, itself flag-gated) treats these purely
+    as *candidates* for the LLM to select from and the PoT lane to re-ground by source — never as a
+    committed answer — so a stale-but-present cell is still a useful pointer. A missing/unreadable store
+    yields ``[]``. Numeric filtering is deliberate: highlighted text labels are not operands.
+    """
+    entry = load(path).get("files", {}).get(nfc(rel))
+    items = (entry or {}).get("highlights") or []
+    out: list[dict[str, Any]] = []
+    for item in items:
+        num = _as_number(item.get("value"))
+        if num is None:
+            continue
+        ev = item.get("evidence") or {}
+        method = item.get("method") or {}
+        # Require a real spreadsheet cell coordinate: a numeric operand candidate must point at an actual
+        # cell (doc:sheet!cell). This deliberately drops pptx/docx highlight numbers that carry no cell —
+        # those are layout artifacts (bullet ordinals "1/2/3"), not operands — so the prefill never injects
+        # that noise (protects wrong-non-increase).
+        if not str(ev.get("cell", "")).strip():
+            continue
+        out.append({
+            "value": item.get("value"),
+            "number": num,
+            "sheet": ev.get("sheet", ""),
+            "cell": ev.get("cell", ""),
+            "column": ev.get("column"),
+            "doc": ev.get("file", nfc(rel)),
+            "group": ev.get("group") or None,
+            "color": method.get("color"),
+        })
+    return out
+
+
+def _as_number(value: Any) -> float | None:
+    """Parse a stored cell value into a float when it reads as a plain number, else ``None``.
+
+    Tolerates thousands separators and a trailing unit suffix (``"73,260円"`` → 73260.0) exactly like the
+    PoT binder's numeric parse, so the same cells the lane can bind are the ones surfaced as candidates.
+    A percentage / bare label / empty cell returns ``None`` (not an operand).
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().replace(",", "").replace("，", "")
+    for suffix in ("円", "%", "％", "人", "件", "時間", "個", "社", "点", "台", "回"):
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)]
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
 def lookup_version_changes(old: FileRef, new: FileRef,
                            path: Path | None = None) -> list[dict[str, Any]] | None:
     """Cached structural changes for the ``old→new`` pair, or None (disabled / miss / stale)."""
