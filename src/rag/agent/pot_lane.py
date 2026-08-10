@@ -962,14 +962,23 @@ def verify_formula(candidates: Sequence[Mapping[str, Any]] | None = None, *,
 def numeric_lane_directive() -> str:
     """The extra pre-inject directive appended to a NUMERIC Evidence Packet when the lane is enabled.
 
-    Tells the agent that the NUMERIC route is a *forced* compute lane: it must route its arithmetic
-    through :data:`TOOL_NAME` (binder→制限AST→Decimal→独立検算) rather than 暗算, and only submit the
-    lane's verified value. Injects no corpus fact and no answer — only the lane protocol."""
+    Tells the agent that the NUMERIC route routes its arithmetic through :data:`TOOL_NAME`
+    (binder→制限AST→Decimal→独立検算) rather than 暗算, and adopts the lane's verified value with high
+    confidence on success. On a lane failure it does NOT force an abstain (SOT-2598): the agent degrades
+    to the normal free-form answer path (still subject to the usual commit/confidence gate, still barred
+    from fabricating a number) instead of dropping an evidence-supported correct answer — 原則
+    「wrong→abstain は許すが match→abstain は許さない」. Injects no corpus fact and no answer — only the
+    lane protocol."""
     return (
-        "【NUMERIC 強制計算レーン(PoT)】この質問は数値導出型です。答えの数値は必ず "
+        "【NUMERIC 強制計算レーン(PoT)】この質問は数値導出型です。答えの数値はまず必ず "
         f"`{TOOL_NAME}` ツールで計算してください(暗算・自由コード禁止)。operand を "
         "value/unit/source(doc:sheet!cell) 付きで束縛し、許可演算限定の式(AST)で組み、三層(operand/"
-        "formula/execution)がすべて合格して独立検算が一致した値だけを submit_answer に渡してください。"
+        "formula/execution)がすべて合格して独立検算が一致した値は、高信頼で submit_answer に採用してください。"
         "条件付き(税込/税抜・◯分の◯に減額 等)は condition の predicate_truth と base_quantity を明示し、"
         "multi-hop/条件付きでは候補を3つ作って多数決(answer∧source∧unit∧branch の全一致)で確定します。"
-        "三層のいずれかが不合格、または検算が一致しない場合は数値を創作せず棄権してください。")
+        "三層のいずれかが不合格、または検算が一致しない場合でも即棄権にはしないでください: 数値の創作"
+        "(暗算・当て推量)は禁止のままですが、原文(セル値・本文の記載値)から直接根拠づけられる回答があれば、"
+        "通常の回答経路(submit_answer)でその根拠に基づく最善の回答を返してください(その回答は通常どおり "
+        "commit/confidence ゲートで判定されます)。exec_verifier 等の独立照合が併用されているときはその照合結果を"
+        "尊重してください。原文から根拠づけられる値が本当に無いときにのみ棄権してください。強制レーンで束縛"
+        "しきれなかったというだけの理由で、原文から支持できる正答を棄権に落とさないこと。")

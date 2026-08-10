@@ -353,6 +353,53 @@ def test_pot_hard_lane_rejects_numeric_submit_until_verified(monkeypatch):
     assert res.pot_lane is not None
 
 
+def test_pot_hard_lane_failure_degrades_to_freeform_not_forced_abstain(monkeypatch):
+    """SOT-2598 — a *failed* verify_formula must NOT force the numeric answer to abstain. Once the lane
+    has been exercised (verdict non-None, even a non-COMMIT one), an evidence-supported free-form value
+    commits through the normal gate (原則 wrong→abstain 可 / match→abstain 不可). This pins the code
+    invariant behind the directive relaxation: the terminal gate rejects only an *unverified* (verdict is
+    None) submit, never a submit that follows a failing lane verdict."""
+    from src.rag.agent import pot_lane as pl
+
+    monkeypatch.setattr(inv, "POT_HARD_LANE", True)
+    monkeypatch.setattr(pl, "enabled", lambda: True)
+    verify_tool = AgentTool(
+        pl.TOOL_NAME, pl.TOOL_DESCRIPTION, pl.TOOL_PARAMETERS,
+        lambda candidates=None, simple=None, require_units=False: pl.verify_formula(
+            candidates, simple=simple, require_units=bool(require_units)))
+    # A candidate the lane cannot verify: the formula references an unbound operand ``y`` → operand-layer
+    # failure → the whole run abstains (status != COMMIT). The model then falls back to a source-grounded
+    # free-form value rather than abstaining.
+    fail_spec = {"operands": [{"name": "x", "value": 2, "unit": "円", "source": "c:S!A1"}],
+                 "formula": {"op": "ADD", "args": [{"ref": "x"}, {"ref": "y"}]},
+                 "condition": None, "result_unit": "円"}
+    model = ScriptedModel([
+        _submit("73260円", confidence=0.9),                                   # unverified → rejected by gate
+        Step(function_calls=(Call(pl.TOOL_NAME, {"candidates": [fail_spec]}),), usage=Usage(20, 10)),
+        _submit("73260円", confidence=0.9),                                   # free-form degrade → accepted
+    ])
+    res = investigate(model, "原文に記載の合計金額はいくらですか？",
+                      [verify_tool, inv.SUBMIT_ANSWER_TOOL], max_turns=6, contract="numeric")
+    assert res.stop_reason == "answered"
+    assert res.answer.answer == "73260円"          # NOT dropped to abstain despite the failed lane
+    assert not is_abstain(res.answer.answer)
+    assert res.pot_lane is not None and res.pot_lane.get("status") != pl.COMMIT  # a failing verdict was recorded
+
+
+def test_numeric_lane_directive_degrades_on_failure_not_forced_abstain():
+    """SOT-2598 — the injected directive no longer force-abstains on lane failure. It must (a) still bar
+    number fabrication, (b) tell the model to fall back to the normal answer path when the source supports
+    a value, and (c) not instruct an unconditional abstain on any layer failure."""
+    from src.rag.agent import pot_lane as pl
+
+    directive = pl.numeric_lane_directive()
+    assert "即棄権にはしないでください" in directive        # failure ⇒ degrade, not forced abstain
+    assert "submit_answer" in directive                    # names the normal free-form answer path
+    assert "創作" in directive                             # still bars fabricating a number
+    # The old unconditional "…場合は数値を創作せず棄権してください" instruction must be gone.
+    assert "一致しない場合は数値を創作せず棄権してください" not in directive
+
+
 def test_investigate_accepts_plain_final_text_with_zero_confidence():
     model = ScriptedModel([Step(function_calls=(), final_text="20日", usage=Usage(10, 5))])
     res = investigate(model, "…", build_tools(CorpusProfile()), max_turns=3)
