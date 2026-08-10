@@ -51,6 +51,7 @@ from src.rag.tools.extract_tools import (
 from src.rag.tools import call_budget
 from src.rag.tools.file_grep import file_grep
 from src.rag.tools import font_emphasis as _font_emphasis
+from src.rag.tools import format_events as _format_events
 from src.rag.tools.highlight_extract import highlight_extract
 from src.rag.tools.pdf_faux_italic import emphasized_words
 from src.rag.tools.profile import CorpusProfile
@@ -669,6 +670,26 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
             _obj({"file": _STR, "require": _STR}, ["file"]),
             lambda file, require=None: _font_emphasis.font_emphasis(
                 file, require=require, profile=profile),
+        ))
+    # SOT-2585: OOXML semantic FORMAT_EVENTs — Excel 条件付き書式ルール(cfRule/dxf)、docx コメント本文＋
+    # anchor、文字色/ハイライト/塗りの複合述語。RAG_FORMAT_EVENTS が on のときだけ追加(既定 OFF ⇒ 既存の
+    # ツールセット/プロンプトは byte-identical)。
+    if _format_events.enabled():
+        tools.append(AgentTool(
+            "format_events",
+            "xlsx/docxの書式イベントを決定論抽出する。(1)Excel条件付き書式ルール(cfRule/dxf: 条件/演算子/"
+            "式/優先度/dxf塗り色/dxf文字色)を FORMAT_EVENT として返す(『黄色ハイライトになっているセルの"
+            "条件』はこのルール条件が答え)。(2)docxコメントを anchor_text(コメントが付いた本文そのもの)＋"
+            "author/日時付きで返す(『コメントがついている部分をそのまま抽出』は anchor_text が答え)。"
+            "(3)文字色・ハイライト・塗りの実効書式を分離。fill=背景色名・font_color=文字色名を同時に渡すと"
+            "『黄色ハイライトかつ赤字』のような複合条件(AND)で絞れる。kind='comment'でコメントのみ、"
+            "kind='conditional_format'で条件付き書式のみ。値は決定論(推測なし)。",
+            _obj({"file": _STR, "fill": _STR, "font_color": _STR, "source": _STR, "kind": _STR},
+                 ["file"]),
+            lambda file, fill=None, font_color=None, source=None, kind=None:
+                _format_events.format_events(
+                    file, fill=fill, font_color=font_color, source=source, kind=kind,
+                    profile=profile),
         ))
     return tools
 
