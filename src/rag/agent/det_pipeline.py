@@ -79,6 +79,35 @@ def enabled() -> bool:
     return _env_flag("RAG_DET_PIPELINE_ROUTER", False)
 
 
+# Per-Wave sub-gates layered UNDER the master router (SOT-2618). The Wave B pipelines register the
+# same as A1〜A4, but SOT-2613's consolidated gold100 split their fates: B1 (document_extract) was a
+# local PASS (match 13→17 / wrong 2→1) while B2 (fact_lookup) regressed (match 18→16 / wrong 2→3), so
+# "Wave A + B" as a whole was rejected. These flags let B1 and B2 be turned on independently so the
+# adopted composition is **Wave A + B1** (B1 default ON, B2 default OFF) without dragging B2's
+# regression back in — while B2 stays recoverable (``RAG_DET_PIPELINE_B2=1``) for a future
+# re-measurement. A contract NOT listed here has no sub-gate and is always active when the router is on
+# (Wave A1〜A4 are unaffected). The master router flag still governs everything: with the router OFF the
+# whole layer is dormant and the serve path is byte-identical regardless of these values.
+_WAVE_FLAGS: "dict[str, tuple[str, bool]]" = {
+    "format_check": ("RAG_DET_PIPELINE_B1", True),    # Wave B1 (document_extract, SOT-2611) — default ON
+    "simple_lookup": ("RAG_DET_PIPELINE_B2", False),  # Wave B2 (fact_lookup, SOT-2612) — default OFF
+}
+
+
+def wave_enabled(contract: "str | None") -> bool:
+    """Whether ``contract``'s per-Wave sub-gate is on (independent of the master router).
+
+    Contracts without a sub-gate (everything except Wave B1/B2) return ``True`` — they are governed
+    solely by the master router. Wave B1/B2 read their own ``RAG_DET_PIPELINE_B1`` / ``…_B2`` flag
+    (defaults: B1 ON, B2 OFF), so the router-on default composition is **Wave A + B1**.
+    """
+    spec = _WAVE_FLAGS.get(contract or "")
+    if spec is None:
+        return True
+    key, default = spec
+    return _env_flag(key, default)
+
+
 def register(contract_type: str, pipeline: Pipeline, *, replace: bool = False) -> None:
     """Register the deterministic ``pipeline`` for a contract type (Wave A1〜B2 wiring).
 
@@ -120,6 +149,11 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
     if not (force or enabled()):
         return None
     if not contract:
+        return None
+    # Per-Wave sub-gate (SOT-2618): a Wave B1/B2 contract whose flag is off falls back to the LLM loop
+    # even with the master router on. ``force`` bypasses it so direct unit/integration tests exercise a
+    # pipeline's grounding regardless of the env flags (回答数を減らさない).
+    if not force and not wave_enabled(contract):
         return None
     _bootstrap_pipelines()
     pipeline = _REGISTRY.get(contract)
