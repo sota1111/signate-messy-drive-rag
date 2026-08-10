@@ -430,6 +430,7 @@ class Investigation:
     error: str | None = None
     contract: str | None = None  # SOT-2498 — routing contract this question was classified as (or None)
     calc_record: dict[str, Any] | None = None  # SOT-2506 — in-memory record for the execution gate
+    pot_lane: dict[str, Any] | None = None  # SOT-2586 — last verify_formula three-layer verdict (None ⇒ lane not exercised)
 
     @property
     def confidence(self) -> float:
@@ -450,6 +451,10 @@ class Investigation:
             "elapsed_s": round(self.elapsed_s, 3),
             "stop_reason": self.stop_reason,
             "error": self.error,
+            # SOT-2586 — thread the PoT forced-lane three-layer verdict into the details log ONLY when the
+            # lane was actually exercised. When it is None (lane OFF, or NUMERIC question that never called
+            # verify_formula) the key is omitted, so the champion/OFF ``.details.jsonl`` stays byte-identical.
+            **({"pot_lane": self.pot_lane} if self.pot_lane is not None else {}),
         }
 
 
@@ -1336,6 +1341,10 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     gantt_question = contract == "chart_read" and _question_contract.is_gantt_week_question(question)
     tool_outputs: list[Any] = []
     version_diff_result: Mapping[str, Any] | None = None
+    # SOT-2586 — retain the PoT forced-lane verdict so the three-layer diagnostics survive into
+    # ``.details.jsonl``. Prefer a COMMIT verdict (the one the answer actually rests on); otherwise keep
+    # the last verdict that carried candidates. Stays None when the lane is never exercised.
+    pot_lane_verdict: dict[str, Any] | None = None
     start = clock()
 
     # SOT-2521 — deterministic first move: run the routed first-move tool *before* the model's first
@@ -1783,6 +1792,15 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
             tool_outputs.append(out)
             if call.name == "version_diff" and isinstance(out, Mapping):
                 version_diff_result = out
+            # SOT-2586 — capture the forced-lane three-layer verdict for the details log. A COMMIT verdict
+            # (what the committed answer rests on) wins; else keep the latest verdict that carried candidates
+            # (error/empty tool results are ignored so the retained trace is always aggregatable).
+            if (call.name == _pot_lane.TOOL_NAME and isinstance(out, Mapping)
+                    and out.get("candidates")):
+                have_commit = (pot_lane_verdict is not None
+                               and pot_lane_verdict.get("status") == _pot_lane.COMMIT)
+                if out.get("status") == _pot_lane.COMMIT or not have_commit:
+                    pot_lane_verdict = dict(out)
             dispatched_tool = True
             if signals is not None:
                 # observe-only: fold the tool outcome into the abstain signals without touching `out`
@@ -1840,6 +1858,7 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
         question=question, answer=answer, iterations=iterations, tool_calls=tool_calls,
         usage=usage, model=model_name, elapsed_s=max(0.0, clock() - start),
         stop_reason=stop_reason, error=error, contract=contract,
+        pot_lane=pot_lane_verdict,  # SOT-2586 — persist the forced-lane verdict for details/diagnostics
     )
 
     # SOT-2492 — abstain ledger: purely post-decision. The answer above is already final; here we only
