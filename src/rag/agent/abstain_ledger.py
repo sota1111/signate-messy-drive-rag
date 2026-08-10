@@ -149,6 +149,11 @@ class AbstainSignals:
     # emitted into the record's signal block ONLY when nonzero so an OFF-default run stays byte-identical,
     # and lets the phase-0 diagnosis measure the guard's per-question capture rate.
     spin_pivots: int = 0
+    # SOT-2620 — how many over-cap search calls (file_grep/find_files) the investigator intercepted on this
+    # question via the 型別 search 上限 (RAG_SEARCH_CAP). Observer-only: it never changes the answer path;
+    # emitted into the record's signal block ONLY when nonzero so an OFF-default run stays byte-identical,
+    # and lets the phase-0 diagnosis measure how often the cap fired.
+    search_cap_hits: int = 0
     # SOT-2502 — obligation-driven re-search phase results (empty unless the research loop ran):
     research_trace: tuple[dict[str, Any], ...] = ()  # ordered targeted re-search rounds
     research_terminal: str = ""        # why re-search stopped: "budget" | "unanswerable" | "answered"
@@ -189,6 +194,9 @@ class AbstainSignals:
             # SOT-2614 — emitted ONLY when the strengthened spin guard actually fired (>0); omitted by
             # default so an OFF (RAG_SPIN_PIVOT unset) run's ledger stays byte-identical.
             **({"spin_pivots": self.spin_pivots} if self.spin_pivots else {}),
+            # SOT-2620 — emitted ONLY when the search 上限 actually intercepted a call (>0); omitted by
+            # default so an OFF (RAG_SEARCH_CAP unset) run's ledger stays byte-identical.
+            **({"search_cap_hits": self.search_cap_hits} if self.search_cap_hits else {}),
         }
 
 

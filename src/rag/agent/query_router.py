@@ -25,6 +25,7 @@ measurable offline (:func:`route_agreement`).
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
@@ -128,6 +129,68 @@ ROUTE_BUDGET: dict[str, BudgetContract] = {
     PIVOT: BudgetContract(retrieval_calls=1, fallback_calls=1, hard_compute=True),
     EXISTENCE: BudgetContract(retrieval_calls=1, fallback_calls=0, hard_compute=True),
 }
+
+# --------------------------------------------------------------------------- per-route search-call cap (SOT-2620)
+# The per-question cap on *search-style* tool calls (file_grep / find_files), keyed by route. Distinct
+# from :data:`ROUTE_BUDGET` (which grants free-exploration *turns* for missing slots): this bounds only
+# the repeated-search axis the phase-0 BUDGET_EXHAUSTED diagnosis flagged
+# (``docs/ai/budget32_trace_classification.md``: 70% of exhausted-question tool calls were search, ~10.6
+# file_grep/問). Total turns are unchanged — once the cap is hit the model still has its turn budget for
+# read_office / compute / registry / a verdict on evidence in hand, just not another reflexive re-grep.
+# Values are the diagnosis-derived initials; each is env-overridable (see :func:`search_cap_for_route`).
+ROUTE_SEARCH_CAP: dict[str, int] = {
+    LOOKUP: 4,          # LOOKUP/fact — a resolved doc + span rarely needs >4 searches
+    NUMERIC: 6,         # multi-operand derivation may legitimately locate several operands
+    ENUM: 6,            # enumeration scans a universe; a few more searches are legitimate
+    VERSION_DIFF: 3,    # the pair is registry-resolvable; grep beyond a few is spin
+    FORMAT: 3,          # a target cell/run is resolved, not searched repeatedly
+    PIVOT: 4,           # a pivot has its own deterministic lane
+    EXISTENCE: 6,       # exhaustive coverage is its point, but still bounded
+}
+
+# Per-route env override key: an int > 0 replaces the default cap for that route (invalid/≤0 ignored).
+_ROUTE_SEARCH_CAP_ENV: dict[str, str] = {
+    LOOKUP: "RAG_SEARCH_CAP_LOOKUP",
+    NUMERIC: "RAG_SEARCH_CAP_NUMERIC",
+    ENUM: "RAG_SEARCH_CAP_ENUM",
+    VERSION_DIFF: "RAG_SEARCH_CAP_DIFF",
+    FORMAT: "RAG_SEARCH_CAP_FORMAT",
+    PIVOT: "RAG_SEARCH_CAP_PIVOT",
+    EXISTENCE: "RAG_SEARCH_CAP_EXISTENCE",
+}
+
+
+def search_cap_for_route(route: str) -> int:
+    """The per-question search-call cap for ``route`` (SOT-2620), env-overridable.
+
+    Returns the diagnosis-derived default from :data:`ROUTE_SEARCH_CAP` (falling back to the LOOKUP cap
+    for an unknown route), unless the route's env key (``RAG_SEARCH_CAP_<ROUTE>``) holds a positive int,
+    which then wins. Pure except for the env read; injects no corpus fact.
+    """
+    default = ROUTE_SEARCH_CAP.get(route, ROUTE_SEARCH_CAP[LOOKUP])
+    env_key = _ROUTE_SEARCH_CAP_ENV.get(route)
+    if env_key:
+        raw = os.getenv(env_key)
+        if raw is not None and raw.strip():
+            try:
+                override = int(raw.strip())
+            except (TypeError, ValueError):
+                override = 0
+            if override > 0:
+                return override
+    return default
+
+
+def search_cap_for_contract(contract: str | None) -> int:
+    """The search-call cap for a 9-contract label (SOT-2620): folds ``contract`` → base route first.
+
+    Existence/pivot are *question-text* refinements that the contract label alone cannot express, so a
+    contract folds to its base route (LOOKUP/NUMERIC/ENUM/VERSION_DIFF/FORMAT) and that route's cap is
+    used. Convenience wrapper so the investigator can resolve the cap from the label it already carries.
+    """
+    base = _CONTRACT_ROUTE.get((contract or "").strip(), LOOKUP)
+    return search_cap_for_route(base)
+
 
 # --------------------------------------------------------------------------- EXISTENCE detection
 # A question asking *whether* something exists / is present / is stated (not its value).  Its answer is a
