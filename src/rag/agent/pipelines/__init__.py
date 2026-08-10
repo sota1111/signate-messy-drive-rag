@@ -14,4 +14,7 @@ from __future__ import annotations
 # Wave A1 — version_diff (SOT-2605). Importing the module runs its module-level ``register()``.
 from . import version_diff as version_diff  # noqa: F401
 
-__all__ = ["version_diff"]
+# Wave A2 — numeric / derived_calculation (SOT-2607). Importing the module runs its ``register()``.
+from . import numeric as numeric  # noqa: F401
+
+__all__ = ["version_diff", "numeric"]

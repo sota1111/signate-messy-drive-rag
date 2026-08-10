@@ -259,7 +259,8 @@ def test_wiring_formats_det_answer_none_form(monkeypatch):
     monkeypatch.setenv("RAG_DET_PIPELINE_ROUTER", "1")
     dp.register("numeric",
                 lambda q, *, profile=None: _contract.make("存在しません", engine="pandas",
-                                                          evidence={"file": "train.xlsx"}))
+                                                          evidence={"file": "train.xlsx"}),
+                replace=True)  # override the real Wave A2 pipeline for this wiring test
 
     def fake_factory(question, tools, *, model=None, system=None):
         raise AssertionError("LLM loop must not be entered when the router grounds an answer")
@@ -278,7 +279,8 @@ def test_wiring_blank_det_value_falls_back_to_loop(monkeypatch):
     monkeypatch.setenv("RAG_DET_PIPELINE_ROUTER", "1")
     dp.register("numeric",
                 lambda q, *, profile=None: _contract.make("   ", engine="pandas",
-                                                          evidence={"file": "train.xlsx"}))
+                                                          evidence={"file": "train.xlsx"}),
+                replace=True)  # override the real Wave A2 pipeline for this wiring test
 
     def fake_factory(question, tools, *, model=None, system=None):
         return _ScriptedModel([Step(
