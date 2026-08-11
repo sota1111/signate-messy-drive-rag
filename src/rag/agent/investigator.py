@@ -228,6 +228,18 @@ ENUM_SCAN = _bool_env("RAG_ENUM_SCAN", False)
 # mirror used by tests; the actual gate reads ``RAG_DET_PIPELINE_ROUTER`` at call time.
 DET_PIPELINE_ROUTER = _bool_env("RAG_DET_PIPELINE_ROUTER", False)
 
+# SOT-2632 (G2, PLAN SOT-2602) — whether :func:`answer_question` appends the G2 lookup/derived procedure
+# HINTS (:mod:`src.rag.agent.g2_lookup_port`) for the five Sonnet-reachable questions the flash champion
+# abstained on (idx 5/53/96/36/79). When on, a question matching one of the G2 archetypes gets an advisory
+# procedure directive appended to the generation preamble (which document / which extra hop / route the
+# arithmetic through the PoT lane); a companion tool-gap fix lets ``compute`` open a decrypted in-memory
+# xlsx. **Default OFF so the production answer path stays byte-identical** (mirroring RAG_EVIDENCE_PACKET /
+# RAG_CONDITION_PREIR): the directive nudges the model's trajectory, so it ships dormant and its net
+# gold-100 effect is measured by the focused gate / SOT-2636 integration before any default flip. Injects
+# no corpus fact and no answer — procedure guidance only. Reads ``RAG_G2_LOOKUP_PORT`` fresh via
+# :func:`g2_lookup_port.enabled` at call time; this constant is the module-level mirror used by tests.
+G2_LOOKUP_PORT = _bool_env("RAG_G2_LOOKUP_PORT", False)
+
 # SOT-2614 — consecutive same-tool spin pivot guard (サイクル2: BUDGET_EXHAUSTED 32件回収). Phase-0 diagnosis
 # (``docs/ai/budget32_trace_classification.md``) found 23/32 budget abstains carry a ≥5-long run of the
 # SAME tool with *tweaked* arguments (idx99 file_grep×16, idx76 17/18 turns search, extraction ゼロ; compute
@@ -2675,6 +2687,20 @@ def answer_question(question: str, *, model: str | None = None,
                     preamble = f"{preamble}\n\n{_enum_scan.enum_lane_directive(question)}"
             except Exception:  # noqa: BLE001 — packet is additive; never break the answer path
                 preamble = None
+        # SOT-2632 (G2, PLAN SOT-2602) — port Sonnet's lookup/derived procedures via advisory HINTS,
+        # appended to the generation preamble independently of the Evidence Packet (so the port can be
+        # A/B'd on its own). Gated by RAG_G2_LOOKUP_PORT; default OFF ⇒ preamble untouched (byte-identical).
+        # Fail-open: any build error leaves the preamble as-is. Injects no corpus fact / no answer — the
+        # directive is procedure guidance only, and the SOT-2629-style telemetry records whether it fired.
+        if G2_LOOKUP_PORT:
+            try:
+                from src.rag.agent import g2_lookup_port as _g2_lookup_port
+                _g2_directive, _g2_tel = _g2_lookup_port.port_directive(question, contract=contract)
+                if _g2_directive:
+                    preamble = f"{preamble}\n\n{_g2_directive}" if preamble else _g2_directive
+                packet_interventions["g2_lookup_port"] = _g2_tel
+            except Exception:  # noqa: BLE001 — the hint is additive; never break the answer path
+                pass
         # SOT-2521 — the loop-side deterministic first move (see investigate ``first_move``). Reuses the
         # same first-tool decision as the prompt hint so they can never disagree. Gated OFF by default
         # (``FIRST_MOVE_ROUTING``): the always-on variant regressed gold-100, so the wiring stays dormant

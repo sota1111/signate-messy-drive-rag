@@ -23,6 +23,8 @@ from __future__ import annotations
 import ast
 import math
 from dataclasses import dataclass
+import io
+import os
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -35,6 +37,39 @@ from src.rag.corpus import FileRef, nfc, walk
 
 class ComputeError(ValueError):
     """Raised when a file cannot be resolved/read or an expression is rejected."""
+
+
+_ON = {"1", "true", "yes", "on"}
+
+
+def _g2_decrypt_enabled() -> bool:
+    """SOT-2632 (G2 tool-gap) — whether ``compute`` transparently decrypts an encrypted xlsx in memory.
+
+    Gated by ``RAG_G2_LOOKUP_PORT`` (default OFF ⇒ ``compute`` opens the raw path exactly as before, so
+    the serve path is byte-identical). The idx79 dossier blocker was that ``compute`` handed an *encrypted*
+    Office file straight to ``openpyxl`` and got ``BadZipFile`` (the encrypted OLE container is not a zip),
+    while ``read_office`` decrypts first — so a per-assignee aggregate could never be computed. When on,
+    ``compute`` reuses the same passwords helper to decrypt to an in-memory buffer before loading.
+    """
+    return os.getenv("RAG_G2_LOOKUP_PORT", "0").strip().lower() in _ON
+
+
+def _decrypted_xlsx_source(ref: FileRef) -> "io.BytesIO | None":
+    """Return an in-memory decrypted xlsx buffer for ``ref`` when the G2 fix is on and the file is
+    encrypted; otherwise ``None`` (⇒ the caller opens the raw path unchanged). Fail-open: any decryption
+    error returns ``None`` so ``compute`` degrades to its prior BadZipFile behaviour rather than raising a
+    new error type on the answer path."""
+    if not _g2_decrypt_enabled():
+        return None
+    try:
+        from src.rag.extract import passwords as _passwords
+
+        if not _passwords.is_encrypted(ref.path):
+            return None
+        data = _passwords.resolve(ref)  # decrypted bytes | None (tries cached/derived passwords)
+    except Exception:  # noqa: BLE001 — decryption is best-effort; never introduce a new failure mode
+        return None
+    return io.BytesIO(data) if data else None
 
 
 # ---- allowed API (the only names an expression may reference) ----
@@ -170,8 +205,12 @@ def _pick_sheet(wb, sheet: int | str | None):
     return best or wb.active
 
 
-def _read_xlsx(path: Path, sheet: int | str | None) -> tuple[pd.DataFrame, str, dict[str, Any]]:
-    wb = load_workbook(path, data_only=True, read_only=True)
+def _read_xlsx(source: "Path | io.BytesIO", sheet: int | str | None,
+               *, display_name: str | None = None) -> tuple[pd.DataFrame, str, dict[str, Any]]:
+    # ``source`` is either a filesystem path (the default, unchanged path) or an in-memory decrypted
+    # buffer (SOT-2632 G2 tool-gap fix). ``openpyxl.load_workbook`` accepts both a path and a file-like.
+    name = display_name or getattr(source, "name", None) or "<workbook>"
+    wb = load_workbook(source, data_only=True, read_only=True)
     try:
         ws = _pick_sheet(wb, sheet)
         title = str(ws.title)
@@ -184,7 +223,7 @@ def _read_xlsx(path: Path, sheet: int | str | None) -> tuple[pd.DataFrame, str, 
         rows.pop(0)
         dropped_leading += 1
     if not rows:
-        raise ComputeError(f"sheet {title!r} in {path.name} has no data")
+        raise ComputeError(f"sheet {title!r} in {name} has no data")
     header = rows[0]
     width = max((i + 1 for i, c in enumerate(header) if c is not None), default=len(header))
     columns = [nfc(str(c)) if c is not None else f"col_{i}" for i, c in enumerate(header[:width])]
@@ -230,6 +269,12 @@ def _read_frame(ref: FileRef, sheet: int | str | None) -> tuple[pd.DataFrame, st
     if ext == "csv":
         df = pd.read_csv(ref.path)
         return df, None, _norm_trace(df, [], excluded_rows=0, extra_rules=[])
+    # SOT-2632 (G2 tool-gap): when RAG_G2_LOOKUP_PORT is on and the workbook is encrypted, open the
+    # decrypted in-memory buffer instead of the raw path (which openpyxl rejects with BadZipFile). OFF or
+    # non-encrypted ⇒ the unchanged path-open, so the serve path is byte-identical.
+    decrypted = _decrypted_xlsx_source(ref)
+    if decrypted is not None:
+        return _read_xlsx(decrypted, sheet, display_name=ref.name or str(ref.path))
     return _read_xlsx(Path(ref.path), sheet)
 
 
