@@ -183,12 +183,24 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def _mcp_config(tool_log: str, max_tool_calls: int) -> dict[str, Any]:
-    """Build a --mcp-config dict launching the SOT-2626 stdio server with per-question budget/log env."""
+def _mcp_config(tool_log: str, max_tool_calls: int,
+                question: str = "", contract: str | None = None,
+                commit_gate_log: str | None = None) -> dict[str, Any]:
+    """Build a --mcp-config dict launching the SOT-2626 stdio server with per-question budget/log env.
+
+    SOT-2640: the question/contract are forwarded so the server-side commit gate (submit_answer execution
+    point) has the commit context. They are inert unless RAG_COMMIT_GATE is set in the ambient env, which
+    the launched server process inherits (the CLI merges this ``env`` over the parent environment)."""
     launcher = str(_repo_root() / "scripts" / "mcp_investigator_server.sh")
     env = {"RAG_MCP_TOOL_LOG": tool_log}
     if max_tool_calls and max_tool_calls > 0:
         env["RAG_MCP_MAX_TOOL_CALLS"] = str(int(max_tool_calls))
+    if question:
+        env["RAG_MCP_QUESTION"] = question
+    if contract:
+        env["RAG_MCP_CONTRACT"] = str(contract)
+    if commit_gate_log:
+        env["RAG_MCP_COMMIT_GATE_LOG"] = commit_gate_log
     return {"mcpServers": {MCP_SERVER_NAME: {"command": "bash", "args": [launcher], "env": env}}}
 
 
@@ -331,6 +343,24 @@ def _abstain_investigation(question: str, *, model: str, elapsed_s: float, stop_
     )
 
 
+def _load_commit_gate_log(path: str) -> list[dict[str, Any]]:
+    """Read the server-side decision stream. A missing/truncated telemetry file is non-fatal."""
+    out: list[dict[str, Any]] = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                decision = rec.get("commit_gate") if isinstance(rec, Mapping) else None
+                if isinstance(decision, Mapping):
+                    out.append(dict(decision))
+    except OSError:
+        pass
+    return out
+
+
 def investigate_question(question: str, *, tools: Sequence[AgentTool],
                          system: str | None = None, contract: str | None = None,
                          preamble: str | None = None,
@@ -371,15 +401,20 @@ def investigate_question(question: str, *, tools: Sequence[AgentTool],
     tmp = tempfile.NamedTemporaryFile("w", suffix=".mcp.json", delete=False, encoding="utf-8")
     log_fd, log_path = tempfile.mkstemp(suffix=".mcp_tool_calls.jsonl")
     os.close(log_fd)
+    gate_fd, gate_log_path = tempfile.mkstemp(suffix=".mcp_commit_gate.jsonl")
+    os.close(gate_fd)
     try:
-        json.dump(_mcp_config(log_path, max_turns), tmp, ensure_ascii=False)
+        json.dump(_mcp_config(log_path, max_turns, question=question, contract=contract,
+                              commit_gate_log=gate_log_path),
+                  tmp, ensure_ascii=False)
         tmp.flush()
         tmp.close()
         stdout, stderr, rc, timed_out = _run_claude(
             user_prompt, system=sys_prompt, model=mdl, cfg_path=tmp.name,
             allowed=allowed, timeout=timeout_s)
+        gate_decisions = _load_commit_gate_log(gate_log_path)
     finally:
-        for p in (tmp.name, log_path):
+        for p in (tmp.name, log_path, gate_log_path):
             try:
                 os.unlink(p)
             except OSError:
@@ -413,8 +448,25 @@ def investigate_question(question: str, *, tools: Sequence[AgentTool],
             error=f"claude -p exited {rc}: {(stderr or stdout)[:400]}", contract=contract,
             tool_calls=tool_calls, iterations=iterations, usage=usage)
     else:
+        gate_tel: dict[str, Any] | None = None
         if parsed["submit_args"] is not None:
             answer = _answer_from_args(parsed["submit_args"])
+            if gate_decisions:
+                from src.rag.agent import commit_gate as _commit_gate
+                last = gate_decisions[-1]
+                gate_tel = dict(last.get("telemetry") or {})
+                # The server is the submit execution point. Honor its formatted/abstained terminal value;
+                # a trailing REJECT means Claude ended without a successful re-submit and must fail closed.
+                if _commit_gate.enforce():
+                    verdict = str(last.get("verdict") or "")
+                    if verdict in {"COMMIT", "ABSTAIN"}:
+                        final = str(last.get("final_answer") or ABSTAIN)
+                    else:
+                        final = ABSTAIN
+                    answer = Answer(answer=final,
+                                    confidence=(answer.confidence if verdict == "COMMIT" else 0.0),
+                                    evidence=answer.evidence,
+                                    method=f"claude-mcp: commit_gate {verdict or 'REJECT'}")
             stop_reason = "answered"
         elif parsed["final_text"]:
             # Plain final-text answer with no submit_answer call — accepted at confidence 0.0, mirroring
@@ -423,6 +475,18 @@ def investigate_question(question: str, *, tools: Sequence[AgentTool],
                             method="claude-mcp: plain final text (no submit_answer)")
             if is_abstain(answer.answer):
                 answer = Answer(answer=ABSTAIN, confidence=0.0, evidence="", method=answer.method)
+            # A final text bypasses submit_answer, so no in-band retry is possible. Apply the same gate
+            # once client-side and fail closed on REJECT, as required by SOT-2640.
+            from src.rag.agent import commit_gate as _commit_gate
+            if _commit_gate.enabled():
+                decision = _commit_gate.evaluate(question, contract, answer.answer)
+                gate_tel = decision.telemetry
+                if _commit_gate.enforce():
+                    final = (decision.final_answer if decision.verdict == _commit_gate.COMMIT else ABSTAIN)
+                    answer = Answer(answer=final,
+                                    confidence=(answer.confidence if decision.verdict == _commit_gate.COMMIT else 0.0),
+                                    evidence=answer.evidence,
+                                    method=f"claude-mcp: plain final commit_gate {decision.verdict}")
             stop_reason = "answered"
         else:
             answer = Answer(answer=ABSTAIN, confidence=0.0, evidence="",
@@ -432,6 +496,8 @@ def investigate_question(question: str, *, tools: Sequence[AgentTool],
             question=question, answer=answer, iterations=iterations, tool_calls=tool_calls,
             usage=usage, model=model_label, elapsed_s=elapsed, stop_reason=stop_reason,
             error=None, contract=contract)
+        if gate_tel is not None:
+            inv.interventions["commit_gate"] = gate_tel
 
     if resume is not None and inv.stop_reason != "usage_limit":
         _append_resume(resume, key, question, inv)

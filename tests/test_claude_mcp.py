@@ -169,3 +169,71 @@ def test_missing_claude_binary_returns_model_error(monkeypatch, tmp_path):
     assert out.stop_reason == "model_error"
     assert out.answer.answer == inv.ABSTAIN
     assert "not on PATH" in (out.error or "")
+
+
+def test_plain_final_text_commit_gate_rejects_to_abstain(monkeypatch):
+    monkeypatch.setenv("RAG_CLAUDE_MCP_RESUME", "0")
+    monkeypatch.setenv("RAG_COMMIT_GATE", "1")
+    monkeypatch.setenv("RAG_COMMIT_GATE_ENFORCE", "1")
+    monkeypatch.setattr(claude_mcp.shutil, "which", lambda _b: "/usr/bin/claude")
+    stdout = _stream({"type": "result", "subtype": "success", "is_error": False,
+                      "result": "42件"})
+    monkeypatch.setattr(claude_mcp, "_run_claude", lambda *a, **k: (stdout, "", 0, False))
+    out = claude_mcp.investigate_question(
+        "合計は何件ですか?", tools=build_tools(CorpusProfile()), contract="numeric")
+    assert out.answer.answer == inv.ABSTAIN
+    assert out.interventions["commit_gate"]["verdict"] == "REJECT"
+
+
+def test_submit_honors_server_commit_gate_decision(monkeypatch, tmp_path):
+    monkeypatch.setenv("RAG_CLAUDE_MCP_RESUME", "0")
+    monkeypatch.setenv("RAG_COMMIT_GATE", "1")
+    monkeypatch.setenv("RAG_COMMIT_GATE_ENFORCE", "1")
+    monkeypatch.setattr(claude_mcp.shutil, "which", lambda _b: "/usr/bin/claude")
+    stdout = _stream({"type": "assistant", "message": {"content": [{
+        "type": "tool_use", "name": "mcp__investigator__submit_answer",
+        "input": {"answer": "42件", "confidence": 0.9}}]}},
+        {"type": "result", "subtype": "success", "is_error": False, "result": "done"})
+
+    def fake_run(*args, **kwargs):
+        cfg = json.loads(open(kwargs["cfg_path"], encoding="utf-8").read())
+        path = cfg["mcpServers"]["investigator"]["env"]["RAG_MCP_COMMIT_GATE_LOG"]
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"commit_gate": {
+                "verdict": "ABSTAIN", "final_answer": inv.ABSTAIN,
+                "reasons": ["reject_streak_abstain"],
+                "telemetry": {"enabled": True, "verdict": "ABSTAIN"}}}) + "\n")
+        return stdout, "", 0, False
+
+    monkeypatch.setattr(claude_mcp, "_run_claude", fake_run)
+    out = claude_mcp.investigate_question(
+        "合計は何件ですか?", tools=build_tools(CorpusProfile()), contract="numeric")
+    assert out.answer.answer == inv.ABSTAIN
+    assert out.answer.confidence == 0.0
+    assert out.interventions["commit_gate"]["verdict"] == "ABSTAIN"
+
+
+def test_observational_gate_records_telemetry_without_changing_submit(monkeypatch):
+    monkeypatch.setenv("RAG_CLAUDE_MCP_RESUME", "0")
+    monkeypatch.setenv("RAG_COMMIT_GATE", "1")
+    monkeypatch.delenv("RAG_COMMIT_GATE_ENFORCE", raising=False)
+    monkeypatch.setattr(claude_mcp.shutil, "which", lambda _b: "/usr/bin/claude")
+    stdout = _stream({"type": "assistant", "message": {"content": [{
+        "type": "tool_use", "name": "mcp__investigator__submit_answer",
+        "input": {"answer": "42件", "confidence": 0.9}}]}},
+        {"type": "result", "subtype": "success", "is_error": False, "result": "done"})
+
+    def fake_run(*args, **kwargs):
+        cfg = json.loads(open(kwargs["cfg_path"], encoding="utf-8").read())
+        path = cfg["mcpServers"]["investigator"]["env"]["RAG_MCP_COMMIT_GATE_LOG"]
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"commit_gate": {
+                "verdict": "REJECT", "final_answer": "42件", "reasons": ["ungrounded"],
+                "telemetry": {"enabled": True, "verdict": "REJECT"}}}) + "\n")
+        return stdout, "", 0, False
+
+    monkeypatch.setattr(claude_mcp, "_run_claude", fake_run)
+    out = claude_mcp.investigate_question(
+        "合計は何件ですか?", tools=build_tools(CorpusProfile()), contract="numeric")
+    assert out.answer.answer == "42件"
+    assert out.interventions["commit_gate"]["verdict"] == "REJECT"

@@ -128,3 +128,52 @@ def test_serve_stdio_roundtrip():
     # two requests → two responses; the notification produced none.
     assert [r["id"] for r in out_lines] == [1, 2]
     assert out_lines[1]["result"]["tools"]
+
+
+def test_commit_gate_rejects_then_abstains_in_band(monkeypatch):
+    monkeypatch.setenv("RAG_COMMIT_GATE", "1")
+    monkeypatch.setenv("RAG_COMMIT_GATE_ENFORCE", "1")
+    server = mcp_server.build_server(CorpusProfile(), log_path=None,
+                                     question="合計は何件ですか?", contract="numeric")
+    first = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": "submit_answer", "arguments": {"answer": "42件"}}})
+    text = first["result"]["content"][0]["text"]
+    assert "commit_gate が回答を却下" in text
+    assert server._commit_gate_rejects == 1
+
+    second = server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                            "params": {"name": "submit_answer", "arguments": {"answer": "42件"}}})
+    payload = json.loads(second["result"]["content"][0]["text"])
+    assert payload["submitted"] is True
+    assert payload["commit_gate"]["verdict"] == "ABSTAIN"
+    assert payload["commit_gate"]["final_answer"] == "わかりません"
+
+
+def test_commit_gate_off_submit_response_is_unchanged(monkeypatch):
+    monkeypatch.delenv("RAG_COMMIT_GATE", raising=False)
+    server = mcp_server.build_server(CorpusProfile(), log_path=None,
+                                     question="合計は何件ですか?", contract="numeric")
+    response = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                              "params": {"name": "submit_answer", "arguments": {"answer": "42件"}}})
+    assert json.loads(response["result"]["content"][0]["text"]) == {"submitted": True}
+    assert server._commit_gate_rejects == 0
+
+
+def test_commit_gate_accepts_numeric_value_grounded_by_compute(monkeypatch):
+    monkeypatch.setenv("RAG_COMMIT_GATE", "1")
+    monkeypatch.setenv("RAG_COMMIT_GATE_ENFORCE", "1")
+    tools = [
+        AgentTool("compute", "compute", {"type": "object", "properties": {}},
+                  lambda **_kwargs: {"value": 42}),
+        AgentTool("submit_answer", "submit", {"type": "object", "properties": {}},
+                  lambda **_kwargs: {"submitted": True}),
+    ]
+    server = mcp_server.InvestigatorMCPServer(
+        tools, question="合計は何件ですか?", contract="numeric")
+    server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "compute", "arguments": {}}})
+    response = server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                              "params": {"name": "submit_answer", "arguments": {"answer": "42件"}}})
+    payload = json.loads(response["result"]["content"][0]["text"])
+    assert payload["commit_gate"]["verdict"] == "COMMIT"
+    assert payload["commit_gate"]["final_answer"] == "42件"

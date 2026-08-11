@@ -54,6 +54,19 @@ def enabled() -> bool:
     return os.getenv("RAG_COMMIT_GATE", "0").strip().lower() in _ON
 
 
+def enforce() -> bool:
+    """Whether the gate's verdict is ENFORCED on the served answer — ``RAG_COMMIT_GATE_ENFORCE`` (default
+    OFF). Single source of truth for the enforcement flag shared by every wiring point.
+
+    SOT-2639's Gemini wiring is equivalence-preserving: with ``RAG_COMMIT_GATE=1`` alone the gate's
+    decision + telemetry are recorded but the loop's own inline guards stay authoritative (the committed
+    answer is served VERBATIM). SOT-2640 turns this ON for the guard-LESS ``claude-mcp`` backend, whose
+    ``submit_answer`` would otherwise commit its raw value unchecked: enforcement makes REJECT feed an
+    in-band retry and, after :func:`abstain_after` consecutive rejects, degrade to ABSTAIN.
+    """
+    return os.getenv("RAG_COMMIT_GATE_ENFORCE", "0").strip().lower() in _ON
+
+
 def abstain_after() -> int:
     """Consecutive-REJECT count that trips the 棄権降格 (``RAG_COMMIT_GATE_ABSTAIN_AFTER``, default 2).
 
