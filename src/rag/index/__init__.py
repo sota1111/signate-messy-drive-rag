@@ -231,6 +231,27 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  id master skipped: {type(e).__name__}: {e}")
 
+    # Derived-metrics store (SOT-2645 / 事前計算事実層 3/5): precompute standard derived quantities for
+    # every 案件 × 全数値列 (column stats / percentiles / correlations / histograms / ratios / OLS
+    # predictions / F1 threshold sweep) with independent dual verification (fail-closed), so
+    # derived_calculation questions (idx50/57/63 …) reduce to an O(1) lookup instead of the run-time
+    # compute guess-and-check that exhausts the turn budget (idx57: 8連発). Question-independent &
+    # LLM-free. Additive and fully guarded — a failure here can never corrupt the retrieval index, and
+    # runtime consultation is opt-in (RAG_DERIVED_METRICS) so the champion serve path is byte-identical.
+    try:
+        from src.rag.index import derived_metrics
+        dm = derived_metrics.build(refs)
+        if verbose:
+            cov = dm["report"]["coverage"]
+            vs = dm["report"]["verification_summary"]
+            print(f"  derived metrics: {dm['cases']} cases "
+                  f"(model={cov['cases_with_model']}, sweep={cov['cases_with_threshold_sweep']}, "
+                  f"mismatches_dropped={vs['mismatches_dropped']}/{vs['metrics_computed']}) "
+                  f"-> {derived_metrics.default_out_path()}")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  derived metrics skipped: {type(e).__name__}: {e}")
+
     if verbose:
         print(f"embedding {len(chunks)} chunks...")
     texts = [c.text for c in chunks]
