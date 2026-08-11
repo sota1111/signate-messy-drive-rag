@@ -492,12 +492,26 @@ def investigate_question(question: str, *, tools: Sequence[AgentTool],
             answer = Answer(answer=ABSTAIN, confidence=0.0, evidence="",
                             method="claude-mcp: no answer emitted")
             stop_reason = "max_turns"
+        # SOT-2650 — 値を変えない括弧内付加情報の書式契約 (RAG_FORMAT_STRIP_PAREN, default OFF). Applied at
+        # the backend boundary so it covers both the submit_answer and plain-final-text commits even when
+        # the commit gate itself is off (the cycle2 dev lever set runs gate-less).
+        strip_tel: dict[str, Any] | None = None
+        if stop_reason == "answered" and not is_abstain(answer.answer):
+            from src.rag.agent import formatting as _fmt
+            if _fmt.strip_paren_enabled():
+                stripped, fired = _fmt.strip_trailing_parenthetical(question, answer.answer)
+                strip_tel = {"applied": bool(fired), "rules": fired}
+                if fired:
+                    answer = Answer(answer=stripped, confidence=answer.confidence,
+                                    evidence=answer.evidence, method=answer.method + " +paren_strip")
         inv = Investigation(
             question=question, answer=answer, iterations=iterations, tool_calls=tool_calls,
             usage=usage, model=model_label, elapsed_s=elapsed, stop_reason=stop_reason,
             error=None, contract=contract)
         if gate_tel is not None:
             inv.interventions["commit_gate"] = gate_tel
+        if strip_tel is not None:
+            inv.interventions["format_strip_paren"] = strip_tel
 
     if resume is not None and inv.stop_reason != "usage_limit":
         _append_resume(resume, key, question, inv)

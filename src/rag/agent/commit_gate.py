@@ -228,18 +228,28 @@ def _apply_formatting(question: str, route: str, submitted: str,
                       naturalizer: Any) -> tuple[str, dict[str, Any]]:
     """Apply the Stage3 書式契約 to the committed value (value-preserving). Best-effort: never破壊commit."""
     tel: dict[str, Any] = {"applied": False}
+    result = submitted
     try:
         contract = {"value": submitted, "evidence": dict(evidence or {}), "method": {}}
         out = _formatting.format_contract(contract, question, contract_type=(route or None),
                                           naturalizer=naturalizer, force=True)
         if out is not None and not _formatting._is_blank(out.get("value")):
-            formatted = str(out["value"])
-            tel = {"applied": formatted != submitted,
+            result = str(out["value"])
+            tel = {"applied": result != submitted,
                    "rules": list((out.get("method") or {}).get("formatting", {}).get("rules", []))}
-            return formatted, tel
     except Exception:  # noqa: BLE001 — formatting is polish; a failure must never drop the commit
         tel = {"applied": False, "error": True}
-    return submitted, tel
+    try:
+        # SOT-2650 — 括弧内付加情報 strip (RAG_FORMAT_STRIP_PAREN, default OFF), value-preserving.
+        if _formatting.strip_paren_enabled():
+            stripped, fired = _formatting.strip_trailing_parenthetical(question, result)
+            if fired:
+                result = stripped
+                tel["applied"] = True
+                tel["rules"] = list(tel.get("rules", [])) + fired
+    except Exception:  # noqa: BLE001
+        pass
+    return result, tel
 
 
 # --------------------------------------------------------------------------- the gate
