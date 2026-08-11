@@ -337,13 +337,31 @@ PRICING: dict[str, tuple[float, float]] = {
     "gemini-2.5-flash-lite": (0.10, 0.40),
 }
 
-SYSTEM_PROMPT = (
+# SOT-2641 — model-neutral SYSTEM_PROMPT. The shared prompt was calibrated against flash's
+# over-abstention ("安易に棄権しない"/"諦めず必ず再試行"/"棄権しない" repeated as brakes-off drivers).
+# Those drivers work as a brake-release for a conservative flash backend, but over-drive an obedient,
+# strong Sonnet into aggressive commits (dev gold100 abstain −20 / wrong +21 = the prompt behaving as
+# instructed). cycle4 principle: the prompt is a MODEL-NEUTRAL role declaration ("explore aggressively;
+# submission is verified by the deterministic commit_gate, SOT-2637..2640") and commit admissibility is
+# owned by the gate, not by prompt exhortation. The variant is gated by ``RAG_NEUTRAL_PROMPT``
+# (default OFF ⇒ byte-identical legacy wording, sha256-verified). Only the abstain/aggressiveness
+# drivers (items 3, 4-tail, 7) change; the TOOL-DISCIPLINE block (4b/5/5b/6a/6b/6c/6 — compute必須 /
+# read_chart_values必須 / caption_image数値採用禁止 等) is model-independent correct discipline and is
+# SHARED verbatim between both variants so it can never drift between them.
+NEUTRAL_PROMPT = _bool_env("RAG_NEUTRAL_PROMPT", False)
+
+# Intro + items 1-2 (shared, unchanged).
+_PROMPT_HEAD = (
     "あなたは社内ドライブの文書QAを行う調査エージェントです。与えられた汎用ツールだけを使って質問に答えます。\n"
     "厳守事項:\n"
     "1. 暗算・記憶・創作で答えない。必ずツールで根拠となる値を取得してから答える。\n"
     "2. パスワード・略称・書式規則などのコーパス固有事実は与えられていない。ツール(ファイル探索/grep/"
     "Office抽出/復号/pandas計算/チャート読取/画像説明)で自力発見する。暗号化ファイルは復号ツールが"
     "ファイル名等から鍵を推定して復号する。\n"
+)
+
+# Items 3-4 — exploration/abstain drivers (the ONLY model-tuned wording; variant).
+_PROMPT_EXPLORE_LEGACY = (
     "3. まず関連ファイルを探索し、必要なツールを反復呼び出しして値を確定する。ツールがエラー/空を返しても"
     "諦めず、原因(列名違い・ファイル違い・値表記違い)を切り分けて別のファイルや式で必ず再試行する。安易に"
     "棄権しない。\n"
@@ -352,6 +370,20 @@ SYSTEM_PROMPT = (
     "特定する。曖昧エラーが返ったら、そのエラーが挙げる『存在プロジェクト』から該当案件を選んで project を"
     "付けて再試行する(棄権しない)。列名や絞り込み値が不明なときは、まず `df.columns.tolist()` や"
     "`df['列'].unique().tolist()` を compute で確認してから集計式を組む。\n"
+)
+_PROMPT_EXPLORE_NEUTRAL = (
+    "3. まず関連ファイルを探索し、必要なツールを反復呼び出しして値を確定する。ツールがエラー/空を返したら、"
+    "原因(列名違い・ファイル違い・値表記違い)を切り分け、手段(別ファイル・別の式・別ツール)を替えて証拠に"
+    "到達するまで探索する。\n"
+    "4. 数値計算(平均・合計・件数など)は必ず compute ツールで行う。train.xlsx/train.csv 等は案件ごとに"
+    "同名で複数存在するので、質問が指す案件名を compute の project 引数(会社名の一部)で渡してファイルを"
+    "特定する。曖昧エラーが返ったら、そのエラーが挙げる『存在プロジェクト』から該当案件を選んで project を"
+    "付けて再試行する。列名や絞り込み値が不明なときは、まず `df.columns.tolist()` や"
+    "`df['列'].unique().tolist()` を compute で確認してから集計式を組む。\n"
+)
+
+# Items 4b-6 — tool discipline (model-independent; SHARED verbatim between both variants).
+_PROMPT_TOOLS = (
     "4b. 案件名+データ資産(train.xlsx/train.csv・分析コード/modeling.py・notebook/EDA・leaderboard・"
     "スケジュール等)を指すデータ/計算系の質問で、grep/検索で根拠ファイルが見つからないときは canonical_route "
     "ツールに質問文をそのまま渡す。用語集で案件を特定し canonical ファイルを直行解決して返すので(chunk検索を"
@@ -385,8 +417,26 @@ SYSTEM_PROMPT = (
     "6. 十分な根拠が得られたら、最終回答は必ず submit_answer ツールを1回だけ呼んで返す(通常のテキストでは"
     "答えない)。submit_answer には次を渡す: answer=回答本文(値/一覧のみ、列挙は「、」区切り、金額は原文表記)、"
     "confidence=0.0〜1.0の自己確信度、evidence=根拠(参照ファイル・値・ツール結果)、method=導出手順の要約。\n"
+)
+
+# Item 7 — commit/abstain policy (variant). Legacy = abstain-only-as-last-resort driver; neutral =
+# gate-delegated commit ("提出は commit_gate が検証する; 拒否されたら検算・修正して再提出; 証拠が確定
+# できなければ「わかりません」"), Incorrect=−1 < Missing=0.
+_PROMPT_COMMIT_LEGACY = (
     f"7. あらゆる手段を尽くしても根拠が得られない場合に限り answer=「{ABSTAIN}」・confidence=0.0 で submit_answer"
     "する。"
+)
+_PROMPT_COMMIT_NEUTRAL = (
+    "7. 提出(submit_answer)は決定論の commit_gate が検証する。ゲートに拒否されたら、その理由に従って"
+    "検算・修正し、正しい値に直して再提出する。手段を替えて探索してもなお証拠が確定できない場合に限り "
+    f"answer=「{ABSTAIN}」・confidence=0.0 で submit_answer する(Incorrect=−1 < Missing=0)。"
+)
+
+SYSTEM_PROMPT = (
+    _PROMPT_HEAD
+    + (_PROMPT_EXPLORE_NEUTRAL if NEUTRAL_PROMPT else _PROMPT_EXPLORE_LEGACY)
+    + _PROMPT_TOOLS
+    + (_PROMPT_COMMIT_NEUTRAL if NEUTRAL_PROMPT else _PROMPT_COMMIT_LEGACY)
 )
 
 
