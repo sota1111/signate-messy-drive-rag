@@ -36,7 +36,7 @@ import sys
 import time
 from typing import Any, Mapping, Sequence
 
-from src.rag.agent.investigator import AgentTool, build_tools, dispatch
+from src.rag.agent.investigator import SUBMIT_ANSWER, AgentTool, build_tools, dispatch
 from src.rag.tools.profile import CorpusProfile
 
 SERVER_NAME = "signate-investigator"
@@ -117,10 +117,16 @@ class InvestigatorMCPServer:
     notification). Kept transport-free so it is directly unit-testable without spawning a process.
     """
 
-    def __init__(self, tools: Sequence[AgentTool], logger: ToolCallLogger | None = None) -> None:
+    def __init__(self, tools: Sequence[AgentTool], logger: ToolCallLogger | None = None,
+                 max_tool_calls: int = 0) -> None:
         self.tools = list(tools)
         self.by_name = {t.name: t for t in self.tools}
         self.logger = logger or ToolCallLogger(None)
+        # SOT-2627 — optional per-session budget: cap the number of *non-terminal* tool calls so the
+        # flat-rate claude-mcp loop cannot spin unbounded (``claude`` has no --max-turns). 0 ⇒ disabled
+        # (default), so the SOT-2626 MCP behaviour is byte-identical unless a budget is explicitly set.
+        self.max_tool_calls = max(0, int(max_tool_calls or 0))
+        self._non_terminal_calls = 0
 
     # -- request handlers ---------------------------------------------------
     def _on_initialize(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -141,8 +147,20 @@ class InvestigatorMCPServer:
             raise _RpcError(_INVALID_PARAMS, "tools/call requires a string 'name'")
         if not isinstance(args, Mapping):
             raise _RpcError(_INVALID_PARAMS, "tools/call 'arguments' must be an object")
+        # SOT-2627 — budget gate: once the non-terminal tool-call cap is reached, decline further
+        # exploratory calls and steer the model to finalize via submit_answer (which is never capped).
+        # Returned as a normal (non-error) tool result so the model reads and acts on it.
+        if (self.max_tool_calls and name != SUBMIT_ANSWER
+                and self._non_terminal_calls >= self.max_tool_calls):
+            msg = (f"budget_exhausted: reached the {self.max_tool_calls}-call tool budget for this "
+                   f"question. Do not call more exploratory tools — call {SUBMIT_ANSWER} now with your "
+                   f"best grounded answer, or answer='わかりません' if no evidence was found.")
+            self.logger.record(name, args, 0.0, ok=False, error="budget_exhausted")
+            return {"content": [{"type": "text", "text": msg}], "isError": False}
         started = time.perf_counter()
         result = dispatch(self.by_name, name, args)
+        if name != SUBMIT_ANSWER:
+            self._non_terminal_calls += 1
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         is_error = isinstance(result, Mapping) and "error" in result and name not in self.by_name
         self.logger.record(name, args, elapsed_ms, ok=not is_error,
@@ -202,11 +220,15 @@ def _log(msg: str) -> None:
 
 
 def build_server(profile: CorpusProfile | None = None,
-                 log_path: str | None = None) -> InvestigatorMCPServer:
+                 log_path: str | None = None,
+                 max_tool_calls: int | None = None) -> InvestigatorMCPServer:
     """Build the server over ``build_tools`` and enforce the read-only invariant.
 
     Raises ``RuntimeError`` if any exposed tool name looks like a write/shell capability, so the
     read-only guarantee cannot regress silently.
+
+    ``max_tool_calls`` (SOT-2627) caps the non-terminal tool calls per session; ``None`` reads the
+    ``RAG_MCP_MAX_TOOL_CALLS`` env (0/unset ⇒ disabled = byte-identical SOT-2626 behaviour).
     """
     tools = build_tools(profile or CorpusProfile())
     for t in tools:
@@ -215,7 +237,12 @@ def build_server(profile: CorpusProfile | None = None,
             raise RuntimeError(
                 f"refusing to expose non-read-only tool over MCP: {t.name!r}")
     path = log_path if log_path is not None else os.getenv("RAG_MCP_TOOL_LOG") or None
-    return InvestigatorMCPServer(tools, ToolCallLogger(path))
+    if max_tool_calls is None:
+        try:
+            max_tool_calls = int(os.getenv("RAG_MCP_MAX_TOOL_CALLS", "0") or 0)
+        except ValueError:
+            max_tool_calls = 0
+    return InvestigatorMCPServer(tools, ToolCallLogger(path), max_tool_calls=max_tool_calls)
 
 
 def serve_stdio(server: InvestigatorMCPServer, stdin: Any, stdout: Any) -> None:

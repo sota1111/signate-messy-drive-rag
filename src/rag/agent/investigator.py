@@ -275,6 +275,16 @@ _DETERMINISTIC_ROUTES: tuple[str, ...] = (
     "seating_lookup", "read_chart_values", "file_grep",
 )
 
+# SOT-2627 — investigator tool-loop backend. ``gemini`` (default) keeps the live Gemini function-calling
+# loop below byte-identical. ``claude-mcp`` delegates the WHOLE per-question loop (tool round-trips → final
+# answer) to a flat-rate Sonnet ``claude -p --mcp-config`` session driving the SOT-2626 stdio MCP server,
+# so a dev gold100 run avoids Gemini metering. **dev-only** (production stays Gemini-only, SOT-2460;
+# official measurement stays flash 3.6, SOT-2625) and the flat-rate limit is shared with the autonomous
+# workers, so it is off unless explicitly opted in. The switch is read in :func:`answer_question` *after*
+# every deterministic pre-stage (document_registry / det_pipeline / deterministic_* shortcuts stay
+# unchanged), so only the model-driven loop moves to Sonnet and the ``gemini`` default is byte-identical.
+INVESTIGATOR_BACKEND = (os.getenv("RAG_INVESTIGATOR_BACKEND", "gemini").strip().lower() or "gemini")
+
 # Vertex Gemini list price (USD per 1M tokens), (input, output) — estimates for cost bookkeeping only.
 PRICING: dict[str, tuple[float, float]] = {
     "gemini-2.5-pro": (1.25, 10.0),
@@ -351,6 +361,11 @@ class Usage:
         return self.input_tokens + self.output_tokens
 
     def cost_usd(self, model: str) -> float:
+        # SOT-2627 — the flat-rate claude-mcp backend has zero marginal token cost, so a
+        # ``…(claude-mcp)`` model prices at 0 regardless of token counts. Gemini models never carry that
+        # suffix, so the production/Gemini details.jsonl cost is byte-identical.
+        if model.endswith("(claude-mcp)"):
+            return 0.0
         pin, pout = PRICING.get(model, PRICING["gemini-2.5-pro"])
         return self.input_tokens / 1e6 * pin + self.output_tokens / 1e6 * pout
 
@@ -2585,6 +2600,18 @@ def answer_question(question: str, *, model: str | None = None,
             # A whole-section read / PPTX shape extraction plus guarded resubmission can exceed the
             # ordinary budget.  This remains bounded and applies only to the two deterministic paths.
             timeout_s = 300.0
+    # SOT-2627 — dev backend switch. Reached only after every deterministic pre-stage declined (so the
+    # deterministic shortcuts above are byte-identical); it swaps ONLY the model-driven tool loop. When
+    # ``RAG_INVESTIGATOR_BACKEND=claude-mcp`` the whole loop is delegated to a flat-rate Sonnet
+    # ``claude -p --mcp-config`` session (SOT-2626 MCP server); the routed ``system``/``contract``/
+    # ``preamble`` computed above are carried over so the Sonnet run sees the same instructions the Gemini
+    # loop would. Any other value keeps the Gemini path unchanged. Imported lazily so the default path
+    # never imports the subprocess provider.
+    if INVESTIGATOR_BACKEND == "claude-mcp":
+        from src.rag.llm_providers import claude_mcp
+        return claude_mcp.investigate_question(
+            question, tools=tools, system=system, contract=contract, preamble=preamble,
+            max_turns=max_turns, timeout_s=timeout_s, model=model)
     model_obj = gemini_model_factory(question, tools, model=model, system=system)
     return investigate(model_obj, question, tools, max_turns=max_turns, timeout_s=timeout_s,
                        ledger=ledger, calc_ledger=calc_ledger, research=research,
