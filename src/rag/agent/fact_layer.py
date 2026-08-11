@@ -368,6 +368,17 @@ _METRIC_ANCHORS: tuple[tuple[str, str, Callable[[str], bool]], ...] = (
 )
 # Aggregation cues that make an enum answer a composite (列挙＋集計) — the lane defers those to the tool.
 _AGG_CUE = re.compile(r"合計|総額|平均|中央値|最大|最小|最も|何件|件数|差|割合|比率|比べ|上位")
+# SOT-2649 empty-composite lane cues. A 列挙+契約金額合計 composite over an EMPTY apr_code match-set is
+# deterministic (該当なし): an empty superset stays empty under any conjunctive refinement and every
+# aggregation over it is vacuous. Complement/disjunction semantics break that proof ⇒ hard defer.
+_SUM_CUE = re.compile(r"合計|総額")
+_NONSUM_AGG_CUE = re.compile(r"平均|中央値|最大|最小|最も|何件|件数|割合|比率|比べ|上位|差")
+_UNSAFE_SET_CUE = re.compile(r"以外|除|不要|必要ない|必要のない|でない|ではない|含まな|または|もしくは|あるいは")
+# _EXTRA_PREDICATE minus the tokens attributable to the amount-sum request itself (契約金額(税込)の合計):
+# any OTHER attribute predicate still defers the composite (precision-first — same boundary as idx87).
+_COMPOSITE_EXTRA = re.compile(
+    r"完了|未着手|進行|中止|ステータス|状態|かつ|うち|以上|以下|超|未満|行|サンプル|"
+    r"医療|固定|精算|着手金|期間|担当|工数|会社|APR-M(?![123]).")
 _ENUM_CUE = re.compile(r"すべて|全て|全部|列挙|挙げ|漏れなく|該当する.*を|主略称|略称で")
 _APR_CODE = re.compile(r"APR[-\s]?M([123])", re.IGNORECASE)
 # ANY extra case-attribute predicate beyond the single APR code makes the enumeration multi-condition
@@ -390,25 +401,43 @@ def _derived_lane(question: str):
     Fires only when: exactly one store case matches a case hint in the question AND exactly one metric
     anchor's tokens are present AND that metric resolves to a non-null store value. Otherwise ``None`` —
     ambiguous case, ambiguous/absent metric, or a free-form derivation all defer to the LLM loop.
+
+    SOT-2649: a shared-stem mention (「青葉のTX」— 青葉与信/青葉バイオ) binds via *metric presence*:
+    when every candidate matched through the SAME single token, the store itself disambiguates — only
+    the case that actually carries the anchored metric (non-null) can be meant. Two DIFFERENT explicit
+    names in one question (comparison shape) still defer.
     """
     _cm, _idm, derived_metrics, _ds = _stores()
     if derived_metrics is None:
         return None
     q = _norm(question)
     rows = derived_metrics.load()
-    hits = [r for r in rows if _norm(r.get("case_id")) and _norm(r.get("case_id"))[:6] in q]
-    # Prefer a company-name substring hit; require exactly one case bound.
-    if len(hits) != 1:
-        # fall back to substring of the leading company token (青葉与信 等) — still must be unique
-        hits = [r for r in rows if any(tok and tok in q for tok in _case_tokens(r))]
-        if len(hits) != 1:
-            return None
-    rec = hits[0]
     ql = q.lower()
     anchored = [(path, label) for (path, label, pred) in _METRIC_ANCHORS if pred(ql)]
     if len(anchored) != 1:
         return None
     path, label = anchored[0]
+    hits = [r for r in rows if _norm(r.get("case_id")) and _norm(r.get("case_id"))[:6] in q]
+    # Prefer a company-name substring hit; require exactly one case bound.
+    if len(hits) != 1:
+        # fall back to substring of company tokens (青葉与信 / prefix-stripped stem 青葉 等)
+        matched = {id(r): sorted((tok for tok in _case_tokens(r) if tok and tok in q),
+                                 key=len, reverse=True) for r in rows}
+        hits = [r for r in rows if matched[id(r)]]
+        if len(hits) > 1:
+            # an explicit (longer) name beats a bare stem; a tie must be the SAME token (single
+            # ambiguous mention), never two distinct names — that is a cross-case comparison ⇒ defer
+            best = max(len(matched[id(r)][0]) for r in hits)
+            top = [r for r in hits if len(matched[id(r)][0]) == best]
+            if len({matched[id(r)][0] for r in top}) != 1:
+                return None
+            if len(top) > 1:
+                # store-side disambiguation: exactly one candidate may carry the anchored metric
+                top = [r for r in top if _dig(r, path) is not None]
+            hits = top
+        if len(hits) != 1:
+            return None
+    rec = hits[0]
     val = _dig(rec, path)
     if val is None:
         return None
@@ -423,6 +452,9 @@ def _derived_lane(question: str):
     return {"value": val, "evidence": evidence, "method": method}
 
 
+_CORP_PREFIX = re.compile(r"^(株式会社|医療法人社団|有限会社|合同会社)\s*")
+
+
 def _case_tokens(rec: Mapping[str, Any]) -> list[str]:
     """Normalized case-name tokens usable as question hints (company name, leading 4+ chars)."""
     cid = _norm(rec.get("case_id"))
@@ -430,7 +462,18 @@ def _case_tokens(rec: Mapping[str, Any]) -> list[str]:
     # a distinctive leading company token (e.g. 青葉与信) — 4 chars is enough to disambiguate 10 cases
     if len(cid) >= 4:
         toks.append(cid[:4])
-    return [t for t in toks if t]
+    # prefix-stripped stems (株式会社青葉バイオ… → 青葉バイオ / 青葉): questions name companies without
+    # the corporate form; the 2-char stem is a *candidate generator* only — a stem-tied bind must still
+    # pass the same-token + metric-presence guards in the derived lane (SOT-2649)
+    stem = _norm(_CORP_PREFIX.sub("", str(rec.get("case_id") or "")))
+    for n in (4, 2):
+        if len(stem) >= n:
+            toks.append(stem[:n])
+    seen: list[str] = []
+    for t in toks:
+        if t and t not in seen:
+            seen.append(t)
+    return seen
 
 
 def _enum_lane(question: str):
@@ -447,10 +490,21 @@ def _enum_lane(question: str):
     codes = {m.group(1) for m in _APR_CODE.finditer(question)}
     if len(codes) != 1:
         return None
-    if _AGG_CUE.search(question) or not _ENUM_CUE.search(question):
+    if not _ENUM_CUE.search(question):
         return None
+    # Complement/disjunction phrasing (以外/または…) voids both the enumeration and the empty-set proof.
+    if _UNSAFE_SET_CUE.search(question):
+        return None
+    composite = bool(_AGG_CUE.search(question))
+    if composite:
+        # SOT-2649: only the 「APR-Mx を列挙し契約金額(税込)を合計」 shape may proceed (and it answers
+        # only on an empty match-set below); any other aggregation or extra predicate defers.
+        if _NONSUM_AGG_CUE.search(question) or not _SUM_CUE.search(question):
+            return None
+        if "金額" not in question or _COMPOSITE_EXTRA.search(question):
+            return None
     # Defer any multi-condition enumeration (extra attribute predicate ⇒ APR-only would over-return).
-    if not _sole_apr_predicate(question):
+    elif not _sole_apr_predicate(question):
         return None
     apr = f"APR-M{next(iter(codes))}"
     rows = case_master.load()
@@ -461,6 +515,20 @@ def _enum_lane(question: str):
     if any(_attr_value(r, "apr_code") is None for r in rows):
         return None
     matched = [r for r in rows if _attr_value(r, "apr_code") == apr]
+    if composite:
+        # Deterministic ONLY for the empty set (該当なし): non-empty composites have a multi-part
+        # answer whose format is genuinely ambiguous ⇒ defer to case_filter + the LLM as before.
+        if matched:
+            return None
+        evidence = {
+            "filter": {"apr_code": apr}, "universe_size": len(rows), "matched": 0,
+            "store": "case_master", "completeness": "row_count==案件数 (母集団確定)",
+            "aggregation": "空集合ゆえ vacuous (該当案件なし ⇒ 合計対象なし)",
+        }
+        method = {"engine": "case_master", "contract": "full_enumeration",
+                  "selection": "apr_code_empty_composite", "naturalize": False,
+                  "verified_operand": True, "confidence": 1.0}
+        return {"value": "該当なし", "evidence": evidence, "method": method}
     labels = [_case_label(r) for r in matched]
     if not labels or any(not l for l in labels):
         return None
