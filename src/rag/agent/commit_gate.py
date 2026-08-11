@@ -89,7 +89,11 @@ ABSTAIN_V = "ABSTAIN"   # commit わかりません (hard blocker or 棄権ポ�
 
 # Numeric-source tools whose *successful* record can ground a numeric commit (mirrors
 # ``calc_ledger._NUMERIC_SOURCE_TOOLS`` — kept local so the gate never imports a private symbol).
-_NUMERIC_TOOLS = frozenset({"compute", "corpus_aggregate", "read_chart_values", "pptx_pivot"})
+_NUMERIC_TOOLS = frozenset({"compute", "corpus_aggregate", "read_chart_values", "pptx_pivot",
+                            # SOT-2647 — precomputed fact-layer tools return provenance-carrying store
+                            # values (per-cell 出典); a numeric answer grounded by one of these is a
+                            # **verified operand**, so the gate accepts it exactly like a live compute.
+                            "metric_lookup", "case_filter", "id_lookup", "diff_lookup"})
 
 # Base contracts (question_contract) that require an executed numeric derivation to commit a number.
 _NUMERIC_CONTRACTS = frozenset({_qc.NUMERIC, _qc.CROSS_AGGREGATE})
