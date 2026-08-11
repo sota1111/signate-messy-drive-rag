@@ -142,3 +142,44 @@ def test_enabled_reads_env(monkeypatch):
     assert eu_gate.enabled() is True
     monkeypatch.setenv("RAG_EU_GATE", "off")
     assert eu_gate.enabled() is False
+
+
+# --------------------------------------------------------------------------- SOT-2635 τ calibration knob
+def test_commit_threshold_default_is_zero_byte_identical(monkeypatch):
+    """Default τ = 0.0 ⇒ the original ``U > 0`` decision (byte-identical to SOT-2589)."""
+    monkeypatch.delenv("RAG_EU_GATE_TAU", raising=False)
+    assert eu_gate.commit_threshold() == 0.0
+
+
+def test_positive_tau_tightens_soft_accept_to_abstain(monkeypatch):
+    """A commit that clears U>0 by a slim margin abstains once τ is raised above that margin."""
+    s = GateSignals(canonical_doc_resolved=True, evidence_slots_complete=True,
+                    answer_verifier_agrees=True)
+    monkeypatch.delenv("RAG_EU_GATE_TAU", raising=False)
+    base = decide(s)
+    assert base.commit is True and base.tier == SOFT_ACCEPT
+    monkeypatch.setenv("RAG_EU_GATE_TAU", str(base.utility + 0.01))
+    tightened = decide(s)
+    assert tightened.commit is False and tightened.tier == ABSTAIN
+    # …and a τ just below the margin still commits.
+    monkeypatch.setenv("RAG_EU_GATE_TAU", str(base.utility - 0.01))
+    assert decide(s).commit is True
+
+
+def test_negative_tau_probe_commits_everything_but_records_utility(monkeypatch):
+    """The telemetry probe (τ very negative) commits even a bare EV-negative bundle, but U is unchanged —
+    so the recorded utilities can be used to pick τ offline without over-abstaining."""
+    monkeypatch.setenv("RAG_EU_GATE_TAU", "-9")
+    d = decide(GateSignals())
+    assert d.commit is True and d.tier == SOFT_ACCEPT
+    assert d.utility <= 0.0  # utility itself is not distorted by the probe threshold
+
+
+def test_base_prior_env_tunable(monkeypatch):
+    monkeypatch.delenv("RAG_EU_GATE_BASE", raising=False)
+    assert eu_gate.base_prior() == pytest.approx(0.30)
+    monkeypatch.setenv("RAG_EU_GATE_BASE", "0.5")
+    assert eu_gate.base_prior() == pytest.approx(0.5)
+    # a garbage value fails open to the default
+    monkeypatch.setenv("RAG_EU_GATE_BASE", "not-a-number")
+    assert eu_gate.base_prior() == pytest.approx(0.30)

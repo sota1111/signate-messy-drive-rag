@@ -2404,6 +2404,105 @@ def gemini_model_factory(question: str, tools: Sequence[AgentTool], *,
                        system=system if system is not None else SYSTEM_PROMPT)
 
 
+# --------------------------------------------------------------------------- SOT-2635 answer-path EU gate
+def _eu_registry_resolves(question: str, *, project: str | None = None) -> bool:
+    """SOT-2635 — True when the SOT-2583 document registry resolves a target document for ``question``.
+
+    Lazy + fail-open (mirrors :func:`src.rag.agent.gate._registry_resolves`): any import/lookup error →
+    ``False`` (a non-blocking default), never an exception on the answer path."""
+    try:
+        from src.rag.index import document_registry as _dr
+
+        resolver = _dr.get_resolver()
+        if resolver is None:
+            return False
+        return bool(resolver.resolve(question, project=project, limit=1))
+    except Exception:  # noqa: BLE001 — advisory signal; never break the answer path
+        return False
+
+
+def _eu_signals_from_investigation(inv: "Investigation", question: str) -> Any:
+    """SOT-2635 — build an :class:`~src.rag.agent.eu_gate.GateSignals` bundle from a single-pass
+    :class:`Investigation` (the production ``answer_question`` / ``gold_offline --run`` path).
+
+    No 合議 verifier runs on this path, so the verifier / self-consistency signals stay at their
+    conservative default (False). Only what the single pass actually carries is reconstructed:
+
+    * ``deterministic_lane`` — the answer came from a deterministic pipeline (``model == 'deterministic'``);
+      such an answer is grounded in resolved structure by construction, so ``canonical_doc_resolved`` and
+      ``evidence_slots_complete`` are credited alongside it.
+    * ``canonical_doc_resolved`` — the SOT-2583 registry resolves the target document (network-free).
+    * ``evidence_slots_complete`` — the answer carries non-empty grounding evidence text.
+    * ``execution_engines_agree`` / ``operand_sources_complete`` (numeric only) — a numeric answer whose
+      PoT三層 verdict (``inv.pot_lane``) *disagreed* forces the execution-disagreement hard blocker.
+    * ``verbal_confidence`` — the model self-report (demoted to a small auxiliary weight in eu_gate).
+    """
+    from src.rag.agent import eu_gate as _eu_gate
+
+    ans = inv.answer
+    calc = inv.calc_record or {}
+    is_numeric = (inv.contract == "numeric") or bool(calc)
+    deterministic = (inv.model == "deterministic")
+    has_evidence = bool((ans.evidence or "").strip())
+
+    # numeric execution agreement from the PoT三層 verdict (fail-open: unknown/absent ⇒ agree).
+    exec_agree = True
+    if is_numeric and isinstance(inv.pot_lane, Mapping):
+        verdict = str(inv.pot_lane.get("verdict") or inv.pot_lane.get("status") or "").upper()
+        if inv.pot_lane.get("agree") is False or verdict in {
+                "MISMATCH", "DISAGREE", "REJECT", "FAIL", "EXEC_MISMATCH"}:
+            exec_agree = False
+
+    canonical = deterministic or _eu_registry_resolves(question)
+    return _eu_gate.GateSignals(
+        canonical_doc_resolved=canonical,
+        evidence_slots_complete=(deterministic or has_evidence),
+        operand_sources_complete=(exec_agree if is_numeric else True),
+        execution_engines_agree=(exec_agree if is_numeric else True),
+        deterministic_lane=deterministic,
+        verbal_confidence=float(ans.confidence),
+    )
+
+
+def _apply_answer_eu_gate(inv: "Investigation", question: str) -> "Investigation":
+    """SOT-2635 — apply the expected-utility commit gate to a produced answer, in place, behind RAG_EU_GATE.
+
+    Records the gate decision in ``inv.interventions['eu_gate']`` for EVERY question (answered OR abstained
+    — SOT-2629 全ケース記録) so an ablation can attribute the gate's effect on the answered trace. When the
+    answer is a real commit and the gate decides ABSTAIN (a hard epistemic blocker, or ``U ≤ τ``), the
+    served answer is flipped to わかりません (棄権側へ倒す); the evidence/method are preserved as diagnostics.
+    An already-abstained answer is never resurrected. No-op unless RAG_EU_GATE is on — default OFF ⇒ this
+    returns ``inv`` untouched (byte-identical), so every call site can wrap its return unconditionally."""
+    from src.rag.agent import eu_gate as _eu_gate
+
+    if not _eu_gate.enabled():
+        return inv
+    try:
+        ans = inv.answer
+        already_abstain = is_abstain(ans.answer)
+        signals = _eu_signals_from_investigation(inv, question)
+        decision = _eu_gate.decide(signals)
+        record: dict[str, Any] = {
+            "enabled": True,
+            "tier": decision.tier,
+            "commit": bool(decision.commit),
+            "utility": round(float(decision.utility), 4),
+            "correctness": round(float(decision.correctness), 4),
+            "already_abstain": already_abstain,
+            "flipped": False,
+            "signals": signals.to_dict(),
+        }
+        if not already_abstain and not decision.commit:
+            inv.answer = Answer(answer=ABSTAIN, confidence=0.0,
+                                evidence=ans.evidence, method=ans.method)
+            inv.stop_reason = "eu_gate_abstain"
+            record["flipped"] = True
+        inv.interventions["eu_gate"] = record
+    except Exception:  # noqa: BLE001 — the gate is advisory telemetry; never break the answer path
+        pass
+    return inv
+
+
 def answer_question(question: str, *, model: str | None = None,
                     profile: CorpusProfile | None = None,
                     max_turns: int = DEFAULT_MAX_TURNS,
@@ -2456,7 +2555,7 @@ def answer_question(question: str, *, model: str | None = None,
     _dr_reason = _document_registry.hard_constraint_abstain(
         question, scope_resolver=lambda q: _resolve_project(q, None))
     if _dr_reason is not None:
-        return Investigation(
+        return _apply_answer_eu_gate(Investigation(
             question=question,
             answer=Answer(answer=ABSTAIN, confidence=0.0,
                           evidence=f"registry: {_dr_reason}",
@@ -2468,7 +2567,7 @@ def answer_question(question: str, *, model: str | None = None,
             elapsed_s=0.0,
             stop_reason=_dr_reason,
             contract=None,
-        )
+        ), question)
     tools = build_tools(profile_obj)
     system: str | None = None
     contract: str | None = None
@@ -2479,15 +2578,10 @@ def answer_question(question: str, *, model: str | None = None,
     # Investigation already carries (spin_pivot / search_cap). A key is added ONLY for an active flag (an
     # ABSENT key ⇒ flag OFF); the value records whether it actually injected/fired for THIS question, so an
     # ON-but-idle intervention is distinguishable from OFF on the answered trace (adversarial-review H6).
-    # ``eu_gate`` is env-only here (the gate's decision string is produced downstream in scoring.gate, not
-    # in this serve loop) — presence records that the EU gate was active for this question.
+    # SOT-2635 — the EU gate's per-question decision (tier / U / commit / flip / signal bundle) is recorded
+    # downstream by :func:`_apply_answer_eu_gate` at every return point (全ケース記録), so no ``eu_gate`` key
+    # is seeded here. That helper also倒す a committed-but-EV-negative answer to 棄権 when RAG_EU_GATE is on.
     packet_interventions: dict[str, Any] = {}
-    try:
-        from src.rag.agent import eu_gate as _eu_gate
-        if _eu_gate.enabled():
-            packet_interventions["eu_gate"] = {"enabled": True}
-    except Exception:  # noqa: BLE001 — telemetry is additive; never break the answer path
-        pass
     if routing not in (None, False):
         from src.rag.agent import question_contract as _question_contract
         from src.rag.agent import routing as _routing  # lazy: keeps import free of the classifier deps
@@ -2517,7 +2611,7 @@ def answer_question(question: str, *, model: str | None = None,
             from src.rag.agent import formatting as _formatting
             formatted = _formatting.format_contract(det_result, question, contract_type=contract)
             if formatted is not None:
-                return Investigation(
+                return _apply_answer_eu_gate(Investigation(
                     question=question,
                     answer=_answer_from_det_contract(formatted),
                     iterations=1,
@@ -2527,7 +2621,7 @@ def answer_question(question: str, *, model: str | None = None,
                     elapsed_s=max(0.0, time.monotonic() - det_started),
                     stop_reason="answered",
                     contract=contract,
-                )
+                ), question)
         # SOT-2584 — Evidence Packet pre-inject (typed route → registry-resolved docs → slots → budget).
         # Built only behind RAG_EVIDENCE_PACKET; reuses the just-computed contract so the question is not
         # re-classified. Fail-open: any build error leaves ``preamble`` None so the answer path is
@@ -2618,7 +2712,7 @@ def answer_question(question: str, *, model: str | None = None,
             deterministic = _deterministic_regulation_answer(question, profile_obj)
             deterministic_tools = ["canonical_route", "find_files", "read_office"]
         if deterministic is not None:
-            return Investigation(
+            return _apply_answer_eu_gate(Investigation(
                 question=question,
                 answer=deterministic,
                 iterations=len(deterministic_tools),
@@ -2628,7 +2722,7 @@ def answer_question(question: str, *, model: str | None = None,
                 elapsed_s=max(0.0, time.monotonic() - started),
                 stop_reason="answered",
                 contract=contract,
-            )
+            ), question)
         # Record whether the caller kept the defaults *before* any adaptation, so every adaptation below
         # only lifts a default budget and never shrinks an explicit caller budget, and so they compose
         # (the ratio +4 still applies on top of the multi-stage lift).
@@ -2668,7 +2762,7 @@ def answer_question(question: str, *, model: str | None = None,
             question, tools=tools, system=system, contract=contract, preamble=preamble,
             max_turns=max_turns, timeout_s=timeout_s, model=model)
         _inv.interventions.update(packet_interventions)  # SOT-2629 — merge env/packet-level telemetry
-        return _inv
+        return _apply_answer_eu_gate(_inv, question)  # SOT-2635 — commit-time EU gate (no-op unless ON)
     model_obj = gemini_model_factory(question, tools, model=model, system=system)
     _inv = investigate(model_obj, question, tools, max_turns=max_turns, timeout_s=timeout_s,
                        ledger=ledger, calc_ledger=calc_ledger, research=research,
@@ -2677,4 +2771,4 @@ def answer_question(question: str, *, model: str | None = None,
                        spin_detection=SPIN_DETECTION, pivot_detection=SPIN_PIVOT,
                        search_cap=SEARCH_CAP, preamble=preamble)
     _inv.interventions.update(packet_interventions)  # SOT-2629 — merge env/packet-level telemetry
-    return _inv
+    return _apply_answer_eu_gate(_inv, question)  # SOT-2635 — commit-time EU gate (no-op unless ON)
