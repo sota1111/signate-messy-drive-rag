@@ -42,6 +42,8 @@ def test_flag_default_off():
      "13ページ（スライド13「8. 費用見積」）", "13ページ"),
     # idx4: metric detail
     ("目的変数と相関が最も高い数値特徴量を教えてください", "bmi(相関係数 約0.171)", "bmi"),
+    # alternate week notation repeats the value rather than adding a second fact
+    ("どの週からどの週に変更されましたか", "第5週目から第6週目（W5〜W6）", "第5週目から第6週目"),
     # idx41: enumeration listing
     ("加藤さんが担当者に含まれるタスクIDはいくつありますか",
      "11件(タスクID: T01, T02, T05)", "11件"),
