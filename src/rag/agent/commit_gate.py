@@ -247,6 +247,13 @@ def _apply_formatting(question: str, route: str, submitted: str,
                 result = stripped
                 tel["applied"] = True
                 tel["rules"] = list(tel.get("rules", [])) + fired
+        # SOT-2656 — 値保存回答正規化 (説明文/接頭辞/カウンタ) (RAG_FORMAT_VALUE_NORM, default OFF).
+        if _formatting.value_norm_enabled():
+            normed, nfired = _formatting.normalize_value_answer(question, result)
+            if nfired:
+                result = normed
+                tel["applied"] = True
+                tel["rules"] = list(tel.get("rules", [])) + nfired
     except Exception:  # noqa: BLE001
         pass
     return result, tel

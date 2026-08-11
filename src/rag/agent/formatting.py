@@ -237,6 +237,104 @@ def strip_trailing_parenthetical(question: str, value: str) -> "tuple[str, list[
     return text + tail, rules
 
 
+# ------------------------------------------------------------------- SOT-2656 値保存回答正規化 (説明文・接頭辞・単位ゆれ)
+# cycle4 クラスタE (docs/ai/sonnet_cycle_analysis/cycle4.md): the committed value is CORRECT but wrapped in
+# non-value decoration the judge scores Incorrect —
+#   * a full sentence frame 「差額は0円です（…）」          → gold 「0円」         (idx6)
+#   * an approximation prefix 「約14,744ドル」               → gold 「14,744ドル」  (idx8/36)
+#   * a redundant counter 「11件」/「49件」 for a bare-count → gold 「11」/「49」    (idx41/92)
+# Each is value-PRESERVING: the number / proper-noun tokens are untouched; only non-value framing is
+# dropped. This composes AFTER the SOT-2650 trailing-paren strip (paren strip → value-norm), and is gated
+# behind a SEPARATE new flag ``RAG_FORMAT_VALUE_NORM`` (default OFF ⇒ byte-identical serve path).
+#
+# Fail-closed boundaries — verified against the whole gold100 (artifacts/predictions_test_v3_final.csv):
+#   * NO gold answer ends in a bare 「N件」, ends in 「です/ます」, or begins with an approximation 「約」 —
+#     so each rule below only ever strips decoration a real gold answer never carries;
+#   * approx-prefix drops 約/およそ… ONLY when the very next char is a digit (a value like 「約款」 is safe);
+#   * counter strip fires ONLY for a bare-count ask AND when the WHOLE value is 「<number><counter>」
+#     (optionally + one trailing paren) — never a counter embedded in a longer phrase;
+#   * sentence-frame collapse fires ONLY for a scalar-value ask AND when the extracted core is value-shaped
+#     (contains a digit) — a prose answer 「担当は田中です」 has no digit ⇒ left alone;
+#   * 「Nページ目」→「Nページ」 unit normalization is deliberately NOT done: gold carries BOTH forms
+#     (idx12=2ページ / idx18=2ページ目), so a blanket conversion would regress idx18 (双方向変換禁止 —
+#     証拠原文の表記を優先);
+#   * a final value-preservation guard refuses any transform whose output numeric tokens are not a subset
+#     of the input's (a transform can only ever DROP decoration, never invent/alter a number).
+_APPROX_PREFIX_RE = re.compile(r"^(?:約|およそ|おおよそ|ほぼ|概ね|おおむね)\s*(?=[0-9０-９])")
+_BARE_COUNT_Q_RE = re.compile(r"いくつ|幾つ|何\s*(?:件|個|名|箇所|つ|回)|件数")
+_COUNT_VALUE_RE = re.compile(
+    r"^\s*(?P<num>-?\d[\d,]*)\s*(?:件|個|名|箇所|点|つ)\s*(?:[（(][^（）()]*[)）])?\s*$")
+_SCALAR_VALUE_Q_RE = re.compile(
+    r"金額|差額|費用|価格|料金|コスト|請求|予算|単価|総額|売上|利益|収益|価額|いくら"
+    r"|何\s*(?:円|ドル|ページ|人|件|個|回|時間|日)")
+_SENTENCE_FRAME_RE = re.compile(
+    r"^(?P<lead>[^、。]{0,16}?)は\s*(?P<core>.+?)\s*"
+    r"(?:です|でした|だ|となります|となる|になります|になる)。?\s*"
+    r"(?:[（(][^（）()]*[)）])?\s*$")
+_NUM_TOKEN_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+_HAS_DIGIT_RE = re.compile(r"[0-9０-９]")
+
+
+def value_norm_enabled() -> bool:
+    """Whether the SOT-2656 value-preserving normalization fires — ``RAG_FORMAT_VALUE_NORM`` (default OFF)."""
+    return _env_flag("RAG_FORMAT_VALUE_NORM", False)
+
+
+def _num_tokens(text: str) -> "list[str]":
+    return _NUM_TOKEN_RE.findall(text)
+
+
+def _numeric_tokens_preserved(out: str, src: str) -> bool:
+    """Every numeric token in ``out`` also occurs (with multiplicity) in ``src`` — no number invented/changed."""
+    from collections import Counter
+
+    co, ci = Counter(_num_tokens(out)), Counter(_num_tokens(src))
+    return all(co[tok] <= ci[tok] for tok in co)
+
+
+def normalize_value_answer(question: str, value: str) -> "tuple[str, list[str]]":
+    """Drop non-value framing (sentence/approx/counter) from an answer, value-preserving (SOT-2656).
+
+    Returns ``(new_value, fired_rules)`` — ``fired_rules`` empty when nothing changed. Each rule is
+    question-cue-gated and fail-closed; a final numeric-token guard refuses any transform that would
+    alter a number. Complements :func:`strip_trailing_parenthetical` (run it first).
+    """
+    rules: list[str] = []
+    if not value or "\n" in value.strip():
+        return value, rules
+    original = value
+    text = value.strip()
+    q = question or ""
+
+    # 1) sentence frame 「…は<核>です（…）」 → 核 — scalar-value ask + value-shaped (digit-bearing) core.
+    if _SCALAR_VALUE_Q_RE.search(q):
+        m = _SENTENCE_FRAME_RE.match(text)
+        if m:
+            core = m.group("core").strip()
+            if core and core != text and _HAS_DIGIT_RE.search(core):
+                text = core
+                rules.append("sentence_frame")
+
+    # 2) approximation prefix 約/およそ… immediately before a digit → drop the qualifier.
+    stripped = _APPROX_PREFIX_RE.sub("", text)
+    if stripped != text:
+        text = stripped.strip()
+        rules.append("approx_prefix")
+
+    # 3) counter suffix 「N件」 → 「N」 — only a bare-count ask whose whole value is <number><counter>(+paren).
+    if _BARE_COUNT_Q_RE.search(q):
+        m = _COUNT_VALUE_RE.match(text)
+        if m:
+            text = m.group("num")
+            rules.append("count_suffix")
+
+    if not rules:
+        return original, []
+    if not text.strip() or not _numeric_tokens_preserved(text, original):
+        return original, []  # fail-closed: a transform that emptied the value or changed a number is refused
+    return text, rules
+
+
 def _parse_small_int(raw: str) -> "int | None":
     """Parse a small positive integer written in ASCII/fullwidth digits or 一〜十 kanji (precision桁 use)."""
     s = raw.translate(_FULLWIDTH_DIGITS).strip()

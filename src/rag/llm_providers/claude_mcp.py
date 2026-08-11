@@ -504,6 +504,14 @@ def investigate_question(question: str, *, tools: Sequence[AgentTool],
                 if fired:
                     answer = Answer(answer=stripped, confidence=answer.confidence,
                                     evidence=answer.evidence, method=answer.method + " +paren_strip")
+            # SOT-2656 — 値保存回答正規化 (説明文/接頭辞/カウンタ) (RAG_FORMAT_VALUE_NORM, default OFF).
+            if _fmt.value_norm_enabled():
+                normed, nfired = _fmt.normalize_value_answer(question, answer.answer)
+                if nfired:
+                    strip_tel = {"applied": True,
+                                 "rules": list((strip_tel or {}).get("rules", [])) + nfired}
+                    answer = Answer(answer=normed, confidence=answer.confidence,
+                                    evidence=answer.evidence, method=answer.method + " +value_norm")
         inv = Investigation(
             question=question, answer=answer, iterations=iterations, tool_calls=tool_calls,
             usage=usage, model=model_label, elapsed_s=elapsed, stop_reason=stop_reason,
