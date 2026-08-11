@@ -60,6 +60,38 @@ def enabled() -> bool:
     return os.getenv("RAG_EU_GATE", "0").strip().lower() in _ON
 
 
+def _env_float(key: str, default: float) -> float:
+    """Read a float calibration knob from ``key``; fail-open to ``default`` on any parse error."""
+    raw = os.getenv(key)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def commit_threshold() -> float:
+    """SOT-2635 — the expected-utility commit bar τ (commit iff ``U > τ``).
+
+    Env-tunable via ``RAG_EU_GATE_TAU`` (default **0.0** — the original ``U > 0`` decision, byte-identical
+    to SOT-2589). A *positive* τ makes the SOFT-ACCEPT tier stricter (commit only clearly-EV-positive
+    answers → more precision, fewer commits); a *negative* τ is used only as a **telemetry probe** (commit
+    everything, record ``U`` per question) to calibrate τ offline without over-abstaining. This is the sole
+    calibration knob the paired answer-increasing path is tuned against — the probability *weights* below
+    stay the hand-set (non-fitted) model, since local proxy ↔ real LB is ρ=−0.09."""
+    return _env_float("RAG_EU_GATE_TAU", 0.0)
+
+
+def base_prior() -> float:
+    """SOT-2635 — the base correctness prior (env-tunable via ``RAG_EU_GATE_BASE``, default 0.30).
+
+    Deliberately low so an answered-yet-unsupported bundle sits below the commit bar — committing must be
+    *earned* by positive evidence, not defaulted into. Exposed for calibration only; the default keeps the
+    SOT-2589 pure-function behaviour byte-identical."""
+    return _env_float("RAG_EU_GATE_BASE", _C_BASE)
+
+
 # --------------------------------------------------------------------------- tiers
 HARD_ACCEPT = "HARD_ACCEPT"
 SOFT_ACCEPT = "SOFT_ACCEPT"
@@ -200,7 +232,7 @@ def correctness_prob(s: GateSignals) -> float:
     a *violated* file constraint which subtracts a penalty. Retrieval is secondary; verbal confidence is a
     small auxiliary term (``_W_VERBAL_CONFIDENCE`` ≤ 0.05) — never the primary driver (faithfulness caveat).
     """
-    c = _C_BASE
+    c = base_prior()
     # hard positive evidence (primary mass)
     if s.canonical_doc_resolved:
         c += _W_CANONICAL_DOC
@@ -342,6 +374,8 @@ def decide(s: GateSignals) -> EUDecision:
             p_acceptable=p_acceptable, p_incorrect=p_incorrect,
             correctness=correctness, reason=reason)
 
+    tau = commit_threshold()
+
     blocker = hard_abstain_reason(s)
     if blocker is not None:
         return _mk(False, ABSTAIN, f"hard-abstain: {blocker} (U={u:.3f}, epistemic blocker)")
@@ -350,7 +384,9 @@ def decide(s: GateSignals) -> EUDecision:
         return _mk(True, HARD_ACCEPT,
                    f"HARD ACCEPT: deterministic lane + evidence complete + verifier agree (U={u:.3f})")
 
-    if u > 0.0:
-        return _mk(True, SOFT_ACCEPT, f"SOFT ACCEPT: expected utility U={u:.3f} > 0")
+    # SOT-2635 — commit bar is the calibrated τ (``RAG_EU_GATE_TAU``, default 0.0 ⇒ the original U>0).
+    if u > tau:
+        return _mk(True, SOFT_ACCEPT, f"SOFT ACCEPT: expected utility U={u:.3f} > τ={tau:.3f}")
 
-    return _mk(False, ABSTAIN, f"ABSTAIN: expected utility U={u:.3f} ≤ 0 (commit is EV-negative)")
+    return _mk(False, ABSTAIN,
+               f"ABSTAIN: expected utility U={u:.3f} ≤ τ={tau:.3f} (commit is EV-negative)")
