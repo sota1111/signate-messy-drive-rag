@@ -218,6 +218,10 @@ def _row(idx: int, recs: dict[int, dict], verdicts: dict[int, str]) -> dict:
     verdict = verdicts.get(idx, "MISSING")
     return {"index": idx, "verdict": verdict, "is_match": verdict in MATCH,
             "route": _route_of(rec), "stop_reason": rec.get("stop_reason"),
+            # SOT-2629 per-question intervention telemetry (absent key ⇒ that guard/flag was OFF this
+            # run; present-with-0/false ⇒ ON-but-idle). Carried into the gate JSON so an ablation can
+            # build the firing→verdict cross-table the fired flag actually caused (SOT-2634).
+            "interventions": rec.get("interventions") or {},
             "answer": str(rec.get("answer", ""))[:200]}
 
 
