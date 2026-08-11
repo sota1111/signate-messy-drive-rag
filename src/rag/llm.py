@@ -47,8 +47,29 @@ def _claude_cli_model() -> str:
     return (os.getenv("CLAUDE_CLI_MODEL") or getattr(settings, "CLAUDE_CLI_MODEL", "sonnet") or "sonnet").strip()
 
 
+class GeminiForbiddenError(RuntimeError):
+    """Raised when Gemini (genai) is accessed while ``RAG_FORBID_GEMINI`` is set (SOT-2648)."""
+
+
+def _forbid_gemini() -> bool:
+    """``RAG_FORBID_GEMINI`` truthy ⇒ any genai client access raises immediately (default OFF).
+
+    no-Gemini runs (e.g. the Sonnet gold100 dev cycle) set this so an unexpected Gemini
+    fallback at answer time (vision, naturalization, embeddings) fails loudly instead of
+    silently billing. Preprocessing/index builds simply leave it unset — Gemini stays
+    allowed there. Read at call time so tests and dev sessions flip it via the environment.
+    """
+    return (os.getenv("RAG_FORBID_GEMINI") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def client() -> genai.Client:
     global _client
+    if _forbid_gemini():
+        raise GeminiForbiddenError(
+            "RAG_FORBID_GEMINI is set: Gemini/genai access is forbidden during this run "
+            "(answer execution must stay on the non-Gemini backend; unset the flag for "
+            "preprocessing/index builds)."
+        )
     if _client is None:
         _client = genai.Client(
             vertexai=True,
@@ -155,6 +176,8 @@ def _gemini_generate(
                 # Blocked or empty — treat as recoverable, back off once.
                 raise RuntimeError(f"empty response (finish={getattr(resp, 'candidates', None)})")
             return text.strip()
+        except GeminiForbiddenError:
+            raise  # policy violation, not a transient failure — never retry or wrap
         except Exception as e:  # noqa: BLE001 — broad on purpose, we back off and retry
             last_err = e
             time.sleep(min(2 ** attempt * 2, 30))
@@ -238,6 +261,8 @@ def _embed_batch(mdl: str, chunk: list[str], task_type: str, retries: int) -> li
                 config=types.EmbedContentConfig(task_type=task_type),
             )
             return [list(e.values) for e in resp.embeddings]
+        except GeminiForbiddenError:
+            raise  # policy violation, not a transient failure — never retry or wrap
         except Exception as e:  # noqa: BLE001
             msg = str(e)
             if ("token count" in msg or "INVALID_ARGUMENT" in msg or "400" in msg) and len(chunk) > 1:
