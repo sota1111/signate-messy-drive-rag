@@ -20,7 +20,10 @@
     "  models, the least flaky class). Single-sample Sonnet-only recoveries (idx5/17/36/53/56/79/80/96)",
     "  were deliberately NOT used: one sample is not stability (SOT-2623 lesson).",
     "  Balance: 3 deterministic-lane picks (model-invariant, byte-exact — all deterministic-direct idx",
-    "  agree across backends per SOT-2642) + 7 LLM-loop picks across 6 archetypes.",
+    "  agree across backends per SOT-2642) + 7 LLM-loop picks across 6 archetypes. During the first",
+    "  live cycle gate, idx16/71 produced the correct value plus variable provenance text and Codex",
+    "  rejected the extra wording; they were replaced by idx3/81, which meet the same two-sample rule",
+    "  and retain document_extract coverage with exact verbatim extraction asks.",
     "",
     "MAINTENANCE: keep exactly 10, keep the type + det/LLM balance. Re-vet from fresh Sonnet gold100",
     "samples as they accumulate; swap an index only when its Sonnet verdict stops being reproducibly",
@@ -37,11 +40,11 @@
     {"index": 44, "archetype": "enum_set",            "route": "deterministic", "note": "Wave-A det pipeline; byte-exact gold (鈴木、藤田); det-direct in both Sonnet samples"},
     {"index": 74, "archetype": "version_diff",        "route": "deterministic", "note": "SOT-2619 det version_diff lane; Sonnet's only stable version_diff MATCH (c2/c3/sonnet all MATCH)"},
     {"index": 2,  "archetype": "highlight_set",       "route": "llm",           "note": "only highlight_set MATCH in both model lanes; MATCH across 4 champion samples + both Sonnet samples"},
-    {"index": 16, "archetype": "document_extract",    "route": "llm",           "note": "exact scalar (0.589); champion-vetted + both Sonnet samples"},
+    {"index": 3,  "archetype": "document_extract",    "route": "llm",           "note": "verbatim emphasis extraction; MATCH in both Sonnet samples"},
     {"index": 21, "archetype": "fact_lookup",         "route": "llm",           "note": "exact answer; champion MATCH->MATCH + both Sonnet samples"},
     {"index": 30, "archetype": "derived_calculation", "route": "llm",           "note": "exact scalar (1.18%); MATCH across 4 champion samples + both Sonnet samples"},
     {"index": 69, "archetype": "fact_lookup",         "route": "llm",           "note": "exact answer; champion MATCH->MATCH + both Sonnet samples"},
-    {"index": 71, "archetype": "document_extract",    "route": "llm",           "note": "exact answer; champion MATCH->MATCH + both Sonnet samples"},
+    {"index": 81, "archetype": "document_extract",    "route": "llm",           "note": "verbatim bold-text extraction; MATCH in both Sonnet samples"},
     {"index": 90, "archetype": "derived_calculation", "route": "llm",           "note": "exact answer; champion MATCH->MATCH + both Sonnet samples"}
   ]
 }

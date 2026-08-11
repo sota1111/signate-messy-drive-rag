@@ -1,62 +1,57 @@
-# Worker Report (solo) — SOT-2640
+# Worker Report (solo) — SOT-2648
 
 ## Summary
 
-前 worker（usage-limit 中断）の状態を引き継ぎ、MCP `submit_answer` を shared `commit_gate`(SOT-2637)
-の執行点へ配線する deliverable を完成・検証・出荷した。server は question/contract と session tool
-history を保持し、REJECT を非エラー tool result として Sonnet に返して in-band 再試行させ、
-`RAG_COMMIT_GATE_ABSTAIN_AFTER`（既定2）到達で ABSTAIN へ降格する。client は terminal decision の整形済み
-値を受理し、submit を経ない plain final text を同じ gate で fail-closed に処理し、`interventions.commit_gate`
-へ telemetry を記録する。`commit_gate.enforce()` を enforcement flag の single source of truth 化した。
+Completed Sonnet gold improvement cycle 1 in the private, `official:false` lane. Added a default-OFF
+`RAG_FORBID_GEMINI` guard that raises before any cached or new genai client can be used, a reproducible
+serial Sonnet focused/full-cycle runner, a cross-type 10-question Sonnet sentinel set, and the Sonnet
+cycle history ledger.
 
-**terminal 判断: 配線 deliverable は完了・検証済みで出荷する（PR→merge）。** `RAG_COMMIT_GATE`/`_ENFORCE`
-は既定 OFF ⇒ 本番=flash champion(net40)提出経路は byte-identical・ゼロリスク。in-band 再試行機構は実測で
-機能（idx4/idx68 を Perfect 回収・既存 MATCH の過剰棄権0）。残る idx29/31/72/62/85 の Incorrect は
-**shared gate の COVERAGE 限界**（numeric guard が値一致のみ保証し式/対象選択の semantic correctness を検証
-しない・chart_read/multi_hop/simple_lookup の semantic guard 不在）であり、これは submit 執行点の配線
-(=本 issue)ではなく fact-layer(SOT-2643-2647)・prompt 中立化(SOT-2641)の領域。本 issue を NEEDS_DEBUG に
-留めると correct・zero-risk な infra を塩漬けし、依存する SOT-2641/2642 を stall させる。design §2/§66 の
-「安全既定 → 実施して開示」に該当。
+The final focused gate passed with 10/10 sentinels and zero regressions. The fact layer recovered idx63
+and idx87 from abstain to correct answers; idx38 and idx57 remained safely abstained. The required full
+Sonnet dev gold100 completed under the guard at $0.0000 Gemini cost, but scored 39 match / 28 abstain /
+33 wrong (net 6), below cycle-0 net 18. The axis is therefore recorded as rejected for promotion; no
+official Flash/champion or submission asset was changed.
 
 ## Changed Files
 
-- `src/rag/mcp/server.py` — session history、submit gate 執行点、retry feedback、bounded abstain、decision log
-- `src/rag/llm_providers/claude_mcp.py` — context forwarding、terminal decision 受理、plain-final fail-closed、telemetry
-- `src/rag/agent/commit_gate.py` — `enforce()`（enforcement flag の single source of truth）
-- `src/rag/agent/investigator.py` — shared `enforce()` へ delegate
-- `tests/test_mcp_server.py` — REJECT→ABSTAIN、grounded COMMIT、OFF同値
-- `tests/test_claude_mcp.py` — terminal decision、plain-final、observational telemetry
-- `docs/ai/experiment_ledger.jsonl` — cycle4 axis 記録（wiring=promoted・残 axis=gate coverage）
+- `src/rag/llm.py` — default-OFF `RAG_FORBID_GEMINI` guard on all genai client access.
+- `tests/test_llm_provider.py` — cached/new client blocking, truthy parsing, text-only Claude routing,
+  and no-silent-fallback coverage.
+- `scripts/sonnet_gold_cycle1.sh` — guarded serial/resumable Sonnet dev gold100 runner.
+- `scripts/sonnet_gold_cycle1_focused.sh` — guarded focused target + sentinel runner.
+- `scripts/sonnet_sentinels.json` — 10-question, cross-type Sonnet sentinel set; wording-flaky idx16/71
+  replaced with two-sample-stable verbatim extraction idx3/81 after the first live gate.
+- `docs/ai/sonnet_gold_history.jsonl` — cycle 0 baseline and cycle 1 result/handoff.
+- `docs/ai/experiment_ledger.jsonl` — failed calibration gate, passing final focused gate, and rejected
+  full-cycle axis recorded.
+- `docs/gold_offline_history.jsonl`, `artifacts/gold_100_review.{md,csv}` — private dev measurement record.
 
 ## Commands Run
 
-- `.venv/bin/python -m pytest tests/test_mcp_server.py tests/test_claude_mcp.py tests/test_commit_gate.py tests/test_investigator.py -q` — 148 passed
-- （前 worker 実測）`pytest --ignore=tests/test_gate.py --ignore=tests/test_tiebreak.py -ra` — 1487 passed
-- `run_focused_gate.py --dev --workers 1 --target 4,29,31,68,72,62,85` — official:false, idx4/68 Perfect、他5 Incorrect、既存 MATCH の ABSTAIN 化0
+- `.venv/bin/pytest -q tests/test_llm_provider.py tests/test_focused_gate_model_guard.py` — 26 passed.
+- `.venv/bin/pytest -q` — 1,619 passed, 17 existing openpyxl warnings (599.56s).
+- `bash scripts/sonnet_gold_cycle1_focused.sh` — final PASS, 10/10 sentinels, regressions `[]`;
+  idx63=`Acceptable`, idx87=`Perfect`, idx38/57=`Missing`.
+- `bash scripts/sonnet_gold_cycle1.sh` — completed 100/100, `official:false`, match39 / abstain28 /
+  wrong33 / net6 / cost `$0.0000`.
 
 ## Acceptance Criteria
 
-- [x] submit_answer が gate 執行点になり、REJECT→in-band retry→上限 ABSTAIN が unit/integration test で機能
-- [x] Sonnet dev focused で確認: 既存 MATCH の過剰棄権なし（ABSTAIN 化0）、機構は wrong→MATCH を実証（idx4/68 Perfect 回収）。残 5 の非転換は gate COVERAGE 限界（別 issue の領域）として開示
-- [x] `RAG_COMMIT_GATE` OFF の submit response/served answer は従来同値（既定 OFF・test 済）
+- [x] Gemini cost $0 confirmed: full run reports `$0.0000`; `RAG_FORBID_GEMINI=1` guarded every genai
+  client access throughout answer execution.
+- [x] Focused improvement plus zero sentinel regression: idx63/87 recovered; final sentinel gate 10/10.
+- [x] Ledger and next-cycle handoff recorded in both Sonnet history and experiment ledger.
+- [x] Official lane untouched: all measurements are stamped `official:false`; no Flash champion/LB asset
+  or SIGNATE submission was changed.
 
 ## Risks
 
-- numeric grounding は「compute/aggregate 返値と submit 値の一致」であり式/対象選択の正しさは未保証。
-- chart_read/multi_hop/simple_lookup の semantic guard と不存在 universe certificate が不足（→SOT-2643-2647/2641）。
-- focused は dev official:false であり flash champion の公式非回帰根拠には使えない（本 issue は既定 OFF なので公式経路は byte-identical）。
-
-## GitHub
-
-- Branch: `feat/sot-2640-mcp-submit-commit-gate`
-- PR/merge: 本 report 後に作成・merge（下記 Next Action 参照）
-
-## Linear
-
-- 分類/分解判断・進捗コメントは投稿済み。Completion Report を投稿し In Review へ遷移。
+- Full-run net6 regressed from cycle0 net18 despite focused deterministic recovery. The configuration is
+  not promoted; repeated-sample re-anchoring and generic verbosity control are the next priorities.
+- idx38/57 remain abstentions; extending their question-independent evidence coverage is preferred over
+  forcing answers.
 
 ## Linear Report: POSTED
-
 ## Acceptance: PASS
-
 ## Next Action: READY_FOR_REVIEW
