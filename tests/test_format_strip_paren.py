@@ -78,6 +78,13 @@ def test_quote_unwrap_after_paren_strip():
     assert rules == ["strip_trailing_paren", "unwrap_quotes"]
 
 
+def test_verbatim_quote_with_paragraph_locator_stripped():
+    q = "契約書において、太字で記載されている部分を抽出してください"
+    out, rules = _strip(q, "「契約締結日兼効力発生日：2025-10-01」（契約書.docx 第114段落）")
+    assert out == "契約締結日兼効力発生日：2025-10-01"
+    assert rules == ["strip_trailing_paren", "unwrap_quotes"]
+
+
 # --------------------------------------------------------------------------- fail-closed keeps
 @pytest.mark.parametrize("question,value", [
     # idx49-shape gold: task name whose paren detail is part of the value — no annotation cue

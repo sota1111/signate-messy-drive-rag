@@ -165,10 +165,10 @@ _QUOTE_WRAP_RE = re.compile(r"^「([^「」]+)」$")
 # attributions (担当), meta commentary (部分/該当/見出し…), corporate-name expansions (株式会社…),
 # metric detail (相関係数/F1/約<digit>), and enumeration listings (タスクID: …).
 _ANNOTATION_PAREN_RE = re.compile(
-    r"担当|スライド|ページ|シート|セル|行目|参照|参考|補足|注記|出典|部分|該当|見出し"
+    r"担当|スライド|ページ|シート|セル|行目|段落|参照|参考|補足|注記|出典|部分|該当|見出し"
     r"|タスクID|アクションID|株式会社|有限会社|医療法人|相関係数|F1|約\s*[0-9０-９]")
 # The narrower meta-commentary subset that is safe even on a verbatim-extraction ask.
-_META_ANNOTATION_RE = re.compile(r"部分|記載|該当|出典|スライド|ページ|見出し")
+_META_ANNOTATION_RE = re.compile(r"部分|記載|該当|出典|スライド|ページ|段落|見出し")
 
 
 def strip_paren_enabled() -> bool:
