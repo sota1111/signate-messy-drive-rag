@@ -53,6 +53,7 @@ from src.rag.tools.file_grep import file_grep
 from src.rag.agent import pot_lane as _pot_lane
 from src.rag.agent import operand_prefill as _operand_prefill
 from src.rag.agent import enum_scan as _enum_scan
+from src.rag.agent import fact_layer as _fact_layer
 # NOTE: ``commit_gate`` is imported lazily inside :func:`investigate` (SOT-2639), not here: it pulls in
 # ``exec_verifier``, which imports names from this module, so a top-level import would form an
 # import cycle during ``investigator`` initialization.
@@ -432,10 +433,21 @@ _PROMPT_COMMIT_NEUTRAL = (
     f"answer=「{ABSTAIN}」・confidence=0.0 で submit_answer する(Incorrect=−1 < Missing=0)。"
 )
 
+# SOT-2647 — fact-layer tool discipline. Appended ONLY when RAG_FACT_LAYER is on (default OFF ⇒ the prompt
+# is byte-identical), mirroring the RAG_NEUTRAL_PROMPT module-level variant gate. Steers the loop to the
+# precomputed-store tools as the first choice over file_grep for 横断列挙/ID逆引き/派生量/版差分 fact reads.
+_PROMPT_FACT_LAYER = (
+    "8. 事前計算事実層(有効時): 横断列挙/横断比較(『APR-M3の案件を略称で列挙し契約金額合計』等)は "
+    "case_filter を、特定IDの内容抜き出しは id_lookup を、案件の相関/F1閾値/予測等の派生量は metric_lookup を、"
+    "旧版→新版の変更点は diff_lookup を、file_grep の反復より先に使う。いずれも出典付きの確定値(検証済み"
+    "operand)を返すので、その value を根拠に submit_answer する。返り値が空/未解決のときのみ従来の探索に戻す。\n"
+)
+
 SYSTEM_PROMPT = (
     _PROMPT_HEAD
     + (_PROMPT_EXPLORE_NEUTRAL if NEUTRAL_PROMPT else _PROMPT_EXPLORE_LEGACY)
     + _PROMPT_TOOLS
+    + (_PROMPT_FACT_LAYER if _fact_layer.enabled() else "")
     + (_PROMPT_COMMIT_NEUTRAL if NEUTRAL_PROMPT else _PROMPT_COMMIT_LEGACY)
 )
 
@@ -974,6 +986,13 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
                 _enum_scan.enum_scan_tool(question, predicate=predicate,
                                           entry_types=entry_types, project=project),
         ))
+    # SOT-2647 (事前計算事実層 5/5): the 4 precomputed stores (案件/ID/派生メトリクス/版差分) as first-class
+    # tools — case_filter / id_lookup / metric_lookup / diff_lookup. Additively exposed ONLY when
+    # RAG_FACT_LAYER is on (``_fact_layer.tools()`` returns [] otherwise), so the champion serve tool set /
+    # function-call schema / MCP surface stay byte-identical by default. Registering here is the single
+    # source of truth: :mod:`src.rag.mcp.server` builds its tools/list from ``build_tools`` too.
+    for _name, _desc, _params, _fn in _fact_layer.tools():
+        tools.append(AgentTool(_name, _desc, _params, _fn))
     return tools
 
 
@@ -2769,6 +2788,31 @@ def answer_question(question: str, *, model: str | None = None,
                     stop_reason="answered",
                     contract=contract,
                 ), question)
+        # SOT-2647 (事前計算事実層 5/5) — precomputed-store direct-answer lane. Sits AFTER the Stage0 router
+        # (so Wave A1〜B2 keep precedence and there is no contract-registry collision) and BEFORE the LLM
+        # loop: when RAG_FACT_LAYER is on AND the contract type binds unambiguously to a unique store value
+        # (案件マスタ enum / 派生メトリクス scalar), answer it deterministically WITHOUT the LLM loop —
+        # model-invariant, provenance-carrying (verified operand). Any ambiguity ⇒ ``fact_result`` None ⇒
+        # fall through to the loop (回答数を減らさない, wrong を増やさない, SOT-2601 の発火緩和 fail の教訓).
+        # RAG_FACT_LAYER default OFF ⇒ resolve() returns None ⇒ byte-identical. Never raises into the path.
+        if _fact_layer.enabled():
+            from src.rag.agent import formatting as _formatting
+            fact_started = time.monotonic()
+            fact_result = _fact_layer.resolve(question, contract, profile=profile_obj)
+            if fact_result is not None:
+                formatted = _formatting.format_contract(fact_result, question, contract_type=contract)
+                if formatted is not None:
+                    return _apply_answer_eu_gate(Investigation(
+                        question=question,
+                        answer=_answer_from_det_contract(formatted),
+                        iterations=1,
+                        tool_calls=[f"fact_layer:{contract}"],
+                        usage=Usage(),
+                        model="deterministic",
+                        elapsed_s=max(0.0, time.monotonic() - fact_started),
+                        stop_reason="answered",
+                        contract=contract,
+                    ), question)
         # SOT-2584 — Evidence Packet pre-inject (typed route → registry-resolved docs → slots → budget).
         # Built only behind RAG_EVIDENCE_PACKET; reuses the just-computed contract so the question is not
         # re-classified. Fail-open: any build error leaves ``preamble`` None so the answer path is
