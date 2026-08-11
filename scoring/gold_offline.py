@@ -479,6 +479,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="also write the JSON report to this path")
     ap.add_argument("--no-review", action="store_true",
                     help="skip regenerating artifacts/gold_100_review.md/.csv + history (SOT-2491)")
+    ap.add_argument("--official", dest="official", action="store_true", default=True,
+                    help="mark this run official in the history jsonl (default; flash-3.6 stack)")
+    ap.add_argument("--no-official", dest="official", action="store_false",
+                    help="mark this run official:false — dev-only calibration/exploration runs "
+                         "(e.g. Sonnet / claude-mcp) that must NOT back official non-regression "
+                         "claims (SOT-2625/2628); keeps them machine-distinguishable in history")
     ap.add_argument("--abstain-ledger", type=Path, default=None,
                     help="abstain ledger to join for per-code棄権集計 (SOT-2497; default "
                          "artifacts/abstain_ledger.jsonl)")
@@ -514,9 +520,10 @@ def main(argv: list[str] | None = None) -> int:
             from scoring import gold_review
             details = args.answers if args.answers.suffix.lower() == ".jsonl" else None
             gen = args.gen if args.run else "answers"
-            entry = gold_review.generate(report, details=details, gen=gen)
+            entry = gold_review.generate(report, details=details, gen=gen,
+                                         official=args.official)
             print(f"[gold_review] wrote {gold_review.DEFAULT_MD} / {gold_review.DEFAULT_CSV}; "
-                  f"history += {entry['recordedAt']}")
+                  f"history += {entry['recordedAt']} (official={entry['official']})")
         except Exception as exc:  # pragma: no cover - レビュー生成失敗で採点を落とさない
             print(f"[gold_review] skipped ({exc!r})")
 
