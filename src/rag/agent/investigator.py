@@ -539,6 +539,13 @@ class Investigation:
     pot_lane: dict[str, Any] | None = None  # SOT-2586 — last verify_formula three-layer verdict (None ⇒ lane not exercised)
     spin_pivots: int = 0  # SOT-2614 — forced consecutive-spin pivots fired this question (0 ⇒ guard OFF/no spin)
     search_cap_hits: int = 0  # SOT-2620 — over-cap search calls intercepted this question (0 ⇒ cap OFF/not hit)
+    # SOT-2629 — per-question intervention/guard firing telemetry, recorded for ANSWERED and abstained cases
+    # alike so class-A attribution (spin/cap 犯人説 …) is verifiable on the answered trace, not just the
+    # abstain ledger (cycle2 adversarial-review hole H6). One key per *active* intervention flag with an
+    # explicit fired count/bool (0/false ⇒ flag ON but did not fire — distinguishable from an ABSENT key ⇒
+    # flag OFF); an empty ``{}`` when no intervention flag was active. Telemetry only: it never touches the
+    # served answer, so the answer CSV stays byte-identical.
+    interventions: dict[str, Any] = field(default_factory=dict)
 
     @property
     def confidence(self) -> float:
@@ -572,6 +579,11 @@ class Investigation:
             # ``.details.jsonl`` stays byte-identical; a nonzero count lets the diagnosis measure how often
             # the search 上限 fired per question.
             **({"search_cap_hits": self.search_cap_hits} if self.search_cap_hits else {}),
+            # SOT-2629 — unified intervention telemetry. ALWAYS emitted (unlike the conditional keys above)
+            # so every details.jsonl row — answered or abstained — carries the same schema and a flag that is
+            # ON-but-fired-0× is distinguishable from a flag that was OFF. Empty ``{}`` when no intervention
+            # flag was active. Additive & telemetry-only: the served answer / answer CSV are unaffected.
+            "interventions": dict(self.interventions),
         }
 
 
@@ -2224,6 +2236,16 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
         error = error or f"max_turns={max_turns} reached without a final answer"
 
     model_name = getattr(model, "model_name", settings.GEN_MODEL_HARD)
+    # SOT-2629 — loop-level intervention telemetry (answered + abstained). A key appears ONLY when its
+    # intervention flag was active this run (an ABSENT key therefore means the flag was OFF), carrying the
+    # explicit firing detail — 0 when the guard was ON but never fired, so ON-but-idle is distinguishable
+    # from OFF on the answered trace (cycle2 adversarial-review hole H6). The env-level interventions built
+    # during preamble assembly (operand_prefill / condition_preir / eu_gate) are merged on by the caller.
+    loop_interventions: dict[str, Any] = {}
+    if pivot_enabled:
+        loop_interventions["spin_pivot"] = pivot_count
+    if search_cap_enabled:
+        loop_interventions["search_cap_hits"] = search_cap_hits
     investigation = Investigation(
         question=question, answer=answer, iterations=iterations, tool_calls=tool_calls,
         usage=usage, model=model_name, elapsed_s=max(0.0, clock() - start),
@@ -2231,6 +2253,7 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
         pot_lane=pot_lane_verdict,  # SOT-2586 — persist the forced-lane verdict for details/diagnostics
         spin_pivots=pivot_count,    # SOT-2614 — forced consecutive-spin pivots (0 ⇒ guard OFF/no spin)
         search_cap_hits=search_cap_hits,  # SOT-2620 — over-cap search calls intercepted (0 ⇒ cap OFF/not hit)
+        interventions=loop_interventions,  # SOT-2629 — per-question guard/flag firing telemetry
     )
 
     # SOT-2492 — abstain ledger: purely post-decision. The answer above is already final; here we only
@@ -2452,6 +2475,19 @@ def answer_question(question: str, *, model: str | None = None,
     first_move: "tuple[str, Mapping[str, Any]] | None" = None
     fallback: "object | None" = None
     preamble: "str | None" = None
+    # SOT-2629 — env/preamble-level intervention telemetry, merged onto the loop-level record the returned
+    # Investigation already carries (spin_pivot / search_cap). A key is added ONLY for an active flag (an
+    # ABSENT key ⇒ flag OFF); the value records whether it actually injected/fired for THIS question, so an
+    # ON-but-idle intervention is distinguishable from OFF on the answered trace (adversarial-review H6).
+    # ``eu_gate`` is env-only here (the gate's decision string is produced downstream in scoring.gate, not
+    # in this serve loop) — presence records that the EU gate was active for this question.
+    packet_interventions: dict[str, Any] = {}
+    try:
+        from src.rag.agent import eu_gate as _eu_gate
+        if _eu_gate.enabled():
+            packet_interventions["eu_gate"] = {"enabled": True}
+    except Exception:  # noqa: BLE001 — telemetry is additive; never break the answer path
+        pass
     if routing not in (None, False):
         from src.rag.agent import question_contract as _question_contract
         from src.rag.agent import routing as _routing  # lazy: keeps import free of the classifier deps
@@ -2508,6 +2544,25 @@ def answer_question(question: str, *, model: str | None = None,
                 decision = _query_router.classify_route(question, contract=qc)
                 _packet, preamble = _evidence_packet.build_directive(
                     question, project=packet_project, decision=decision)
+                # SOT-2629 — record whether the NUMERIC operand-prefill / condition-IR interventions
+                # actually injected into this question's packet (reading the packet the agent will see, so
+                # the telemetry cannot drift from what fired). Keys are added ONLY when the flag is ON; the
+                # value is 0/false when the flag was ON but nothing was injected for this question.
+                _pkt_ev = _packet.evidence if _packet is not None else None
+                if _operand_prefill.enabled():
+                    _catalog = (_pkt_ev or {}).get("operand_candidates")
+                    packet_interventions["operand_prefill"] = {
+                        "candidates": len(_catalog) if _catalog else 0,
+                        "injected": bool(_catalog),
+                    }
+                try:
+                    from src.rag.agent import condition_prefill as _condition_prefill
+                    if _condition_prefill.enabled():
+                        packet_interventions["condition_preir"] = {
+                            "built": bool((_pkt_ev or {}).get("condition_ir")),
+                        }
+                except Exception:  # noqa: BLE001 — telemetry is additive; never break the answer path
+                    pass
                 # SOT-2586 — NUMERIC PoT forced-lane directive (only when RAG_POT_HARD_LANE is on and the
                 # route is NUMERIC). Appended to the packet preamble so the agent is told to route its
                 # arithmetic through ``verify_formula`` (binder→制限AST→Decimal→独立検算) rather than 暗算.
@@ -2609,13 +2664,17 @@ def answer_question(question: str, *, model: str | None = None,
     # never imports the subprocess provider.
     if INVESTIGATOR_BACKEND == "claude-mcp":
         from src.rag.llm_providers import claude_mcp
-        return claude_mcp.investigate_question(
+        _inv = claude_mcp.investigate_question(
             question, tools=tools, system=system, contract=contract, preamble=preamble,
             max_turns=max_turns, timeout_s=timeout_s, model=model)
+        _inv.interventions.update(packet_interventions)  # SOT-2629 — merge env/packet-level telemetry
+        return _inv
     model_obj = gemini_model_factory(question, tools, model=model, system=system)
-    return investigate(model_obj, question, tools, max_turns=max_turns, timeout_s=timeout_s,
+    _inv = investigate(model_obj, question, tools, max_turns=max_turns, timeout_s=timeout_s,
                        ledger=ledger, calc_ledger=calc_ledger, research=research,
                        enumeration=enumeration, contract=contract, first_move=first_move,
                        fallback=fallback, budget_boundary=BUDGET_BOUNDARY_RESEARCH,
                        spin_detection=SPIN_DETECTION, pivot_detection=SPIN_PIVOT,
                        search_cap=SEARCH_CAP, preamble=preamble)
+    _inv.interventions.update(packet_interventions)  # SOT-2629 — merge env/packet-level telemetry
+    return _inv

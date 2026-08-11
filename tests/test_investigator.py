@@ -327,6 +327,37 @@ def test_investigate_omits_pot_lane_when_lane_not_exercised():
     assert "pot_lane" not in res.to_dict()
 
 
+def test_investigate_interventions_empty_when_no_guard_flag_active():
+    """SOT-2629 — with every intervention flag OFF, the answered trace carries an EMPTY interventions dict
+    (always present so the schema is uniform), and no per-flag key. The served answer is unchanged."""
+    tools = [_tool_that_records([]), inv.SUBMIT_ANSWER_TOOL]
+    model = ScriptedModel([
+        Step(function_calls=(Call("compute", {}),), usage=Usage(10, 5)),
+        _submit("20", confidence=0.9),
+    ])
+    res = investigate(model, "…", tools, max_turns=5)
+    assert res.interventions == {}
+    d = res.to_dict()
+    assert d["interventions"] == {}
+    json.dumps(d, ensure_ascii=False)  # details.jsonl serialization must not raise
+
+
+def test_investigate_records_active_guard_flags_even_when_idle():
+    """SOT-2629 (adversarial-review H6) — when the spin-pivot / search-cap guards are ARMED but never fire,
+    the answered case's details still records ``spin_pivot: 0`` / ``search_cap_hits: 0``. This is exactly
+    the distinction cycle2 lacked: a flag ON-but-fired-0× (key present, 0) vs a flag OFF (key absent)."""
+    tools = [_tool_that_records([]), inv.SUBMIT_ANSWER_TOOL]
+    model = ScriptedModel([
+        Step(function_calls=(Call("compute", {}),), usage=Usage(10, 5)),
+        _submit("20", confidence=0.9),
+    ])
+    res = investigate(model, "…", tools, max_turns=5,
+                      pivot_detection=True, search_cap={"cap": 5})
+    assert res.interventions == {"spin_pivot": 0, "search_cap_hits": 0}
+    d = res.to_dict()
+    assert d["interventions"] == {"spin_pivot": 0, "search_cap_hits": 0}
+
+
 def test_pot_hard_lane_rejects_numeric_submit_until_verified(monkeypatch):
     """SOT-2586 — ON means a real terminal gate: direct NUMERIC submit cannot bypass verify_formula."""
     from src.rag.agent import pot_lane as pl
