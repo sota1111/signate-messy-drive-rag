@@ -229,10 +229,18 @@ def _diff_lookup(question: str = "", old: str = "", new: str = "", project: str 
     rec = recs[0]
     changes = diff_store.filter_changes(
         rec, exclude_attributes=_split(exclude_attributes), require_attributes=_split(require_attributes))
-    value = [{"rank": c.get("rank"), "kind": c.get("kind"), "intent": c.get("intent"),
-              "before": c.get("before"), "after": c.get("after"),
-              "structural_location": c.get("structural_location"), "attributes": c.get("attributes")}
-             for c in changes[:12]]
+    # NB: store records keep the texts under "old"/"new" (diffpair.RankedChange.to_dict) — the prior
+    # "before"/"after" reads always returned None (SOT-2650 fix). Notebook records may also carry a
+    # deterministic table-header diff; surface it when present.
+    value = []
+    for c in changes[:12]:
+        item = {"rank": c.get("rank"), "kind": c.get("kind"), "intent": c.get("intent"),
+                "before": c.get("old", c.get("before")), "after": c.get("new", c.get("after")),
+                "structural_location": c.get("structural_location"), "attributes": c.get("attributes")}
+        for k in ("headers_added", "headers_removed", "headers_old_count", "headers_new_count"):
+            if c.get(k) not in (None, []):
+                item[k] = c[k]
+        value.append(item)
     return _contract.make(
         value, engine="diff_store",
         evidence={"applicable": True, "resolved": True, "old_file": rec.get("old_rel"),
@@ -388,6 +396,18 @@ _APR_CODE = re.compile(r"APR[-\s]?M([123])", re.IGNORECASE)
 _EXTRA_PREDICATE = re.compile(
     r"完了|未着手|進行|中止|ステータス|状態|かつ|うち|以上|以下|超|未満|行|サンプル|"
     r"金額|円|医療|固定|精算|着手金|期間|担当|契約|工数|会社|APR-M(?![123]).")
+# SOT-2650 amount-difference enumeration (idx67 型): 「完了案件のうち APR-Mx に該当する案件の中で、
+# 提案時金額と FR 時の金額が異なる案件を略称ですべて」. Both amounts are standard case-master attributes,
+# so under a full-coverage certificate over the filtered universe the enumeration is deterministic.
+_AMOUNT_DIFF_CUE = re.compile(
+    r"提案時?の?金額.{0,14}(?:FR|最終報告|最終請求)時?の?金額|"
+    r"(?:FR|最終報告|最終請求)時?の?金額.{0,14}提案時?の?金額")
+_DIFF_NE_CUE = re.compile(r"異な|一致しない|同じでない|違う")
+# Any attribute predicate OUTSIDE this shape's vocabulary (完了 status + APR code + the two amounts)
+# still defers — same precision-first boundary as the other composites.
+_DIFF_EXTRA_PREDICATE = re.compile(
+    r"未着手|進行|中止|以上|以下|超|未満|行|サンプル|医療|固定|精算|着手金|期間|担当|工数|会社|"
+    r"合計|総額|平均|中央値|最大|最小|上位|契約金額|着手|円")
 
 
 def _sole_apr_predicate(question: str) -> bool:
@@ -476,6 +496,61 @@ def _case_tokens(rec: Mapping[str, Any]) -> list[str]:
     return seen
 
 
+def _amount_diff_enum(question: str, apr: str):
+    """SOT-2650 — deterministic 提案時金額≠FR時金額 enumeration over the (完了, APR-Mx) universe.
+
+    Fires only when: the amount-difference shape is the question's ONLY non-status/APR predicate
+    (:data:`_DIFF_EXTRA_PREDICATE` defers anything else), AND the store certifies full coverage —
+    apr_code/status for EVERY case, and BOTH amounts for every case inside the filtered universe.
+    A single missing cell defers (an incomplete universe could silently drop a qualifying case).
+    """
+    case_master, _idm, _dm, _ds = _stores()
+    if case_master is None:
+        return None
+    if _DIFF_EXTRA_PREDICATE.search(question):
+        return None
+    rows = case_master.load()
+    if not rows:
+        return None
+    if any(_attr_value(r, "apr_code") is None for r in rows):
+        return None
+    use_status = "完了" in question
+    if use_status and any(_attr_value(r, "status") is None for r in rows):
+        return None
+    universe = [r for r in rows
+                if _attr_value(r, "apr_code") == apr
+                and (not use_status or _attr_value(r, "status") == "完了")]
+    # Full-coverage certificate on the compared attributes: every universe member must carry BOTH
+    # amounts (else defer — never enumerate over partial evidence).
+    amounts: list[tuple[Any, int, int]] = []
+    for r in universe:
+        prop = _attr_value(r, "proposal_amount_incl_tax")
+        fr = _attr_value(r, "fr_amount_incl_tax")
+        if not isinstance(prop, int) or not isinstance(fr, int):
+            return None
+        amounts.append((r, prop, fr))
+    matched = [(r, prop, fr) for (r, prop, fr) in amounts if prop != fr]
+    labels = [_case_label(r) for (r, _p, _f) in matched]
+    if matched and any(not l for l in labels):
+        return None
+    evidence = {
+        "filter": {"apr_code": apr, **({"status": "完了"} if use_status else {})},
+        "predicate": "proposal_amount_incl_tax != fr_amount_incl_tax",
+        "universe_size": len(rows), "filtered": len(universe), "matched": len(matched),
+        "cases": [{"abbrev": _case_label(r), "proposal_amount_incl_tax": p, "fr_amount_incl_tax": f,
+                   "proposal_source": _attr(r, "proposal_amount_incl_tax").get("source"),
+                   "fr_source": _attr(r, "fr_amount_incl_tax").get("source")}
+                  for (r, p, f) in matched],
+        "store": "case_master",
+        "completeness": "row_count==案件数 かつ 対象属性 filtered universe 全充足 (母集団確定)",
+    }
+    method = {"engine": "case_master", "contract": "full_enumeration",
+              "selection": "amount_diff_enumeration", "naturalize": False,
+              "verified_operand": True, "confidence": 1.0}
+    value = "、".join(labels) if labels else "該当なし"
+    return {"value": value, "evidence": evidence, "method": method}
+
+
 def _enum_lane(question: str):
     """An exhaustive 略称 enumeration for an APR-code FULL_ENUMERATION question — no aggregation.
 
@@ -495,6 +570,8 @@ def _enum_lane(question: str):
     # Complement/disjunction phrasing (以外/または…) voids both the enumeration and the empty-set proof.
     if _UNSAFE_SET_CUE.search(question):
         return None
+    if _AMOUNT_DIFF_CUE.search(question) and _DIFF_NE_CUE.search(question):
+        return _amount_diff_enum(question, f"APR-M{next(iter(codes))}")
     composite = bool(_AGG_CUE.search(question))
     if composite:
         # SOT-2649: only the 「APR-Mx を列挙し契約金額(税込)を合計」 shape may proceed (and it answers
