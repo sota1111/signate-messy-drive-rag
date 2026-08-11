@@ -214,6 +214,23 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  case master skipped: {type(e).__name__}: {e}")
 
+    # ID master reverse-lookup (SOT-2644 / 事前計算事実層 2/5): precompute every ID-code occurrence
+    # (タスクID/アクションID/マイルストーン/チェックポイント/WBS/AI番号 …) with its full 原文行 + 隣接列 +
+    # locator, so an "ID→内容そのまま抜き出す" question resolves to an O(1) reverse-lookup instead of the
+    # file_grep repetition that exhausts the turn budget (idx98: 11連発). Additive and fully guarded — a
+    # failure here can never corrupt the retrieval index, and runtime consultation is opt-in
+    # (RAG_ID_MASTER) so the champion serve path is byte-identical by default.
+    try:
+        from src.rag.index import id_master
+        idm = id_master.build(refs)
+        if verbose:
+            print(f"  id master: {idm['occurrences']} occurrences "
+                  f"({idm['distinct_ids']} distinct ids over {idm['files']} files) "
+                  f"-> {id_master.default_out_path()}")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  id master skipped: {type(e).__name__}: {e}")
+
     if verbose:
         print(f"embedding {len(chunks)} chunks...")
     texts = [c.text for c in chunks]
