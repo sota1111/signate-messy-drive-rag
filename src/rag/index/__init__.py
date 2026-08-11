@@ -196,6 +196,24 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  pre-index decrypt skipped: {type(e).__name__}: {e}")
 
+    # Case master table (SOT-2643 / 事前計算事実層 1/5): precompute one deterministic row per 案件
+    # (全案件 × 標準属性 with per-cell provenance), so cross-corpus enumeration / comparison questions
+    # (enum hard core idx38/67/87 …) reduce to a single filter over a self-evidently complete universe
+    # (row count == 案件数) instead of runtime evidence-search that exhausts the turn budget. Additive
+    # and fully guarded — a failure here can never corrupt the retrieval index, and runtime consultation
+    # is opt-in (RAG_CASE_MASTER) so the champion serve path is byte-identical by default.
+    try:
+        from src.rag.index import case_master
+        cmst = case_master.build(refs)
+        if verbose:
+            cert = cmst["report"]["certificate"]
+            print(f"  case master: {cmst['cases']} cases "
+                  f"(universe_ok={cert['row_count_equals_universe']}) "
+                  f"-> {case_master.default_out_path()}")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  case master skipped: {type(e).__name__}: {e}")
+
     if verbose:
         print(f"embedding {len(chunks)} chunks...")
     texts = [c.text for c in chunks]
