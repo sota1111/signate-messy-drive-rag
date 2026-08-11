@@ -229,6 +229,334 @@ def pair_record(pair: "diffpair.VersionPair", sources: Sequence[str]) -> dict[st
     }
 
 
+# --------------------------------------------------------------------------- notebook (.ipynb) diff レーン
+# SOT-2650 — idx22 型の hard-core 版ペア。決定論 office diff パイプライン (diffpair, pptx/docx/xlsx) は
+# serve path からも参照されるため触らず、notebook はこのストア専用の build 時レーンで扱う（追加行のみ =
+# additive、serve 到達は diff_lookup 経由で RAG_FACT_LAYER ゲート下）。セル単位で source と出力テキストを
+# 突き合わせ、変わった行だけを before/after で保存する（質問非依存・全 ipynb 版ペア網羅・LLM-free）。
+
+def _notebook_pairs() -> list["diffpair.VersionPair"]:
+    """All .ipynb version pairs via the same filename conventions as the office rules.
+
+    ``diffpair.find_pairs`` requires a version token on BOTH sides, so the corpus shape
+    ``01_eda_old.ipynb × 01_eda.ipynb`` (versioned old × unversioned latest) never enumerates there.
+    Here a versioned member pairs with its unversioned same-dir sibling (the latest), and the office
+    old-folder rule is mirrored as-is.
+    """
+    try:
+        refs = [r for r in diffpair._walk(None) if r.ext == "ipynb"]
+    except Exception:  # noqa: BLE001
+        return []
+    by_dir: dict[str, list[FileRef]] = {}
+    for r in refs:
+        by_dir.setdefault("/".join(r.rel.split("/")[:-1]), []).append(r)
+    pairs: list["diffpair.VersionPair"] = []
+    seen: set[tuple[str, str]] = set()
+    for d, files in by_dir.items():
+        by_stem = {nfc(f.stem): f for f in files}
+        for f in files:
+            pv = diffpair._parse_version(f.stem)
+            if pv is None:
+                continue
+            base, _rank = pv
+            latest = by_stem.get(nfc(base))
+            if latest is None or latest.rel == f.rel:
+                continue
+            key = (f.rel, latest.rel)
+            if key not in seen:
+                seen.add(key)
+                pairs.append(diffpair.VersionPair(f, latest, base, "notebook"))
+        # old-folder rule (old/ 旧/ …) mirrored from diffpair.find_pairs
+        leaf = nfc(d.split("/")[-1].lower()) if d else ""
+        if leaf in getattr(diffpair, "_OLD_DIR_NAMES", set()):
+            parent = "/".join(d.split("/")[:-1])
+            for old_ref in files:
+                for new_ref in by_dir.get(parent, []):
+                    if new_ref.name == old_ref.name:
+                        key = (old_ref.rel, new_ref.rel)
+                        if key not in seen:
+                            seen.add(key)
+                            pairs.append(diffpair.VersionPair(old_ref, new_ref, old_ref.stem, "notebook"))
+    return pairs
+
+
+def _nb_cells(path: Path) -> list[dict[str, str]] | None:
+    """Notebook → [{type, src, out}] (outputs as plain text), or ``None`` when unparsable."""
+    try:
+        nb = json.loads(Path(path).read_text(encoding="utf-8", errors="ignore"))
+    except Exception:  # noqa: BLE001
+        return None
+    cells: list[dict[str, str]] = []
+    for cell in nb.get("cells", []) or []:
+        src = "".join(cell.get("source", []) or [])
+        outs: list[str] = []
+        for o in cell.get("outputs", []) or []:
+            txt = o.get("text") or (o.get("data", {}) or {}).get("text/plain")
+            if txt:
+                outs.append("".join(txt) if isinstance(txt, list) else str(txt))
+        cells.append({"type": str(cell.get("cell_type", "code")), "src": src, "out": "\n".join(outs)})
+    return cells
+
+
+_EMBEDDED_IMG_RE = re.compile(r"!\[[^\]]*\]\(data:image/(png|jpeg);base64,([A-Za-z0-9+/=\s]+?)\)")
+
+
+def _embedded_image_b64(src: str) -> "tuple[str, str] | None":
+    """(mime_subtype, base64) of the first embedded data-URI image in a cell source, or ``None``."""
+    m = _EMBEDDED_IMG_RE.search(src or "")
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _transcribe_embedded(b64: str, subtype: str) -> "str | None":
+    """Build-time Gemini-vision transcription of one embedded image (表/図の中身をテキスト化).
+
+    Spends a vision call, so it runs only under the same opt-in build flag as the OCR store
+    (``RAG_OCR_STORE_BUILD``) — the default build stays LLM-free. Failure ⇒ ``None`` (honest marker).
+    """
+    try:
+        from src.rag.index import ocr_store
+        if not ocr_store.build_enabled():
+            return None
+        import base64 as _b64mod
+
+        from src.rag import llm
+        from src.rag.extract.vision import _OCR_PROMPT
+
+        data = _b64mod.b64decode(re.sub(r"\s+", "", b64))
+        mime = f"image/{subtype}"
+        try:
+            # Notebook-rendered tables are frequently transparent-background PNGs whose glyphs vanish
+            # on the model's default (black) canvas — composite onto white before transcription.
+            import io
+
+            from PIL import Image as _PILImage
+
+            img = _PILImage.open(io.BytesIO(data))
+            if img.mode in ("RGBA", "LA", "P"):
+                rgba = img.convert("RGBA")
+                canvas = _PILImage.new("RGB", rgba.size, (255, 255, 255))
+                canvas.paste(rgba, mask=rgba.split()[-1])
+                buf = io.BytesIO()
+                canvas.save(buf, format="PNG")
+                data, mime = buf.getvalue(), "image/png"
+        except Exception:  # noqa: BLE001 — compositing is best-effort; fall back to the raw bytes
+            pass
+        txt = llm.generate(_OCR_PROMPT, images=[llm.Image(data=data, mime_type=mime)],
+                           model=llm.settings.VISION_MODEL, max_output_tokens=2048)
+        return txt.strip() if txt and txt.strip() else None
+    except Exception:  # noqa: BLE001 — transcription is best-effort; the pair record survives without it
+        return None
+
+
+_HEADER_PROMPT = (
+    "画像は統計表・データ表の一部です。表のセクション見出し（変数名・列名。例: Attr1 のような識別子）だけを、"
+    "上から順に改行区切りで全て列挙してください。綴りは画像の文字を1文字ずつ正確に転記してください。"
+    "統計量の行ラベル（平均、標準偏差、データ個数など）や数値は出力しないでください。"
+    "見出しが無ければ NONE とだけ出力してください。")
+
+
+def _table_headers(b64: str, subtype: str, tiles: int = 4) -> "list[str] | None":
+    """Build-time vision enumeration of a rendered table's variable headers (tiled for resolution).
+
+    A 4000px-tall rendered describe() table downsamples past glyph fidelity in one shot (class→dass
+    misreads); reading vertical tiles keeps each pass sharp. Same opt-in gating as the transcription.
+    Returns the ordered de-duplicated header list, or ``None`` when unavailable.
+    """
+    try:
+        from src.rag.index import ocr_store
+        if not ocr_store.build_enabled():
+            return None
+        import base64 as _b64mod
+        import io
+
+        from PIL import Image as _PILImage
+
+        from src.rag import llm
+
+        data = _b64mod.b64decode(re.sub(r"\s+", "", b64))
+        img = _PILImage.open(io.BytesIO(data)).convert("RGBA")
+        canvas = _PILImage.new("RGB", img.size, (255, 255, 255))
+        canvas.paste(img, mask=img.split()[-1])
+        w, h = canvas.size
+        out: list[str] = []
+        for t in range(tiles):
+            tile = canvas.crop((0, h * t // tiles, w, h * (t + 1) // tiles))
+            buf = io.BytesIO()
+            tile.save(buf, format="PNG")
+            txt = llm.generate(_HEADER_PROMPT,
+                               images=[llm.Image(data=buf.getvalue(), mime_type="image/png")],
+                               model=llm.settings.VISION_MODEL, max_output_tokens=1024) or ""
+            for ln in txt.splitlines():
+                s = ln.strip()
+                if s and s != "NONE" and s not in out:
+                    out.append(s)
+        return out or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _changed_lines(old: str, new: str) -> tuple[str, str]:
+    """The line-level (removed, added) content between two texts — the changed rows only, clipped."""
+    import difflib
+
+    old_lines, new_lines = old.splitlines(), new.splitlines()
+    removed: list[str] = []
+    added: list[str] = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=old_lines, b=new_lines,
+                                                       autojunk=False).get_opcodes():
+        if tag in ("replace", "delete"):
+            removed.extend(old_lines[i1:i2])
+        if tag in ("replace", "insert"):
+            added.extend(new_lines[j1:j2])
+    return _clip_text("\n".join(removed)), _clip_text("\n".join(added))
+
+
+def _notebook_pair_record(pair: "diffpair.VersionPair") -> dict[str, Any]:
+    """One .ipynb pair's cell-level diff record (same schema as :func:`pair_record`)."""
+    old_cells = _nb_cells(pair.old.path)
+    new_cells = _nb_cells(pair.new.path)
+    alignment_ok = old_cells is not None and new_cells is not None
+    changes: list[dict[str, Any]] = []
+    if alignment_ok:
+        import difflib
+
+        sm = difflib.SequenceMatcher(a=[c["src"] for c in old_cells],
+                                     b=[c["src"] for c in new_cells], autojunk=False)
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                for oi, nj in zip(range(i1, i2), range(j1, j2)):
+                    if old_cells[oi]["out"] != new_cells[nj]["out"]:
+                        rem, add = _changed_lines(old_cells[oi]["out"], new_cells[nj]["out"])
+                        changes.append({"kind": "modify", "intent": "SUBSTANTIVE",
+                                        "old": rem, "new": add,
+                                        "structural_location": f"cell {nj + 1} (output)",
+                                        "attributes": ["substantive", "notebook", "output_change"]})
+            elif tag == "replace":
+                for oi, nj in zip(range(i1, i2), range(j1, j2)):
+                    old_img = _embedded_image_b64(old_cells[oi]["src"])
+                    new_img = _embedded_image_b64(new_cells[nj]["src"])
+                    if old_img and new_img:
+                        # An embedded data-URI image changed (e.g. a rendered 記述統計 table). The
+                        # base64 blob itself is diff-noise; at build time (vision, opt-in) enumerate
+                        # both renders' variable headers (tiled — glyph-exact) and transcribe the
+                        # content, storing the HEADER set diff + content diff instead.
+                        ch: dict[str, Any] = {"kind": "modify", "intent": "SUBSTANTIVE",
+                                              "structural_location": f"cell {nj + 1} (embedded image)",
+                                              "attributes": ["substantive", "notebook", "embedded_image"]}
+                        old_hdr = _table_headers(old_img[1], old_img[0])
+                        new_hdr = _table_headers(new_img[1], new_img[0])
+                        if old_hdr is not None and new_hdr is not None:
+                            ch["headers_old_count"] = len(old_hdr)
+                            ch["headers_new_count"] = len(new_hdr)
+                            ch["headers_added"] = [x for x in new_hdr if x not in old_hdr]
+                            ch["headers_removed"] = [x for x in old_hdr if x not in new_hdr]
+                            ch["attributes"].append("table_headers")
+                            if ch["headers_added"]:
+                                ch["attributes"].append("column_added")
+                        old_txt = _transcribe_embedded(old_img[1], old_img[0])
+                        new_txt = _transcribe_embedded(new_img[1], new_img[0])
+                        if old_txt is not None and new_txt is not None:
+                            rem, add = _changed_lines(old_txt, new_txt)
+                            ch["old"], ch["new"] = rem, add
+                            ch["attributes"].append("image_ocr")
+                        else:
+                            marker = "[埋め込み画像 (base64相違、転記未実施)]"
+                            ch["old"] = ch["new"] = marker
+                        changes.append(ch)
+                        continue
+                    rem, add = _changed_lines(old_cells[oi]["src"], new_cells[nj]["src"])
+                    changes.append({"kind": "modify", "intent": "SUBSTANTIVE",
+                                    "old": rem, "new": add,
+                                    "structural_location": f"cell {nj + 1} (source)",
+                                    "attributes": ["substantive", "notebook", "source_change"]})
+                    if old_cells[oi]["out"] != new_cells[nj]["out"]:
+                        rem, add = _changed_lines(old_cells[oi]["out"], new_cells[nj]["out"])
+                        changes.append({"kind": "modify", "intent": "SUBSTANTIVE",
+                                        "old": rem, "new": add,
+                                        "structural_location": f"cell {nj + 1} (output)",
+                                        "attributes": ["substantive", "notebook", "output_change"]})
+                for oi in range(i1 + (j2 - j1), i2):
+                    changes.append({"kind": "remove", "intent": "SUBSTANTIVE",
+                                    "old": _clip_text(old_cells[oi]["src"]), "new": "",
+                                    "structural_location": f"old cell {oi + 1}",
+                                    "attributes": ["substantive", "notebook", "deletion"]})
+                for nj in range(j1 + (i2 - i1), j2):
+                    changes.append({"kind": "add", "intent": "SUBSTANTIVE",
+                                    "old": "", "new": _clip_text(new_cells[nj]["src"]),
+                                    "structural_location": f"cell {nj + 1}",
+                                    "attributes": ["substantive", "notebook", "addition"]})
+            elif tag == "delete":
+                for oi in range(i1, i2):
+                    changes.append({"kind": "remove", "intent": "SUBSTANTIVE",
+                                    "old": _clip_text(old_cells[oi]["src"]), "new": "",
+                                    "structural_location": f"old cell {oi + 1}",
+                                    "attributes": ["substantive", "notebook", "deletion"]})
+            elif tag == "insert":
+                for nj in range(j1, j2):
+                    changes.append({"kind": "add", "intent": "SUBSTANTIVE",
+                                    "old": "", "new": _clip_text(new_cells[nj]["src"]),
+                                    "structural_location": f"cell {nj + 1}",
+                                    "attributes": ["substantive", "notebook", "addition"]})
+    truncated = len(changes) > _MAX_STORED_CHANGES
+    changes = changes[:_MAX_STORED_CHANGES]
+    for rank, ch in enumerate(changes):
+        ch["rank"] = rank
+    return {
+        "old_rel": nfc(pair.old.rel), "new_rel": nfc(pair.new.rel),
+        "old_name": nfc(pair.old.name), "new_name": nfc(pair.new.name),
+        "project": nfc(pair.new.project or pair.old.project or ""),
+        "base": nfc(pair.base), "basis": "notebook", "ext": "ipynb",
+        "sources": ["notebook"], "alignment_ok": alignment_ok,
+        "old_size": _file_size(pair.old.path), "new_size": _file_size(pair.new.path),
+        "change_count": len(changes), "truncated": truncated, "changes": changes,
+    }
+
+
+def _file_size(path) -> int:
+    try:
+        return int(Path(path).stat().st_size)
+    except OSError:
+        return 0
+
+
+def _prior_notebook_records(out: Path | None) -> dict[tuple[str, str], dict[str, Any]]:
+    """Prior store's notebook records keyed by (old_rel, new_rel) — for build-time reuse."""
+    p = out or default_out_path()
+    prior: dict[tuple[str, str], dict[str, Any]] = {}
+    try:
+        for line in Path(p).read_text(encoding="utf-8").splitlines():
+            rec = json.loads(line)
+            if rec.get("basis") == "notebook" and rec.get("old_rel") and rec.get("new_rel"):
+                prior[(rec["old_rel"], rec["new_rel"])] = rec
+    except Exception:  # noqa: BLE001 — no/corrupt prior store ⇒ nothing to reuse
+        return {}
+    return prior
+
+
+def _notebook_records(out: Path | None) -> list[dict[str, Any]]:
+    """Notebook pair records, reusing prior vision-derived records for unchanged files.
+
+    The vision passes run only under ``RAG_OCR_STORE_BUILD``; a default (LLM-free) rebuild must not
+    DOWNGRADE a previously transcribed record to the 転記未実施 marker, so an unchanged pair (same
+    old/new file sizes) whose prior record carries vision output is kept verbatim.
+    """
+    prior = _prior_notebook_records(out)
+    records: list[dict[str, Any]] = []
+    for pair in _notebook_pairs():
+        key = (nfc(pair.old.rel), nfc(pair.new.rel))
+        old = prior.get(key)
+        if (old is not None and old.get("alignment_ok")
+                and old.get("old_size") == _file_size(pair.old.path)
+                and old.get("new_size") == _file_size(pair.new.path)
+                and any("image_ocr" in (c.get("attributes") or []) or "table_headers" in (c.get("attributes") or [])
+                        or "embedded_image" not in (c.get("attributes") or [])
+                        for c in old.get("changes", []) or [{}])):
+            records.append(old)
+            continue
+        records.append(_notebook_pair_record(pair))
+    return records
+
+
 # --------------------------------------------------------------------------- write / build
 def _sort_key(rec: dict[str, Any]) -> tuple:
     return (rec.get("project", ""), rec.get("old_rel", ""), rec.get("new_rel", ""))
@@ -264,6 +592,12 @@ def build(refs: list[FileRef] | None = None, *, out: Path | None = None,
     """
     pairs = enumerate_pairs()
     records = [pair_record(pair, sources) for pair, sources in pairs]
+    # SOT-2650: notebook (.ipynb) pairs — build-time cell-level diff lane (office enumerators can never
+    # produce these, so the append is disjoint / additive).
+    try:
+        records += _notebook_records(out)
+    except Exception:  # noqa: BLE001 — the notebook lane must not sink the office store
+        pass
     counts = write_store(records, out)
     report = build_report(records, out or default_out_path())
     if write_report:
@@ -341,8 +675,9 @@ _VERSION_HARD_CORE: dict[str, dict[str, Any]] = {
     "idx22": {
         "gist": "白峰信用リスク評価 01_eda_old.ipynb→01_eda.ipynb の記述統計表の変更（hard core）",
         "old_hint": "01_eda_old.ipynb", "new_hint": "白峰信用リスク評価",
-        "note": ("**.ipynb 版ペア** — 決定論 office diff パイプライン(pptx/docx/xlsx)の対象外のため本ストアでは "
-                 "diff 未確定。notebook 構造 diff は別レーンの領域（本ストアはカバレッジ外を honest に報告）。"),
+        "note": ("**.ipynb 版ペア** — 決定論 office diff パイプライン(pptx/docx/xlsx)の対象外。SOT-2650 で "
+                 "build 時 notebook レーン（セル単位 source/出力 diff、basis=notebook）が本ストアに追加行として "
+                 "列挙するようになった。"),
     },
     "idx95": {
         "gist": "青嶺不動産 スケジュール_r1→_r2、未着手→完了を除く実質的変更（Bクラス誤答）",

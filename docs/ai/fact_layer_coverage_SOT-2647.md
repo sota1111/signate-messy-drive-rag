@@ -74,3 +74,26 @@ case_filter を選び MATCH）。モデルのツール選択に依存しない�
   青葉バイオ の 2 案件に跨る語幹で従来 defer。全候補が**同一トークン**でマッチし、アンカ済み
   メトリクス（best_f1 等）を **non-null で持つ案件が厳密に 1 つ**のときのみその案件に束縛する
   （store 側の事実が曖昧性を解消）。異なる 2 社名の明示（比較形）は従来どおり defer。
+
+## SOT-2650 追補 — OCR 永続ストア / idx67 金額カバレッジ / idx22 notebook レーン（Sonnet cycle3）
+
+cycle2 の残 abstain は BUDGET_EXHAUSTED 25 支配だが、その相当数は「証拠がそもそも読めない」クラス
+だった — スキャン PDF（テキスト層なし/ほぼなし）18 本は、Sonnet dev レーンでは RAG_FORBID_GEMINI=1
+により live OCR (RAG_PDF_OCR) が**無音で空振り**するため、どのツール経路でも到達不能。cycle3 の拡張:
+
+- **OCR 永続ストア（`src/rag/index/ocr_store.py`, `RAG_OCR_STORE` 既定 OFF）**: 実質画像 PDF（本文
+  <200 字。実測ギャップ 43↔3375 字の内側）18 本を **build 時に一度だけ** Gemini vision で転記し
+  `artifacts/ocr_store.jsonl` へ焼き込み。serve は genai 呼び出しなしでストアを読む。near-empty
+  最終報告（みなみ野/青潮）と 青葉バイオ 提案書 PDF は live OCR の「厳密空」トリガも外れていた層で、
+  本ストアが唯一の到達経路。ビルドは RAG_OCR_STORE_BUILD 明示時のみ（vision 費用を伴う唯一のストア）。
+- **idx67（提案時金額≠FR時金額の列挙）**: case_master の 提案/FR 金額抽出を実コーパスの印字形
+  （隣接行ラベル・半角括弧 OCR 形・税抜×1.10 整数のみ fallback）へ拡張し **1-2/10 → 10/10**。
+  その完全被覆証明書の下で「完了 × APR-Mx × 提案≠FR」形の composite を決定論レーン化
+  （`amount_diff_enumeration`）。欠測セルが 1 つでもあれば defer（部分母集団で列挙しない）。
+- **idx22（ipynb 版ペア）**: diff_store に build 専用 notebook レーンを追加（diffpair 本体は serve
+  経路のため不変更）。セル単位 source/出力 diff に加え、変更された埋め込み画像（描画済み記述統計表）
+  は build 時に**縦タイル分割 vision 読取**で変数見出し集合を機械抽出し、`headers_added=['class']`
+  (64→65) を決定論フィールドとして保存。既存レコードは (rel,size) 一致で再利用され、LLM-free の
+  既定ビルドが転記済みレコードを劣化させることはない。
+- **diff_lookup の before/after 修正**: ストアは変更テキストを `old`/`new` キーで保存するが、ツールは
+  `before`/`after` を読んでいたため**全変更の内容が None で返っていた**（SOT-2647 配線以来の欠陥）。

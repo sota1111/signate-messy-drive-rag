@@ -136,6 +136,107 @@ _FULLWIDTH_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789"
 _KANJI_SMALL_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 
 
+# ------------------------------------------------------------------- SOT-2650 括弧内付加情報の書式契約
+# The "parenthetical addition" wrong class (idx52/84/87/88 …): the committed value is correct but the
+# model appends a supplementary annotation — 「解釈・業務示唆整理（担当：松本・鈴木）」「5（スライド6）」
+# 「AYM(青葉与信マネジメント株式会社)」 — and the judge scores the extra content Incorrect. Dropping a
+# *trailing* balanced （…）/(…) group never changes the answer value (the value is the body before it),
+# so this is a value-preserving contract in the same family as the SOT-2617 verbosity trim.
+#
+# Fail-closed boundaries (some gold answers legitimately END with a parenthetical — e.g. a task name
+# 「…確定（タスク割振・ガント更新）」 or a value detail 「n_estimators（1位=500、2位=300）」 — so a blanket
+# trailing strip is NOT value-preserving; only *recognized annotation shapes* are dropped):
+# * only a TRAILING group is dropped — a mid-string parenthetical (idx93 gold 「疑似欠損（NA）扱い…」)
+#   is part of the extracted value and is never touched;
+# * the group's CONTENT must look like an annotation: a locator/attribution/name-expansion/metric-detail
+#   keyword (:data:`_ANNOTATION_PAREN_RE`), or a qualifier echoed verbatim from the question
+#   (idx52 「（別契約）」 ← 「別契約」と明記されているもの). Anything else is treated as value and kept;
+# * a verbatim-extraction ask (「そのまま」「抜き出し」) narrows further to meta-commentary shapes only
+#   (:data:`_META_ANNOTATION_RE` — 「…の部分」「（スライド6）」), since there the source text, parens
+#   included, IS the requested value;
+# * the remaining body must be non-empty — a fully parenthesized answer is left alone;
+# * multi-line answers are prose, not a value+annotation shape — skipped;
+# * gated behind ``RAG_FORMAT_STRIP_PAREN`` (default OFF ⇒ byte-identical serve path).
+_PAREN_OPEN = {"(", "（"}
+_PAREN_CLOSE = {")", "）"}
+_VERBATIM_Q_RE = re.compile(r"そのまま|抜き出し|抜き出す|抜粋")
+_QUOTE_WRAP_RE = re.compile(r"^「([^「」]+)」$")
+# Supplementary-annotation cues inside a trailing paren: provenance locators (スライド/ページ/セル…),
+# attributions (担当), meta commentary (部分/該当/見出し…), corporate-name expansions (株式会社…),
+# metric detail (相関係数/F1/約<digit>), and enumeration listings (タスクID: …).
+_ANNOTATION_PAREN_RE = re.compile(
+    r"担当|スライド|ページ|シート|セル|行目|段落|参照|参考|補足|注記|出典|部分|該当|見出し"
+    r"|タスクID|アクションID|株式会社|有限会社|医療法人|相関係数|F1|約\s*[0-9０-９]"
+    r"|W[0-9０-９]+\s*[〜～\-]\s*W[0-9０-９]+")
+# The narrower meta-commentary subset that is safe even on a verbatim-extraction ask.
+_META_ANNOTATION_RE = re.compile(r"部分|記載|該当|出典|スライド|ページ|段落|見出し")
+
+
+def strip_paren_enabled() -> bool:
+    """Whether the trailing-parenthetical strip fires — ``RAG_FORMAT_STRIP_PAREN`` (default OFF)."""
+    return _env_flag("RAG_FORMAT_STRIP_PAREN", False)
+
+
+def _trailing_paren_span(text: str) -> "tuple[int, int] | None":
+    """(start, end) of a balanced trailing （…）/(…) group in ``text`` (end == len), or ``None``."""
+    if not text or text[-1] not in _PAREN_CLOSE:
+        return None
+    depth = 0
+    for i in range(len(text) - 1, -1, -1):
+        ch = text[i]
+        if ch in _PAREN_CLOSE:
+            depth += 1
+        elif ch in _PAREN_OPEN:
+            depth -= 1
+            if depth == 0:
+                return i, len(text)
+    return None  # unbalanced — leave alone
+
+
+def strip_trailing_parenthetical(question: str, value: str) -> "tuple[str, list[str]]":
+    """Drop trailing supplementary parenthetical group(s) from an answer, value-preserving.
+
+    Returns ``(new_value, fired_rules)`` — ``fired_rules`` is empty when nothing changed. Also unwraps
+    a whole-answer 「…」 quotation (the same annotation-verbosity class: 「0.589」 vs gold 0.589).
+    """
+    rules: list[str] = []
+    if not value or "\n" in value.strip():
+        return value, rules
+    text = value.strip()
+    question = question or ""
+    verbatim = bool(_VERBATIM_Q_RE.search(question))
+    # trailing sentence punctuation after the group (「…（同額）。」) is preserved across the strip
+    tail = ""
+    while text and text[-1] in "。．.":
+        tail = text[-1] + tail
+        text = text[:-1].rstrip()
+    while True:
+        span = _trailing_paren_span(text)
+        if span is None:
+            break
+        body = text[:span[0]].rstrip()
+        content = text[span[0] + 1:len(text) - 1].strip()
+        if not body or not content:
+            break  # fully parenthesized (or empty group) — the group IS the value
+        if verbatim:
+            annotation = bool(_META_ANNOTATION_RE.search(content))
+        else:
+            annotation = bool(_ANNOTATION_PAREN_RE.search(content)) or (
+                len(content) >= 2 and content in question)
+        if not annotation:
+            break  # unrecognized shape ⇒ value-bearing, keep (fail-closed)
+        text = body
+        if "strip_trailing_paren" not in rules:
+            rules.append("strip_trailing_paren")
+    quote = _QUOTE_WRAP_RE.match(text)
+    if quote and quote.group(1).strip():
+        text = quote.group(1).strip()
+        rules.append("unwrap_quotes")
+    if not rules:
+        return value, rules
+    return text + tail, rules
+
+
 def _parse_small_int(raw: str) -> "int | None":
     """Parse a small positive integer written in ASCII/fullwidth digits or 一〜十 kanji (precision桁 use)."""
     s = raw.translate(_FULLWIDTH_DIGITS).strip()

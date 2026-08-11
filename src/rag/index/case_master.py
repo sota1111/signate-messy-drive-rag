@@ -158,13 +158,46 @@ _PROPOSAL_AMOUNT_PATTERNS = [
     r"見込金額（税込）\s*[：:|]?\s*[¥￥]?\s*([0-9][0-9,]*)" + _CCY,
     r"想定金額（税込）\s*[：:|]?\s*[¥￥]?\s*([0-9][0-9,]*)" + _CCY,
     r"提案金額（税込）\s*[：:|]?\s*[¥￥]?\s*([0-9][0-9,]*)" + _CCY,
-    r"[¥￥]\s*([0-9][0-9,]*)\s*（税込）",
+    # 東都: 「見込金額：4,675,000円（税込）」 — the 税込 qualifier trails the figure.
+    r"見込金額\s*[：:]\s*[¥￥]?\s*([0-9][0-9,]*)\s*円\s*（税込）",
+    # 京橋/かえで: 「費用: ¥5,775,000（税込・固定価格）」「¥3,850,000（税込）」.
+    r"[¥￥]\s*([0-9][0-9,]*)\s*（税込[^）]*）",
+    # 青嶺: 「支払条件：…一括支払（100%）　税込 ¥4,675,000」.
+    r"税込\s*[¥￥]\s*([0-9][0-9,]*)",
+]
+# PPTX 費用見積 slides frequently put the label and the figure on ADJACENT extracted lines
+# (「契約金額（税込）」 ↵ 「¥3,960,000」 / 「7,480,000円」) — a label regex + short lookahead resolves
+# those. Ordered most-specific-first; each label is tried across all texts before the next.
+_PROPOSAL_AMOUNT_LABELS = [
+    r"(?:契約|見込)?金額（税込）",
+    r"税込金額",
+    # 青潮: 「見込金額」 ↵ 「¥4,675,000」 ↵ 「（税込）」 — unqualified label, figure on the next line.
+    # 税抜-qualified variants are excluded so a tax-exclusive figure can never be committed as 税込.
+    r"見込金額(?!（税抜)",
 ]
 _FR_AMOUNT_PATTERNS = [
-    r"最終請求金額（税込）\s*[：:|]?\s*[¥￥]?\s*([0-9][0-9,]*)" + _CCY,
+    # 半角/全角括弧の両方を許容 — OCR 転記（スキャン最終報告）は半角括弧で出る（青潮: 「最終請求金額(税込):
+    # 4,785,000 JPY」）。
+    r"最終請求金額[（(]税込[）)]\s*[：:|]?\s*[¥￥]?\s*([0-9][0-9,]*)" + _CCY,
     r"最終金額（税込）\s*[：:|]?\s*[¥￥]?\s*([0-9][0-9,]*)" + _CCY,
     r"請求金額（税込）\s*[：:|]?\s*[¥￥]?\s*([0-9][0-9,]*)" + _CCY,
+    # 京橋: 「固定価格契約: 税抜 5,250,000円（税込 5,775,000円）」/ みなみ野(OCR): 「固定価格(税込3,960,000円)」.
+    r"[（(]税込\s*([0-9][0-9,]*)\s*円[）)]",
+    # ひがし丘/青葉バイオ: 「税込金額 4,675,000円」「税込金額：3,443,000 円」.
+    r"税込金額\s*[：:|]?\s*[¥￥]?\s*([0-9][0-9,]*)\s*(?:円|JPY)",
+    # 青葉与信: 「契約金額：¥4,200,000（税抜）/ ¥4,620,000（税込）」.
+    r"[¥￥]\s*([0-9][0-9,]*)\s*（税込）",
 ]
+_FR_AMOUNT_LABELS = [
+    r"最終請求金額（税込）",
+    r"税込金額",
+]
+# 白峰: the 最終報告 prints only 「固定価格6,800,000円（税抜）」 — a tax-EXCLUSIVE total. Committed as
+# 税込 only when 税抜×1.1 is exactly integral (消費税10%, the corpus-wide rate) — fail-closed otherwise.
+_FR_AMOUNT_EXCL_PATTERNS = [
+    r"固定価格\s*([0-9][0-9,]*)\s*円\s*（税抜）",
+]
+_AMOUNT_LINE_RE = re.compile(r"^\s*[¥￥]?\s*([0-9][0-9,]*)\s*(?:円|JPY)?\s*$")
 _EST_EFFORT_PATTERNS = [r"見込工数\s*[：:|]?\s*([0-9][0-9,]*)\s*時間", r"見積工数\s*[：:|]?\s*([0-9][0-9,]*)\s*時間"]
 _ACT_EFFORT_PATTERNS = [r"実績工数\s*[：:|]?\s*([0-9][0-9,]*)\s*時間"]
 
@@ -186,6 +219,55 @@ def _first_unique_int(texts: Sequence[tuple[FileRef, str]],
         if len(values) == 1 and locus is not None:
             return values.pop(), locus
     return None
+
+
+def _labeled_amount(texts: Sequence[tuple[FileRef, str]],
+                    labels: Sequence[str]) -> tuple[int, dict[str, Any]] | None:
+    """A label line whose yen figure sits on the SAME line or within the next 2 extracted lines.
+
+    Mirrors :func:`_first_unique_int`'s precision-first contract: all matches for one label must
+    collapse to a single distinct int, else the label is ambiguous and the next label is tried.
+    """
+    for label in labels:
+        label_re = re.compile(label)
+        values: set[int] = set()
+        locus: dict[str, Any] | None = None
+        for ref, text in texts:
+            lines = text.splitlines()
+            for i, line in enumerate(lines):
+                if not label_re.search(line):
+                    continue
+                found: int | None = None
+                same = re.search(label + r"\s*[：:|]?\s*[¥￥]?\s*([0-9][0-9,]*)" + _CCY, line)
+                if same:
+                    found = int(same.group(1).replace(",", ""))
+                else:
+                    for nxt in lines[i + 1:i + 3]:
+                        m = _AMOUNT_LINE_RE.match(nxt)
+                        if m:
+                            found = int(m.group(1).replace(",", ""))
+                            break
+                if found is not None:
+                    values.add(found)
+                    if locus is None:
+                        locus = _source(ref.rel, snippet=line.strip())
+        if len(values) == 1 and locus is not None:
+            return values.pop(), locus
+    return None
+
+
+def _fr_amount_from_excl(texts: Sequence[tuple[FileRef, str]]) -> tuple[int, dict[str, Any]] | None:
+    """税抜-only FR total → 税込 via the corpus-wide 消費税10%, only when exactly integral (fail-closed)."""
+    hit = _first_unique_int(texts, _FR_AMOUNT_EXCL_PATTERNS)
+    if hit is None:
+        return None
+    excl, locus = hit
+    incl_times_10 = excl * 11
+    if incl_times_10 % 10 != 0:
+        return None
+    locus = dict(locus)
+    locus["basis"] = "税抜表示×1.10（消費税10%）"
+    return incl_times_10 // 10, locus
 
 
 # --------------------------------------------------------------------------- APR / 決裁レベル derivation
@@ -310,10 +392,13 @@ def _make_record(project: str, refs: Sequence[FileRef], glossary: Glossary) -> C
     proposal_texts = _texts_for(project, refs, "proposal", {"docx", "pptx", "pdf", "xlsx"})
     report_texts = _texts_for(project, refs, "report", {"docx", "pptx", "pdf", "xlsx"})
 
-    prop = _first_unique_int(proposal_texts, _PROPOSAL_AMOUNT_PATTERNS)
+    prop = (_first_unique_int(proposal_texts, _PROPOSAL_AMOUNT_PATTERNS)
+            or _labeled_amount(proposal_texts, _PROPOSAL_AMOUNT_LABELS))
     attrs["proposal_amount_incl_tax"] = (_cell(prop[0], prop[1]) if prop
                                          else _missing("提案時金額（税込）を提案書から一意抽出できない"))
-    fr = _first_unique_int(report_texts, _FR_AMOUNT_PATTERNS)
+    fr = (_first_unique_int(report_texts, _FR_AMOUNT_PATTERNS)
+          or _labeled_amount(report_texts, _FR_AMOUNT_LABELS)
+          or _fr_amount_from_excl(report_texts))
     attrs["fr_amount_incl_tax"] = (_cell(fr[0], fr[1]) if fr
                                    else _missing("FR時金額（税込）を最終報告書から一意抽出できない"))
     est = _first_unique_int(proposal_texts, _EST_EFFORT_PATTERNS)
