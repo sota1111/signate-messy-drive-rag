@@ -252,6 +252,27 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  derived metrics skipped: {type(e).__name__}: {e}")
 
+    # Version-pair diff store (SOT-2646 / 事前計算事実層 4/5): precompute every version-family pair's
+    # structural diff + SUBSTANTIVE-ranked candidates (+ per-change exclusion attributes) once, so a
+    # version_diff question reads a pre-confirmed result instead of re-running the runtime diff→LLM
+    # formatting that flaked run-to-run (cycle3 version 系 MATCH↔WRONG). Pair enumeration unions the
+    # filename rules with the document-registry families so the SOT-2588 gap (_old×unversioned latest,
+    # idx0/idx1) is filled. Question-independent & LLM-free (diff logic itself unchanged — it only calls
+    # diffpair.rank_changes). Additive and fully guarded — a failure here can never corrupt the retrieval
+    # index, and runtime consultation is opt-in (RAG_DIFF_STORE) so the champion serve path is byte-identical.
+    try:
+        from src.rag.index import diff_store
+        ds = diff_store.build(refs)
+        if verbose:
+            cov = ds["report"]["version_hard_core_coverage"]
+            covered = sum(1 for c in cov.values() if c["enumerated"] and c["alignment_ok"])
+            print(f"  diff store: {ds['pairs']} version pairs "
+                  f"({ds['changes']} ranked changes, alignment_failures={ds['alignment_failures']}, "
+                  f"hard_core_covered={covered}/{len(cov)}) -> {diff_store.default_out_path()}")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  diff store skipped: {type(e).__name__}: {e}")
+
     if verbose:
         print(f"embedding {len(chunks)} chunks...")
     texts = [c.text for c in chunks]
