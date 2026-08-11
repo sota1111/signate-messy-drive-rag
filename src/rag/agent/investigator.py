@@ -78,18 +78,15 @@ _COMMIT_GATE_RETRY_DIRECTIVE = (
     "列挙の『該当なし』は母集団を全数確認してから submit_answer してください。"
     "根拠を実際に取得できない場合のみ棄権してください。")
 
-_COMMIT_GATE_ON = {"1", "true", "yes", "on"}
-
 
 def _commit_gate_enforce() -> bool:
     """Whether the commit gate's verdict is ENFORCED on the answer — ``RAG_COMMIT_GATE_ENFORCE`` (default
-    OFF). SOT-2639's Gemini wiring is equivalence-preserving: with ``RAG_COMMIT_GATE=1`` alone the gate's
-    decision + telemetry are recorded but the loop's own inline guards stay authoritative, so a committed
-    answer is served VERBATIM (byte-equivalent to OFF — the champion's inline exec/PoT/numeric guards
-    already vetted it, and the gate's stricter compute-record heuristic must not degrade a good derived
-    answer). Enforcement (REJECT → in-band retry, ABSTAIN 降格) is opt-in and is what SOT-2640 turns on
-    for the guard-LESS claude-mcp backend, which commits ``submit_answer`` raw."""
-    return os.getenv("RAG_COMMIT_GATE_ENFORCE", "0").strip().lower() in _COMMIT_GATE_ON
+    OFF). Delegates to :func:`commit_gate.enforce` (SOT-2640, single source of truth for the flag shared
+    across the Gemini and claude-mcp wiring points). SOT-2639's Gemini wiring is equivalence-preserving:
+    with ``RAG_COMMIT_GATE=1`` alone the gate's decision + telemetry are recorded but the loop's own inline
+    guards stay authoritative, so a committed answer is served VERBATIM (byte-equivalent to OFF)."""
+    from src.rag.agent import commit_gate as _commit_gate  # lazy (avoids exec_verifier import cycle)
+    return _commit_gate.enforce()
 
 
 def _bool_env(key: str, default: bool) -> bool:

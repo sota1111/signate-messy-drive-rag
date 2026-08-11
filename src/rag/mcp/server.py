@@ -54,6 +54,15 @@ _METHOD_NOT_FOUND = -32601
 _INVALID_PARAMS = -32602
 _INTERNAL_ERROR = -32603
 
+# SOT-2640 — in-band feedback returned as the submit_answer tool result when the shared commit gate
+# REJECTs a submitted answer. The flat-rate Sonnet loop reads this (a normal, non-error tool result) and
+# re-derives + re-submits, exactly as the Gemini loop's own ``answer_rejected`` retry channel does. The
+# retry is bounded: the gate itself degrades to ABSTAIN after RAG_COMMIT_GATE_ABSTAIN_AFTER rejects.
+_COMMIT_GATE_RETRY_DIRECTIVE = (
+    "commit_gate が回答を却下しました。数値回答は compute / corpus_aggregate で値を実際に導出・検算してから、"
+    "列挙の『該当なし』は母集団を全数確認してから submit_answer を呼び直してください。"
+    "根拠を実際に取得できない場合のみ answer=「わかりません」で submit してください。")
+
 
 def tool_specs(tools: Sequence[AgentTool]) -> list[dict[str, Any]]:
     """Convert :class:`AgentTool` schemas into MCP ``tools/list`` entries (single source of truth).
@@ -118,7 +127,8 @@ class InvestigatorMCPServer:
     """
 
     def __init__(self, tools: Sequence[AgentTool], logger: ToolCallLogger | None = None,
-                 max_tool_calls: int = 0) -> None:
+                 max_tool_calls: int = 0, *, question: str = "", contract: str | None = None,
+                 commit_gate_log: str | None = None) -> None:
         self.tools = list(tools)
         self.by_name = {t.name: t for t in self.tools}
         self.logger = logger or ToolCallLogger(None)
@@ -127,6 +137,16 @@ class InvestigatorMCPServer:
         # (default), so the SOT-2626 MCP behaviour is byte-identical unless a budget is explicitly set.
         self.max_tool_calls = max(0, int(max_tool_calls or 0))
         self._non_terminal_calls = 0
+        # SOT-2640 — commit-gate session state. ``submit_answer`` is the gate's execution point for the
+        # guard-less claude-mcp backend: the question/contract identify the commit, ``_tool_history`` is
+        # the session's successful tool records the gate grounds numerics against, and ``_commit_gate_rejects``
+        # counts consecutive rejects so the in-band retry degrades to ABSTAIN after the threshold. All of
+        # this is inert unless RAG_COMMIT_GATE (+ RAG_COMMIT_GATE_ENFORCE) is set ⇒ OFF byte-identical.
+        self.question = str(question or "")
+        self.contract = contract
+        self.commit_gate_log = commit_gate_log
+        self._tool_history: list[dict[str, Any]] = []
+        self._commit_gate_rejects = 0
 
     # -- request handlers ---------------------------------------------------
     def _on_initialize(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -157,16 +177,78 @@ class InvestigatorMCPServer:
                    f"best grounded answer, or answer='わかりません' if no evidence was found.")
             self.logger.record(name, args, 0.0, ok=False, error="budget_exhausted")
             return {"content": [{"type": "text", "text": msg}], "isError": False}
+        # SOT-2640 — commit gate at the submit_answer execution point. Returns a response dict when the gate
+        # is active AND governs this submit (REJECT retry feedback, or a COMMIT/ABSTAIN marker for the
+        # client to honor); returns None when the gate is OFF/observational so the normal dispatch below runs
+        # unchanged (⇒ OFF byte-identical).
+        if name == SUBMIT_ANSWER:
+            gate_resp = self._commit_gate_submit(args)
+            if gate_resp is not None:
+                return gate_resp
         started = time.perf_counter()
         result = dispatch(self.by_name, name, args)
         if name != SUBMIT_ANSWER:
             self._non_terminal_calls += 1
+            # SOT-2640 — record the successful tool outcome so the gate can ground a later numeric commit
+            # against a real compute/corpus_aggregate value (mirrors the Gemini loop's ``tool_history``).
+            is_err = isinstance(result, Mapping) and "error" in result and name not in self.by_name
+            self._tool_history.append({"name": name, "response": result, "ok": not is_err})
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         is_error = isinstance(result, Mapping) and "error" in result and name not in self.by_name
         self.logger.record(name, args, elapsed_ms, ok=not is_error,
                            error=(str(result.get("error")) if is_error else None))
         text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
         return {"content": [{"type": "text", "text": text}], "isError": bool(is_error)}
+
+    def _commit_gate_submit(self, args: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Run the shared commit gate at ``submit_answer`` (SOT-2640). Backend-agnostic commit judgment for
+        the guard-less claude-mcp loop, wired identically to the Gemini finalization (SOT-2639).
+
+        Returns ``None`` when the gate is inert for this submit — RAG_COMMIT_GATE OFF (byte-identical) or
+        ON-but-observational (record telemetry, let the raw value commit) — so the caller's normal dispatch
+        proceeds. Returns a tool-result dict when the gate governs the submit:
+
+        * ``REJECT`` (retry streak below threshold) → non-error feedback text; the submit does NOT finalize
+          and the model re-derives + re-submits in-band. The consecutive-reject counter advances.
+        * ``COMMIT`` / ``ABSTAIN`` → a terminal marker (``{"submitted": true, "commit_gate": {...}}``) whose
+          ``final_answer`` the client honors (formatted value on COMMIT, ABSTAIN on the 棄権 degrade).
+        """
+        from src.rag.agent import commit_gate as _commit_gate  # lazy — avoids the exec_verifier cycle
+        if not _commit_gate.enabled():
+            return None  # OFF ⇒ byte-identical
+        submitted = str((args or {}).get("answer", "") or "")
+        decision = _commit_gate.evaluate(
+            self.question, self.contract, submitted,
+            session_tool_history=self._tool_history,
+            prior_rejects=self._commit_gate_rejects,
+        )
+        self._log_commit_gate(decision)
+        if not _commit_gate.enforce():
+            return None  # observational: record telemetry, keep the raw commit (equivalence)
+        if decision.verdict == _commit_gate.REJECT:
+            self._commit_gate_rejects += 1
+            reason = "; ".join(decision.reasons)
+            msg = _COMMIT_GATE_RETRY_DIRECTIVE + (f" (却下理由: {reason})" if reason else "")
+            self.logger.record(SUBMIT_ANSWER, args, 0.0, ok=False, error="commit_gate_reject")
+            return {"content": [{"type": "text", "text": msg}], "isError": False}
+        # COMMIT or ABSTAIN — terminal. Embed the gate decision so the client serves final_answer.
+        payload = {"submitted": True, "commit_gate": decision.to_dict()}
+        self.logger.record(SUBMIT_ANSWER, args, 0.0, ok=True, error=None)
+        return {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}],
+                "isError": False}
+
+    def _log_commit_gate(self, decision: Any) -> None:
+        """Best-effort append of the commit-gate decision telemetry (SOT-2629 形式) to a jsonl sink; a
+        logging failure never affects the submit."""
+        if not self.commit_gate_log:
+            return
+        try:
+            rec = {"ts": time.time(), "commit_gate": decision.to_dict()}
+            os.makedirs(os.path.dirname(self.commit_gate_log) or ".", exist_ok=True)
+            with open(self.commit_gate_log, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception as exc:  # noqa: BLE001 — telemetry must never break the submit
+            _log(f"commit-gate log write failed: {exc}")
 
     def handle(self, message: Mapping[str, Any]) -> dict[str, Any] | None:
         """Dispatch one JSON-RPC message; return a response dict, or ``None`` for a notification."""
@@ -221,7 +303,9 @@ def _log(msg: str) -> None:
 
 def build_server(profile: CorpusProfile | None = None,
                  log_path: str | None = None,
-                 max_tool_calls: int | None = None) -> InvestigatorMCPServer:
+                 max_tool_calls: int | None = None,
+                 *, question: str | None = None, contract: str | None = None,
+                 commit_gate_log: str | None = None) -> InvestigatorMCPServer:
     """Build the server over ``build_tools`` and enforce the read-only invariant.
 
     Raises ``RuntimeError`` if any exposed tool name looks like a write/shell capability, so the
@@ -229,6 +313,10 @@ def build_server(profile: CorpusProfile | None = None,
 
     ``max_tool_calls`` (SOT-2627) caps the non-terminal tool calls per session; ``None`` reads the
     ``RAG_MCP_MAX_TOOL_CALLS`` env (0/unset ⇒ disabled = byte-identical SOT-2626 behaviour).
+
+    ``question`` / ``contract`` / ``commit_gate_log`` (SOT-2640) supply the commit-gate context; ``None``
+    reads ``RAG_MCP_QUESTION`` / ``RAG_MCP_CONTRACT`` / ``RAG_MCP_COMMIT_GATE_LOG`` (unset ⇒ empty, and the
+    gate stays inert unless RAG_COMMIT_GATE is also set).
     """
     tools = build_tools(profile or CorpusProfile())
     for t in tools:
@@ -242,7 +330,11 @@ def build_server(profile: CorpusProfile | None = None,
             max_tool_calls = int(os.getenv("RAG_MCP_MAX_TOOL_CALLS", "0") or 0)
         except ValueError:
             max_tool_calls = 0
-    return InvestigatorMCPServer(tools, ToolCallLogger(path), max_tool_calls=max_tool_calls)
+    q = question if question is not None else (os.getenv("RAG_MCP_QUESTION") or "")
+    c = contract if contract is not None else (os.getenv("RAG_MCP_CONTRACT") or None)
+    cg_log = commit_gate_log if commit_gate_log is not None else (os.getenv("RAG_MCP_COMMIT_GATE_LOG") or None)
+    return InvestigatorMCPServer(tools, ToolCallLogger(path), max_tool_calls=max_tool_calls,
+                                 question=q, contract=c, commit_gate_log=cg_log)
 
 
 def serve_stdio(server: InvestigatorMCPServer, stdin: Any, stdout: Any) -> None:
