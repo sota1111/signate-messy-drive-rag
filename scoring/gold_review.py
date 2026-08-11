@@ -161,8 +161,14 @@ def write_csv(rows: list[dict], path: Path) -> None:
 
 
 def _history_entry(report: "Report", gen: str | None, out_md: Path, out_csv: Path,
-                   now: str) -> dict:
-    """履歴 1 行 — メトリクスのみ（設問・正答・システム解答は含めない）。"""
+                   now: str, official: bool = True) -> dict:
+    """履歴 1 行 — メトリクスのみ（設問・正答・システム解答は含めない）。
+
+    ``official`` は「公式 net の根拠に使える計測か」を機械判別するためのフラグ（SOT-2628）。
+    公式計測は flash 3.6 固定（SOT-2625）。dev 専用の Sonnet / claude-mcp 経路など、公式非回帰の
+    根拠に使ってはならない run は ``official=False`` で記録し、履歴上で ``official`` フィールドで
+    公式記録と機械的に分離できるようにする。既定 True（従来 run は公式扱いのまま後方互換）。
+    """
     d = report.to_dict()
     by_type = {arch: {"n": b["n"], "match": b["match"], "abstain": b["abstain"],
                       "wrong": b["wrong"], "match_rate": b["match_rate"]}
@@ -170,6 +176,7 @@ def _history_entry(report: "Report", gen: str | None, out_md: Path, out_csv: Pat
     return {
         "recordedAt": now,
         "gen": gen or "system",
+        "official": bool(official),
         "n": d["n"],
         "match": d["match"]["count"],
         "abstain": d["abstain"]["count"],
@@ -199,10 +206,11 @@ def _under_repo(p: Path) -> bool:
 
 
 def append_history(report: "Report", gen: str | None, out_md: Path, out_csv: Path,
-                   history_path: Path, now: str | None = None) -> dict:
+                   history_path: Path, now: str | None = None,
+                   official: bool = True) -> dict:
     """履歴 jsonl に 1 行追記（上書きしない）し、追記した entry を返す。"""
     now = now or datetime.now(timezone.utc).isoformat()
-    entry = _history_entry(report, gen, out_md, out_csv, now)
+    entry = _history_entry(report, gen, out_md, out_csv, now, official=official)
     history_path.parent.mkdir(parents=True, exist_ok=True)
     with history_path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -212,7 +220,8 @@ def append_history(report: "Report", gen: str | None, out_md: Path, out_csv: Pat
 def generate(report: "Report", *, details: dict[int, dict] | Path | None = None,
              gen: str | None = None,
              out_md: Path = DEFAULT_MD, out_csv: Path = DEFAULT_CSV,
-             history_path: Path = DEFAULT_HISTORY, now: str | None = None) -> dict:
+             history_path: Path = DEFAULT_HISTORY, now: str | None = None,
+             official: bool = True) -> dict:
     """レビュー md/csv を再生成し、履歴 jsonl に 1 行追記する。
 
     ``details`` は details.jsonl パス、読み込み済み dict、または None を受け付ける。
@@ -223,4 +232,4 @@ def generate(report: "Report", *, details: dict[int, dict] | Path | None = None,
     out_md.parent.mkdir(parents=True, exist_ok=True)
     out_md.write_text(render_md(rows, report, gen), encoding="utf-8")
     write_csv(rows, out_csv)
-    return append_history(report, gen, out_md, out_csv, history_path, now=now)
+    return append_history(report, gen, out_md, out_csv, history_path, now=now, official=official)
