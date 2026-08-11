@@ -58,3 +58,19 @@ champion (Wave A net40) の abstain 46 のうち **hard core 16問**（`champion
 **設計上、決定論レーンで確実に発火するのは idx63（モデル不変）**。他の hard core は主に (b) ツール経路で
 LLM が正しい述語を組んでストアを引く（file_grep 反復＝BUDGET_EXHAUSTED を回避）ことで回収する。
 `RAG_FACT_LAYER` 既定 OFF ゆえ champion 提出経路は byte-identical（本層は opt-in レバー・champion リスク 0）。
+
+## SOT-2649 追補 — idx38 / idx57 の決定論レーン化（Sonnet cycle2）
+
+Sonnet cycle1 実測（SOT-2648）で idx38/57 は **ツール経路に依存すると回収できない**ことが判明した —
+Sonnet は case_filter / metric_lookup を選ばず file_grep/compute 反復で BUDGET_EXHAUSTED（idx87 は
+case_filter を選び MATCH）。モデルのツール選択に依存しない回収として、両者を**発火境界の拡張**で
+決定論レーンへ昇格した（質問非依存: ストア内容と質問述語のみで束縛、gold は見ない）:
+
+- **idx38（空集合 composite）**: 列挙+契約金額合計の composite は従来一律 defer だったが、apr_code
+  完全被覆（10/10 証明書）の下で **APR フィルタが空集合**なら、いかなる連言述語の追加でも空のまま・
+  集計も vacuous ゆえ「該当なし」が一意に確定する。発火条件は「単一 APR-Mx + 列挙キュー + 金額合計
+  キューのみ + 補集合/選言/他述語なし + matched==0」。非空 composite は従来どおり defer。
+- **idx57（共有語幹の metric-presence 束縛）**: 「青葉のTX」（TX=用語集の train.xlsx）は 青葉与信/
+  青葉バイオ の 2 案件に跨る語幹で従来 defer。全候補が**同一トークン**でマッチし、アンカ済み
+  メトリクス（best_f1 等）を **non-null で持つ案件が厳密に 1 つ**のときのみその案件に束縛する
+  （store 側の事実が曖昧性を解消）。異なる 2 社名の明示（比較形）は従来どおり defer。

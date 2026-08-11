@@ -112,6 +112,44 @@ def test_derived_lane_defers_when_case_ambiguous(stores):
     assert fl.resolve("F1最大化閾値でのF1は?", "numeric") is None
 
 
+# SOT-2649 (idx57型): a shared-stem mention (「青葉のTX」) binds via metric presence when exactly one
+# candidate carries the anchored metric; both-carry / two-distinct-names still defer.
+_IDX57_Q = ("青葉のTXにて算出された回帰係数を用いて全データの予測値を計算し、正解データに対する"
+            "F1スコアが最大となるように閾値を設定したときのF1スコアを答えてください")
+
+
+def _two_aoba_rows(bio_has_model: bool):
+    rows = _derived_rows()
+    bio = {"case_id": "株式会社青葉バイオメディカル機器", "train_file": "…/train.csv",
+           "sources": {"train_file": "…/train.csv"},
+           "model": ({"threshold_sweep": {"best_f1": 0.9, "best_threshold": 0.4}}
+                     if bio_has_model else {"present": False, "reason": "no target"})}
+    return rows + [bio]
+
+
+def test_derived_lane_shared_stem_binds_via_metric_presence(stores, monkeypatch):
+    from src.rag.index import derived_metrics
+    monkeypatch.setattr(derived_metrics, "load", lambda path=None: _two_aoba_rows(False))
+    r = fl.resolve(_IDX57_Q, "numeric")
+    assert r is not None and r["value"] == 0.42395962
+    assert r["evidence"]["case"] == "青葉与信マネジメント株式会社"
+
+
+def test_derived_lane_shared_stem_defers_when_both_carry_metric(stores, monkeypatch):
+    from src.rag.index import derived_metrics
+    monkeypatch.setattr(derived_metrics, "load", lambda path=None: _two_aoba_rows(True))
+    assert fl.resolve(_IDX57_Q, "numeric") is None
+
+
+def test_derived_lane_two_distinct_names_defer(stores, monkeypatch):
+    from src.rag.index import derived_metrics
+    rows = _derived_rows() + [{"case_id": "京橋信用ソリューションズ株式会社", "train_file": "…/train.csv",
+                               "sources": {}, "model": {"threshold_sweep": {"best_f1": 0.455}}}]
+    monkeypatch.setattr(derived_metrics, "load", lambda path=None: rows)
+    # two DIFFERENT explicit company names (comparison shape) must never store-disambiguate to one
+    assert fl.resolve("青葉与信と京橋信用のF1最大化閾値でのF1を比べてください", "numeric") is None
+
+
 def test_enum_lane_fires_pure_enumeration(stores):
     r = fl.resolve("APR-M1に該当する案件を主略称ですべて列挙してください", "full_enumeration")
     assert r is not None
@@ -120,8 +158,42 @@ def test_enum_lane_fires_pure_enumeration(stores):
 
 
 def test_enum_lane_defers_on_aggregation_cue(stores):
-    # 列挙＋合計 composite ⇒ defer to the tool + LLM (no misfire on a composite intent)
-    assert fl.resolve("APR-M3の案件を略称で列挙し契約金額を合計してください", "full_enumeration") is None
+    # NON-EMPTY 列挙＋合計 composite ⇒ defer to the tool + LLM (multi-part answer format is ambiguous)
+    assert fl.resolve("APR-M1の案件を略称で列挙し契約金額を合計してください", "full_enumeration") is None
+
+
+def test_enum_lane_empty_composite_fires(stores):
+    # SOT-2649 (idx38型): 列挙+契約金額合計 composite over an EMPTY apr_code match-set is deterministic —
+    # the certified universe (apr_code 3/3) proves 0 matches, so both parts are vacuous ⇒ 該当なし.
+    q = "社内管理のAPRに照らして、APR-M3が必要な案件を主略称ですべて挙げ、それらの契約金額（税込）の合計を答えてください。"
+    r = fl.resolve(q, "full_enumeration")
+    assert r is not None and r["value"] == "該当なし"
+    assert r["method"]["selection"] == "apr_code_empty_composite"
+    assert r["evidence"]["matched"] == 0 and r["evidence"]["universe_size"] == 3
+
+
+def test_enum_lane_empty_composite_defers_on_negation(stores):
+    # complement phrasing voids the empty-set proof (APR-M3以外 is NON-empty) ⇒ hard defer
+    q = "APR-M3以外の案件を主略称ですべて挙げ、それらの契約金額（税込）の合計を答えてください"
+    assert fl.resolve(q, "full_enumeration") is None
+
+
+def test_enum_lane_empty_composite_defers_on_count_aggregation(stores):
+    # a 件数 composite would gold-format as 「0件」, not 該当なし ⇒ only the 金額合計 shape may fire
+    q = "APR-M3が必要な案件を主略称ですべて挙げ、何件あるか答えてください"
+    assert fl.resolve(q, "full_enumeration") is None
+
+
+def test_enum_lane_empty_composite_defers_on_extra_predicate(stores):
+    # an extra attribute predicate keeps the idx87-shape boundary even for the empty composite
+    q = "完了案件のうちAPR-M3が必要な案件を主略称ですべて挙げ、契約金額（税込）の合計を答えてください"
+    assert fl.resolve(q, "full_enumeration") is None
+
+
+def test_enum_lane_pure_enumeration_defers_on_negation(stores):
+    # 「APR-M1以外を列挙」: the APR-only lane would return the M1 set itself (the complement's inverse) —
+    # negation phrasing must defer the WHOLE lane, not just composites
+    assert fl.resolve("APR-M1以外に該当する案件を主略称ですべて列挙してください", "full_enumeration") is None
 
 
 def test_enum_lane_defers_on_multiple_codes(stores):
