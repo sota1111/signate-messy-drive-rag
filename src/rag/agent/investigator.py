@@ -53,6 +53,9 @@ from src.rag.tools.file_grep import file_grep
 from src.rag.agent import pot_lane as _pot_lane
 from src.rag.agent import operand_prefill as _operand_prefill
 from src.rag.agent import enum_scan as _enum_scan
+# NOTE: ``commit_gate`` is imported lazily inside :func:`investigate` (SOT-2639), not here: it pulls in
+# ``exec_verifier``, which imports names from this module, so a top-level import would form an
+# import cycle during ``investigator`` initialization.
 from src.rag.tools import font_emphasis as _font_emphasis
 from src.rag.tools import format_events as _format_events
 from src.rag.tools.highlight_extract import highlight_extract
@@ -66,6 +69,27 @@ DEFAULT_TIMEOUT_S = 180.0         # wall-clock budget per question (checked betw
 ABSTAIN = settings.ABSTAIN
 SUBMIT_ANSWER = "submit_answer"   # terminal tool name the model calls to finish
 DIRECTIVE_MESSAGE = "__instruction__"  # plain user guidance, never a synthetic function response
+
+# SOT-2639 — in-band directive fed back when the shared commit gate REJECTs a submitted answer. Reuses
+# the existing ``answer_rejected`` retry channel (identical to the exec/numeric rejection flow), so a
+# rejected commit re-enters the loop with a concrete "検算せよ" instruction rather than being dropped.
+_COMMIT_GATE_RETRY_DIRECTIVE = (
+    "commit_gate が回答を却下しました。数値回答は compute / corpus_aggregate で値を実際に導出・検算してから、"
+    "列挙の『該当なし』は母集団を全数確認してから submit_answer してください。"
+    "根拠を実際に取得できない場合のみ棄権してください。")
+
+_COMMIT_GATE_ON = {"1", "true", "yes", "on"}
+
+
+def _commit_gate_enforce() -> bool:
+    """Whether the commit gate's verdict is ENFORCED on the answer — ``RAG_COMMIT_GATE_ENFORCE`` (default
+    OFF). SOT-2639's Gemini wiring is equivalence-preserving: with ``RAG_COMMIT_GATE=1`` alone the gate's
+    decision + telemetry are recorded but the loop's own inline guards stay authoritative, so a committed
+    answer is served VERBATIM (byte-equivalent to OFF — the champion's inline exec/PoT/numeric guards
+    already vetted it, and the gate's stricter compute-record heuristic must not degrade a good derived
+    answer). Enforcement (REJECT → in-band retry, ABSTAIN 降格) is opt-in and is what SOT-2640 turns on
+    for the guard-LESS claude-mcp backend, which commits ``submit_answer`` raw."""
+    return os.getenv("RAG_COMMIT_GATE_ENFORCE", "0").strip().lower() in _COMMIT_GATE_ON
 
 
 def _bool_env(key: str, default: bool) -> bool:
@@ -1667,8 +1691,15 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     numeric_feature_guidance_sent = False  # SOT-2562 — one-shot numeric-feature correlation literalism
     relevance_guidance_sent = False        # SOT-2562 — one-shot relevance-filtered enumeration re-filter
     from src.rag.agent import question_contract as _question_contract
+    from src.rag.agent import commit_gate as _commit_gate  # SOT-2639 — lazy (avoids exec_verifier cycle)
     gantt_question = contract == "chart_read" and _question_contract.is_gantt_week_question(question)
     tool_outputs: list[Any] = []
+    # SOT-2639 — tolerant (name, response) tool records for the shared commit gate's numeric-grounding
+    # probe. Populated at every real dispatch below; read only when RAG_COMMIT_GATE is ON, so an OFF run
+    # never touches it (the list stays a pure local ⇒ byte-identical).
+    tool_history: list[dict[str, Any]] = []
+    commit_gate_rejects = 0                          # consecutive commit_gate REJECTs (drives 棄権降格)
+    commit_gate_tel: dict[str, Any] | None = None    # commit_gate decision telemetry (SOT-2629 形式)
     version_diff_result: Mapping[str, Any] | None = None
     # SOT-2586 — retain the PoT forced-lane verdict so the three-layer diagnostics survive into
     # ``.details.jsonl``. Prefer a COMMIT verdict (the one the answer actually rests on); otherwise keep
@@ -1696,6 +1727,7 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
             if _first_move_useful(fm_out):
                 tool_calls.append(fm_name)
                 tool_outputs.append(fm_out)
+                tool_history.append({"name": fm_name, "response": fm_out, "ok": True})  # SOT-2639
                 if fm_name == "version_diff" and isinstance(fm_out, Mapping):
                     version_diff_result = fm_out
                 if signals is not None:
@@ -2081,6 +2113,7 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                         fb_out = cached_dispatch(fb_name, dict(fb_args or {}))
                         tool_calls.append(fb_name)
                         tool_outputs.append(fb_out)
+                        tool_history.append({"name": fb_name, "response": fb_out, "ok": True})  # SOT-2639
                         if fb_name == "version_diff" and isinstance(fb_out, Mapping):
                             version_diff_result = fb_out
                         if signals is not None:
@@ -2097,6 +2130,43 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                             }))
                             dispatched_tool = True  # count the forced fallback round; re-prompt next turn
                             break
+                # SOT-2639 — route the finalization through the shared commit gate (RAG_COMMIT_GATE,
+                # default OFF ⇒ byte-identical / unwired). This is the model-invariant commit boundary:
+                # the same accept / reject / abstain judgment every backend (Gemini here, claude-mcp in
+                # SOT-2640) must pass. It is wired as the terminal DECISION, not an added formatter — on
+                # COMMIT the model's own gold-form value is kept VERBATIM (re-applying formatting.py here
+                # would be the 二重 naturalize the design forbids), so a committed answer on this Gemini
+                # path stays equivalent to OFF. A precision REJECT is fed back through the existing
+                # ``answer_rejected`` in-band retry channel (identical to the exec/numeric rejection flow);
+                # it is bounded because the gate itself degrades to ABSTAIN after
+                # RAG_COMMIT_GATE_ABSTAIN_AFTER consecutive rejects, so it can never loop.
+                if _commit_gate.enabled():
+                    cg = _commit_gate.evaluate(
+                        question, contract, candidate.answer,
+                        session_tool_history=tool_history,
+                        naturalizer=None,
+                        prior_rejects=commit_gate_rejects,
+                    )
+                    commit_gate_tel = cg.telemetry
+                    # Equivalence-preserving default: record the gate DECISION + telemetry, but on this
+                    # Gemini path the loop's own inline guards remain authoritative, so a committed answer
+                    # is kept VERBATIM (no re-format, no degrade) ⇒ byte-equivalent to OFF. Enforcement is
+                    # opt-in (RAG_COMMIT_GATE_ENFORCE) and only ever acts on a non-abstain commit — an
+                    # already-abstain answer is untouched either way. See :func:`_commit_gate_enforce`.
+                    if _commit_gate_enforce() and not is_abstain(candidate.answer):
+                        if cg.verdict == _commit_gate.REJECT:
+                            commit_gate_rejects += 1
+                            responses.append(ToolResponse(SUBMIT_ANSWER, {
+                                "answer_rejected": True,
+                                "reason": "commit_gate: " + "; ".join(cg.reasons),
+                                "directive": _COMMIT_GATE_RETRY_DIRECTIVE,
+                            }))
+                            dispatched_tool = True   # count the guided re-verification round
+                            break
+                        if cg.abstained:
+                            candidate = Answer(answer=ABSTAIN, confidence=0.0,
+                                               evidence=candidate.evidence,
+                                               method="(commit_gate: 棄権降格) " + candidate.method)
                 answer = candidate
                 if director is not None and not is_abstain(answer.answer):
                     director.note_answered()
@@ -2196,6 +2266,7 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
                 strict_chart_evidence = _has_deterministic_gantt_evidence(out)
             responses.append(ToolResponse(call.name, out))
             tool_outputs.append(out)
+            tool_history.append({"name": call.name, "response": out, "ok": True})  # SOT-2639
             if call.name == "version_diff" and isinstance(out, Mapping):
                 version_diff_result = out
             # SOT-2586 — capture the forced-lane three-layer verdict for the details log. A COMMIT verdict
@@ -2270,6 +2341,11 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
         loop_interventions["spin_pivot"] = pivot_count
     if search_cap_enabled:
         loop_interventions["search_cap_hits"] = search_cap_hits
+    if commit_gate_tel is not None:
+        # SOT-2639 — surface the commit-gate decision (SOT-2629 形式). The key appears ONLY when the gate
+        # actually ran at the commit boundary (RAG_COMMIT_GATE ON and a submit reached it); an absent key
+        # therefore means the gate was OFF or never reached ⇒ an OFF run's telemetry is byte-identical.
+        loop_interventions["commit_gate"] = commit_gate_tel
     investigation = Investigation(
         question=question, answer=answer, iterations=iterations, tool_calls=tool_calls,
         usage=usage, model=model_name, elapsed_s=max(0.0, clock() - start),
