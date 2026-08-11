@@ -240,6 +240,18 @@ DET_PIPELINE_ROUTER = _bool_env("RAG_DET_PIPELINE_ROUTER", False)
 # :func:`g2_lookup_port.enabled` at call time; this constant is the module-level mirror used by tests.
 G2_LOOKUP_PORT = _bool_env("RAG_G2_LOOKUP_PORT", False)
 
+# SOT-2631 (G1, PLAN SOT-2602) — whether :func:`answer_question` appends the G1 highlight-extraction
+# procedure HINTS (:mod:`src.rag.agent.g1_highlight_port`) for the three Sonnet-reachable questions the
+# flash champion abstained on (idx 15/80/17). When on, a question matching one of the G1 archetypes gets
+# an advisory procedure directive appended to the generation preamble (highlight cell → pivot-label
+# reverse-lookup → compute self-verify for the 抽出条件 class; composite 黄∧赤 + PoT-lane arithmetic for
+# idx17). **Default OFF so the production answer path stays byte-identical** (mirroring RAG_EVIDENCE_PACKET
+# / RAG_G2_LOOKUP_PORT): the directive nudges the model's trajectory, so it ships dormant and its net
+# gold-100 effect is measured by the focused gate / SOT-2636 integration before any default flip. Injects
+# no corpus fact and no answer — procedure guidance only. Reads ``RAG_G1_HIGHLIGHT_PORT`` fresh via
+# :func:`g1_highlight_port.enabled` at call time; this constant is the module-level mirror used by tests.
+G1_HIGHLIGHT_PORT = _bool_env("RAG_G1_HIGHLIGHT_PORT", False)
+
 # SOT-2614 — consecutive same-tool spin pivot guard (サイクル2: BUDGET_EXHAUSTED 32件回収). Phase-0 diagnosis
 # (``docs/ai/budget32_trace_classification.md``) found 23/32 budget abstains carry a ≥5-long run of the
 # SAME tool with *tweaked* arguments (idx99 file_grep×16, idx76 17/18 turns search, extraction ゼロ; compute
@@ -2699,6 +2711,21 @@ def answer_question(question: str, *, model: str | None = None,
                 if _g2_directive:
                     preamble = f"{preamble}\n\n{_g2_directive}" if preamble else _g2_directive
                 packet_interventions["g2_lookup_port"] = _g2_tel
+            except Exception:  # noqa: BLE001 — the hint is additive; never break the answer path
+                pass
+        # SOT-2631 (G1, PLAN SOT-2602) — port Sonnet's highlight-extraction procedures via advisory HINTS,
+        # appended to the generation preamble independently of the Evidence Packet (so the port can be
+        # A/B'd on its own, exactly like the G2 sibling). Gated by RAG_G1_HIGHLIGHT_PORT; default OFF ⇒
+        # preamble untouched (byte-identical). Fail-open: any build error leaves the preamble as-is.
+        # Injects no corpus fact / no answer — the directive is procedure guidance only, and the
+        # SOT-2629-style telemetry records whether it fired.
+        if G1_HIGHLIGHT_PORT:
+            try:
+                from src.rag.agent import g1_highlight_port as _g1_highlight_port
+                _g1_directive, _g1_tel = _g1_highlight_port.port_directive(question, contract=contract)
+                if _g1_directive:
+                    preamble = f"{preamble}\n\n{_g1_directive}" if preamble else _g1_directive
+                packet_interventions["g1_highlight_port"] = _g1_tel
             except Exception:  # noqa: BLE001 — the hint is additive; never break the answer path
                 pass
         # SOT-2521 — the loop-side deterministic first move (see investigate ``first_move``). Reuses the
