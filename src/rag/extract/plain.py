@@ -30,10 +30,12 @@ def extract_pdf(ref: FileRef) -> str:
     """Text layer via pdfplumber (keeps tables as pipe rows); image-only PDFs fall back to vision OCR.
 
     A scanned 会議録 / 報告書 has no searchable text layer, so pdfplumber/pypdf return only the page
-    markers.  When the text layer is effectively empty AND the OCR fallback is enabled
-    (:func:`src.rag.extract.vision.pdf_ocr_enabled`, ``RAG_PDF_OCR`` default OFF), transcribe the page
-    rasters via Gemini vision so the document's content (action-item tables / owners / milestones)
-    becomes readable.  Default OFF ⇒ byte-identical to the previous text-only behaviour.
+    markers.  When the text layer is effectively image-only and the persisted OCR store is enabled
+    (:func:`src.rag.index.ocr_store.enabled`, ``RAG_OCR_STORE`` default OFF), return the build-time
+    transcription — no genai call at serve time.  When the text layer is strictly empty AND the live
+    OCR fallback is enabled (:func:`src.rag.extract.vision.pdf_ocr_enabled`, ``RAG_PDF_OCR`` default
+    OFF), transcribe the page rasters via Gemini vision.  Both default OFF ⇒ byte-identical to the
+    previous text-only behaviour.
     """
     out: list[str] = []
     try:
@@ -58,6 +60,12 @@ def extract_pdf(ref: FileRef) -> str:
         except Exception:
             out = []
     text = "\n".join(out)
+    from src.rag.index import ocr_store
+
+    if ocr_store.enabled() and ocr_store.is_effectively_image_only(text):
+        stored = ocr_store.lookup(ref)
+        if stored and stored.strip():
+            return stored
     if not _text_layer_body(text).strip():
         from src.rag.extract import vision
 

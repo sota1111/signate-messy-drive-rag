@@ -196,6 +196,27 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  pre-index decrypt skipped: {type(e).__name__}: {e}")
 
+    # OCR persistence store (SOT-2650 / 事前計算事実層 追補): transcribe every effectively-image-only
+    # PDF once at build time (Gemini vision — 前処理限定の使用) and persist the text, so the serve path
+    # can read scanned 会議録/報告書/最終報告 under RAG_OCR_STORE with no genai call (Sonnet dev runs set
+    # RAG_FORBID_GEMINI=1 and therefore silently lose live OCR — the store is their only route to these
+    # documents). Unlike the LLM-free sibling stores this step SPENDS vision calls, so it additionally
+    # gates the build itself behind RAG_OCR_STORE_BUILD (default OFF ⇒ skipped, prior artifact kept).
+    try:
+        from src.rag.index import ocr_store
+        if ocr_store.build_enabled():
+            ocs = ocr_store.build(refs)
+            if verbose:
+                rep = ocs["report"]
+                print(f"  ocr store: {ocs['records']} scanned PDFs "
+                      f"(transcribed={rep['transcribed']}, reused={rep['reused']}, "
+                      f"pages={rep['pages']}) -> {ocr_store.default_out_path()}")
+        elif verbose:
+            print("  ocr store: build skipped (RAG_OCR_STORE_BUILD off; existing artifact kept)")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  ocr store skipped: {type(e).__name__}: {e}")
+
     # Case master table (SOT-2643 / 事前計算事実層 1/5): precompute one deterministic row per 案件
     # (全案件 × 標準属性 with per-cell provenance), so cross-corpus enumeration / comparison questions
     # (enum hard core idx38/67/87 …) reduce to a single filter over a self-evidently complete universe
