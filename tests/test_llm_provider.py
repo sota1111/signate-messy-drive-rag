@@ -200,3 +200,40 @@ def test_claude_cli_empty_result_raises(monkeypatch):
     )
     with pytest.raises(RuntimeError):
         claude_cli.generate_text("hi", retries=1)
+
+
+# --------------------------------------------------------------- no-Gemini guard (SOT-2648)
+def test_forbid_gemini_default_off(monkeypatch):
+    monkeypatch.delenv("RAG_FORBID_GEMINI", raising=False)
+    assert llm._forbid_gemini() is False
+    # cached client is returned untouched when the guard is off
+    sentinel = object()
+    monkeypatch.setattr(llm, "_client", sentinel)
+    assert llm.client() is sentinel
+
+
+@pytest.mark.parametrize("val", ["1", "true", "YES", "on"])
+def test_forbid_gemini_blocks_client(monkeypatch, val):
+    monkeypatch.setenv("RAG_FORBID_GEMINI", val)
+    # even a cached client must not be handed out while the guard is up
+    monkeypatch.setattr(llm, "_client", object())
+    with pytest.raises(llm.GeminiForbiddenError, match="RAG_FORBID_GEMINI"):
+        llm.client()
+
+
+def test_forbid_gemini_blocks_gemini_generate_but_not_claude_cli(monkeypatch):
+    monkeypatch.setenv("RAG_FORBID_GEMINI", "1")
+    # gemini text path dies at the client() choke point
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    with pytest.raises(llm.GeminiForbiddenError):
+        llm.generate("hello")
+    # claude-cli text path never touches genai and keeps working under the guard
+    monkeypatch.setenv("LLM_PROVIDER", "claude-cli")
+    monkeypatch.setattr(claude_cli, "generate_text", lambda *a, **k: "SONNET")
+    assert llm.generate("hello") == "SONNET"
+
+
+def test_forbid_gemini_falsey_values_allow(monkeypatch):
+    for val in ("0", "false", "off", ""):
+        monkeypatch.setenv("RAG_FORBID_GEMINI", val)
+        assert llm._forbid_gemini() is False
