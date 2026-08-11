@@ -75,6 +75,44 @@ def test_match_wrong_abstain_buckets():
     assert d["cost_usd"] == 0.06
 
 
+def test_intervention_verdict_crosstab(tmp_path):
+    """SOT-2629 — the report cross-tabs intervention firing against match/abstain/wrong. A flag present
+    with a fired value counts as ON, and as FIRED only when it actually fired (int>0 / injected / built)."""
+    gold = {0: "a", 1: "b", 2: "c"}
+    preds = _preds(
+        # answered+match, spin fired 2×, cap armed but idle, operand injected
+        {"index": 0, "question": "q0", "answer": "a",
+         "interventions": {"spin_pivot": 2, "search_cap_hits": 0,
+                           "operand_prefill": {"candidates": 5, "injected": True}}},
+        # answered+wrong, spin armed but idle
+        {"index": 1, "question": "q1", "answer": "z",
+         "interventions": {"spin_pivot": 0}},
+        # abstained, no flag active → empty telemetry
+        {"index": 2, "question": "q2", "answer": settings.ABSTAIN, "interventions": {}},
+    )
+    judge = _stub_judge({"a": "Perfect", "b": "Incorrect"})
+    d = GO.evaluate(preds, gold, judge=judge).to_dict()
+    iv = d["interventions"]
+    # spin_pivot ON on both answered items, fired only on the match
+    assert iv["spin_pivot"]["match"] == {"on": 1, "fired": 1, "fire_rate": 1.0}
+    assert iv["spin_pivot"]["wrong"] == {"on": 1, "fired": 0, "fire_rate": 0.0}
+    assert iv["spin_pivot"]["total"] == {"on": 2, "fired": 1, "fire_rate": 0.5}
+    # search_cap armed once, never fired; operand_prefill injected once on the match
+    assert iv["search_cap_hits"]["total"] == {"on": 1, "fired": 0, "fire_rate": 0.0}
+    assert iv["operand_prefill"]["match"]["fired"] == 1
+    # the abstain item contributed no intervention keys
+    assert set(iv) == {"spin_pivot", "search_cap_hits", "operand_prefill"}
+
+
+def test_interventions_absent_when_no_telemetry():
+    """SOT-2629 — legacy prediction rows without an ``interventions`` field yield an empty cross-tab
+    (fail-open), so the block never breaks scoring of an older details.jsonl."""
+    gold = {0: "a"}
+    preds = _preds({"index": 0, "question": "q", "answer": "a"})
+    d = GO.evaluate(preds, gold, judge=_stub_judge({"a": "Perfect"})).to_dict()
+    assert d["interventions"] == {}
+
+
 def test_sentinel_abstain_skips_the_judge():
     gold = {0: "x"}
     preds = _preds({"index": 0, "question": "q", "answer": settings.ABSTAIN})

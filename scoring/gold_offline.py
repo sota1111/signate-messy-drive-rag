@@ -136,6 +136,10 @@ class Item:
     archetype: str
     verdict: str
     cost_usd: float = 0.0
+    # SOT-2629 — per-question intervention/guard firing telemetry copied from the prediction row's
+    # ``interventions`` field (empty when the row predates the telemetry or no flag was active). Enables the
+    # 介入発火×verdict cross-tab below without re-running anything.
+    interventions: dict = field(default_factory=dict)
 
     @property
     def is_match(self) -> bool:
@@ -225,6 +229,11 @@ class Report:
             # SOT-2497: 原因別の棄権集計（メトリクスのみ・設問/正答を含まない）。改善Issueの効果を
             # 「棄権総数」でなく NOT_RETRIEVED / EVIDENCE_INCOMPLETE / BUDGET_EXHAUSTED … の増減で測れる。
             "abstain_state_codes": _abstain_state_block(self.items, self.abstain_codes),
+            # SOT-2629 — 介入発火×verdict クロス集計. Per active intervention flag, how often it FIRED across
+            # match / abstain / wrong items — the metric cycle2's report could not compute because the
+            # firings lived only in the abstain ledger (adversarial-review hole H6). Empty when no prediction
+            # row carried intervention telemetry (fail-open on legacy details.jsonl).
+            "interventions": _intervention_block(self.items),
         }
         if self.baseline_conversion is not None:
             out["conversion"] = self.baseline_conversion
@@ -257,6 +266,17 @@ class Report:
         for code, cnt in asc["by_code"].items():
             if cnt:
                 lines.append(f"    {code:<20} {cnt:>3}")
+        iv = d.get("interventions") or {}
+        if iv:
+            lines.append("  interventions (fired / on)  by verdict:")
+            for key, entry in iv.items():
+                t = entry["total"]
+                lines.append(
+                    f"    {key:<18} on={t['on']:>2} fired={t['fired']:>2} "
+                    f"({t['fire_rate']:.0%})  "
+                    f"match={entry['match']['fired']}/{entry['match']['on']} "
+                    f"abstain={entry['abstain']['fired']}/{entry['abstain']['on']} "
+                    f"wrong={entry['wrong']['fired']}/{entry['wrong']['on']}")
         if "conversion" in d:
             c = d["conversion"]
             lines += [
@@ -349,6 +369,61 @@ def attach_abstain_state_codes(report: "Report", path: Path | None = None) -> "R
     return report
 
 
+def _intervention_fired(val) -> bool:
+    """Whether a recorded intervention actually *fired* for this question (SOT-2629).
+
+    ``val`` is the details ``interventions[<flag>]`` value: an int firing count (spin_pivot /
+    search_cap_hits), or a small dict (operand_prefill ``injected``, condition_preir ``built``, eu_gate
+    ``enabled`` …). A flag key present with a 0/false value = the flag was ON but idle this question."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return val > 0
+    if isinstance(val, dict):
+        for k in ("injected", "built", "enabled", "hit", "hits", "fired"):
+            if k in val:
+                return bool(val[k])
+        return any(bool(v) for v in val.values())
+    return bool(val)
+
+
+def _intervention_block(items: list[Item]) -> dict:
+    """介入発火×verdict クロス集計 (SOT-2629).
+
+    For every intervention flag that appears in any prediction row's ``interventions``, count — split by
+    match / abstain / wrong verdict — how many items had the flag ON and how many of those actually FIRED,
+    with the fire rate. This is the answered-case attribution the cycle2 report could not produce because
+    the firings lived only in the abstain ledger (adversarial-review hole H6). Empty when no row carried
+    intervention telemetry (legacy details.jsonl → fail-open)."""
+    _VERDS = ("match", "abstain", "wrong")
+
+    def _verdict_of(it: Item) -> str:
+        return "match" if it.is_match else ("abstain" if it.is_abstain else "wrong")
+
+    buckets: dict[str, dict[str, dict[str, int]]] = {}
+    for it in items:
+        vk = _verdict_of(it)
+        for key, val in (it.interventions or {}).items():
+            b = buckets.setdefault(key, {v: {"on": 0, "fired": 0} for v in _VERDS})
+            b[vk]["on"] += 1
+            b[vk]["fired"] += int(_intervention_fired(val))
+
+    out: dict[str, dict] = {}
+    for key in sorted(buckets):
+        vb = buckets[key]
+        entry: dict[str, dict] = {}
+        for v in _VERDS:
+            on, fired = vb[v]["on"], vb[v]["fired"]
+            entry[v] = {"on": on, "fired": fired,
+                        "fire_rate": round(fired / on, 4) if on else 0.0}
+        total_on = sum(vb[v]["on"] for v in _VERDS)
+        total_fired = sum(vb[v]["fired"] for v in _VERDS)
+        entry["total"] = {"on": total_on, "fired": total_fired,
+                          "fire_rate": round(total_fired / total_on, 4) if total_on else 0.0}
+        out[key] = entry
+    return out
+
+
 def _abstain_state_block(items: list[Item], abstain_codes: dict[int, dict]) -> dict:
     """Aggregate abstains by state code and by state-code × archetype — METRICS ONLY (no text).
 
@@ -419,9 +494,11 @@ def evaluate(predictions: dict[int, dict], gold: dict[int, str],
             cost = float(row.get("cost_usd", 0.0) or 0.0)
         except (TypeError, ValueError):
             cost = 0.0
+        _iv = row.get("interventions")
         items.append(Item(index=i, question=q, answer=_answer(row), gold=gold[i],
                           archetype=classify(q) if q else "unknown",
-                          verdict=verdicts[i], cost_usd=cost))
+                          verdict=verdicts[i], cost_usd=cost,
+                          interventions=dict(_iv) if isinstance(_iv, dict) else {}))
     return Report(items=items)
 
 
