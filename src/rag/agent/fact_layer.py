@@ -379,6 +379,15 @@ def _schedule_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | N
         return None
 
 
+def _doc_reach_tools() -> "list[tuple[str, str, dict[str, Any], Callable[..., Any]]]":
+    """SOT-2677 文書テーブル/全文チャンク lookup ツール群 (default OFF ⇒ [] ⇒ surface byte-identical)。"""
+    try:
+        from src.rag.agent import doc_lookup_lane
+        return doc_lookup_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return []
+
+
 def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     """The 4 fact-layer tools, or ``[]`` when the layer is OFF (⇒ tool set / MCP surface byte-identical)."""
     if not enabled():
@@ -387,6 +396,7 @@ def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
                             _visual_tool(), _heading_page_tool(), _derived_coverage_tool(),
                             _schedule_tool())
                 if x is not None]
+    optional += _doc_reach_tools()
     return optional + [
         (CASE_FILTER,
          "案件マスタ(全案件×標準属性, 各セル出典付き)を属性一致でフィルタし、該当案件を出典付きで返す。"
