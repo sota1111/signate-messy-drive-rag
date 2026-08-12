@@ -125,6 +125,71 @@ def test_flat_rate_cost_is_zero():
     assert inv.Usage(1_000_000, 0).cost_usd("gemini-2.5-pro") == pytest.approx(1.25)
 
 
+# -- planner -> parallel fan-out -> synthesis flow (SOT-2661) --------------------------------------
+def test_plan_fanout_off_preserves_prompt_and_budget(monkeypatch):
+    monkeypatch.delenv("RAG_PLAN_FANOUT", raising=False)
+    assert inv.plan_fanout_enabled() is False
+    assert inv.plan_fanout_budget(18) == 18
+    assert inv._PROMPT_PLAN_FANOUT not in inv.SYSTEM_PROMPT
+
+
+def test_plan_fanout_on_uses_five_nonterminal_calls_for_six_total(monkeypatch):
+    monkeypatch.setenv("RAG_PLAN_FANOUT", "1")
+    assert inv.plan_fanout_enabled() is True
+    assert inv.plan_fanout_budget(18) == 5
+    assert inv.plan_fanout_budget(4) == 4  # never loosen a tighter caller cap
+    monkeypatch.setenv("RAG_PLAN_FANOUT_MAX_TURNS", "3")
+    assert inv.plan_fanout_budget(18) == 3
+    assert "分子・分母・最終式を1つの compute 式" in inv._PROMPT_PLAN_FANOUT
+    assert "budget_exhausted" in inv._PROMPT_PLAN_FANOUT
+    assert "要求外の補足を混ぜない" in inv._PROMPT_PLAN_FANOUT
+
+
+def test_plan_fanout_telemetry_counts_search_and_supplements():
+    tel = claude_mcp._plan_fanout_telemetry(
+        ["search", "metric_lookup", "file_grep", "submit_answer"], 5)
+    assert tel == {
+        "enabled": True,
+        "budget": 5,
+        "first_tool": "search",
+        "search_first": True,
+        "search_calls": 1,
+        "supplement_calls": 2,
+        "extra_searches": 0,
+        "tool_turns": 3,
+    }
+
+
+def test_plan_fanout_wires_cap_and_records_intervention(monkeypatch):
+    monkeypatch.setenv("RAG_CLAUDE_MCP_RESUME", "0")
+    monkeypatch.setenv("RAG_PLAN_FANOUT", "1")
+    monkeypatch.setattr(claude_mcp.shutil, "which", lambda _b: "/usr/bin/claude")
+    stdout = _stream(
+        {"type": "assistant", "message": {"content": [{
+            "type": "tool_use", "name": "mcp__investigator__search",
+            "input": {"query": "Q"}}]}},
+        {"type": "assistant", "message": {"content": [{
+            "type": "tool_use", "name": "mcp__investigator__submit_answer",
+            "input": {"answer": "42件", "confidence": 0.9,
+                      "evidence": "doc.xlsx#row=2", "method": "search"}}]}},
+        {"type": "result", "subtype": "success", "is_error": False, "result": "done"},
+    )
+
+    def fake_run(*args, **kwargs):
+        cfg = json.loads(open(kwargs["cfg_path"], encoding="utf-8").read())
+        env = cfg["mcpServers"]["investigator"]["env"]
+        assert env["RAG_MCP_MAX_TOOL_CALLS"] == "5"
+        return stdout, "", 0, False
+
+    monkeypatch.setattr(claude_mcp, "_run_claude", fake_run)
+    out = claude_mcp.investigate_question(
+        "Q", tools=build_tools(CorpusProfile()), contract="numeric", max_turns=18)
+    assert out.answer.answer == "42件"
+    assert out.interventions["plan_fanout"]["search_first"] is True
+    assert out.interventions["plan_fanout"]["tool_turns"] == 1
+    assert out.interventions["plan_fanout"]["supplement_calls"] == 0
+
+
 # -- server-side tool-call budget cap (SOT-2627) ---------------------------------------------------
 def _make_capped_server(cap: int) -> mcp_server.InvestigatorMCPServer:
     return mcp_server.build_server(CorpusProfile(), log_path=None, max_tool_calls=cap)
