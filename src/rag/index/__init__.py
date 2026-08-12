@@ -344,6 +344,29 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  action row store skipped: {type(e).__name__}: {e}")
 
+    # Document distillation store (SOT-2658 / Cerebras 型検索基盤 2/5): distil every document (xlsx per-
+    # sheet) once at build time via Gemini (前処理限定の使用) into a normalized "この文書は何に答えられるか"
+    # record (answerable_questions / summary / key_facts / mentioned_*), with an anti-hallucination guard
+    # (原文非存在値は破棄) and a content-hash cache (不変ユニットは再蒸留しない ⇒ 課金は初回のみ). The serve
+    # path then reads the baked records LLM-free (registry synopsis 強化 / SOT-2657 FTS の二重表現ソース).
+    # Like ocr_store this SPENDS Gemini, so it gates the build behind RAG_DISTILL_STORE_BUILD (default OFF
+    # ⇒ skipped, prior artifact kept); runtime consultation is opt-in (RAG_DISTILL_STORE) so the champion
+    # serve path is byte-identical by default.
+    try:
+        from src.rag.index import distill_store
+        if distill_store.build_enabled():
+            dz = distill_store.build(refs)
+            if verbose:
+                rep = dz["report"]
+                print(f"  distill store: {rep['units']} units over {rep['docs']} docs "
+                      f"(distilled={rep['distilled']}, reused={rep['reused']}, "
+                      f"dropped_values={rep['dropped_values']}) -> {distill_store.default_out_path()}")
+        elif verbose:
+            print("  distill store: build skipped (RAG_DISTILL_STORE_BUILD off; existing artifact kept)")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  distill store skipped: {type(e).__name__}: {e}")
+
     if verbose:
         print(f"embedding {len(chunks)} chunks...")
     texts = [c.text for c in chunks]

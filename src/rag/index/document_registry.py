@@ -542,6 +542,25 @@ class Resolver:
         scored.sort(key=lambda t: (-t[0], t[1]))
         return [Resolution(d, "synopsis", s, self._by_id[d].get("case_id", "")) for s, d in scored]
 
+    def _distill(self, question: str, project: str | None) -> list[Resolution]:
+        """Distilled-synopsis tier (SOT-2658): rank scoped docs by the build-time Gemini distillation.
+
+        Serve-time LLM-free — it only reads ``artifacts/distill_store.jsonl`` (answerable_questions /
+        summary / key_facts) baked at build time and lexically matches the question. Consulted only when
+        ``RAG_DISTILL_STORE`` is on, so the default serve path never touches it (byte-identical).
+        """
+        try:
+            from src.rag.index import distill_store
+        except Exception:  # noqa: BLE001 — additive; a missing store never breaks resolution
+            return []
+        scoped = set(self._scope(self._by_id.keys(), project))
+        if not scoped:
+            return []
+        out: list[Resolution] = []
+        for doc_id in distill_store.candidate_doc_ids(question, allowed=scoped):
+            out.append(Resolution(doc_id, "distill", 1.0, self._by_id.get(doc_id, {}).get("case_id", "")))
+        return out
+
     def _rank(self, doc_ids: Sequence[str], tier: str, score: float,
               preserve_order: bool = False) -> list[Resolution]:
         ordered = list(doc_ids) if preserve_order else sorted(dict.fromkeys(doc_ids))
@@ -568,6 +587,17 @@ class Resolver:
         ):
             if tier:
                 return tier[:limit]
+        # SOT-2658: distilled-synopsis tier — an enhanced, LLM-free fallback ahead of embedding synopsis.
+        # Guarded by RAG_DISTILL_STORE (default OFF ⇒ this block is skipped and resolve() is byte-identical).
+        try:
+            from src.rag.index import distill_store
+            distill_on = distill_store.enabled()
+        except Exception:  # noqa: BLE001
+            distill_on = False
+        if distill_on:
+            dz = self._distill(question, project)
+            if dz:
+                return dz[:limit]
         if embedder is not None:
             syn = self._synopsis(question, project, embedder)
             if syn:
