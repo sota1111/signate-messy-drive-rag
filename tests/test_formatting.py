@@ -392,3 +392,67 @@ def test_wiring_blank_det_value_falls_back_to_loop(monkeypatch):
     assert res.model != "deterministic"
     assert res.answer.answer == "フォールバック値"
     assert res.tool_calls != ["det_pipeline:numeric"]
+
+
+# --------------------------------------------------------------------------- SOT-2682 小数指定問の単位strip
+_DEC_Q = ("恒一会 かえで総合病院の計画フォルダ内において、データアステル側の担当者のうち、1タスク当たりの想定"
+          "工数（想定工数 ÷ 担当タスク数）が最も大きい人のフルネームと、その1タスク当たりの想定工数を小数第2位"
+          "で答えてください。")
+
+
+def test_decimal_unit_strip_idx79_case():
+    # idx79: name + decimal + composite rate unit ⇒ unit dropped, value (name + number) preserved.
+    out, fired = fmt.strip_decimal_spec_unit(_DEC_Q, "池田 直哉、7.00時間/タスク")
+    assert out == "池田 直哉、7.00"
+    assert fired == ["decimal_spec_unit_strip"]
+
+
+def test_decimal_unit_strip_percent_and_bai():
+    # a 小数第N位 rate/ratio ask answered with %/倍 ⇒ the trailing unit is dropped (gold is bare).
+    assert fmt.strip_decimal_spec_unit("上昇率を小数第2位まで答えてください", "2.21%")[0] == "2.21"
+    assert fmt.strip_decimal_spec_unit("何倍か小数第2位まで求めてください", "2.49倍")[0] == "2.49"
+
+
+def test_decimal_unit_strip_noop_when_already_bare():
+    # gold-shaped bare decimals are a no-op (no unit to strip).
+    for v in ("1.18", "6.088138 ~ 6.288138", "0.42396", "池田 直哉、7.00"):
+        out, fired = fmt.strip_decimal_spec_unit(_DEC_Q, v)
+        assert out == v and fired == []
+
+
+def test_decimal_unit_strip_requires_decimal_spec_question():
+    # no 小数第N位 directive ⇒ never fires, even if the answer carries a number+unit.
+    out, fired = fmt.strip_decimal_spec_unit("想定工数を答えてください", "7.00時間/タスク")
+    assert out == "7.00時間/タスク" and fired == []
+
+
+def test_decimal_unit_strip_integer_answer_untouched():
+    # integer answers (no decimal point) are out of scope — idx27「5」 must not be touched.
+    out, fired = fmt.strip_decimal_spec_unit("項目はいくつありますか。小数第2位で答えてください", "5")
+    assert out == "5" and fired == []
+
+
+def test_decimal_unit_strip_preserves_numeric_tokens():
+    # the numeric token is never altered — only the trailing unit is removed.
+    out, _ = fmt.strip_decimal_spec_unit(_DEC_Q, "3.14ラジアン")
+    assert out == "3.14"
+
+
+def test_decimal_unit_strip_skips_multiline_and_paren_prose():
+    # multi-line prose is skipped; a trailing parenthetical is left to the paren-strip contract.
+    assert fmt.strip_decimal_spec_unit(_DEC_Q, "7.00時間\n(根拠…)")[1] == []
+    # a trailing balanced paren (not a bare unit token) is not a unit ⇒ no strip here.
+    assert fmt.strip_decimal_spec_unit(_DEC_Q, "7.00（時間/タスク）")[1] == []
+
+
+def test_decimal_unit_strip_flag_default_off():
+    import os
+    prev = os.environ.pop("RAG_DECIMAL_UNIT_STRIP", None)
+    try:
+        assert fmt.decimal_unit_strip_enabled() is False
+        os.environ["RAG_DECIMAL_UNIT_STRIP"] = "1"
+        assert fmt.decimal_unit_strip_enabled() is True
+    finally:
+        os.environ.pop("RAG_DECIMAL_UNIT_STRIP", None)
+        if prev is not None:
+            os.environ["RAG_DECIMAL_UNIT_STRIP"] = prev

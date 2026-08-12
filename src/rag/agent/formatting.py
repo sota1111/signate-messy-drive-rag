@@ -335,6 +335,57 @@ def normalize_value_answer(question: str, value: str) -> "tuple[str, list[str]]"
     return text, rules
 
 
+# ------------------------------------------------------------------- SOT-2682 小数指定問の単位strip書式契約
+# idx79: 「…小数第2位で答えてください」への回答が「池田 直哉、7.00時間/タスク」— gold「池田 直哉、7.00」。
+# 数値(7.00)は完全一致で、末尾に付いた単位/サフィックス(時間/タスク・%・倍…)のみで Incorrect。回答が明示的に
+# 「小数第N位」で数値を求めた問いのとき、末尾の (小数)数値 の直後に来る単位表現だけを落とす — 値保存(数値
+# トークン不変)・書式のみ。
+#
+# 全 gold100 較正 (artifacts/predictions_test_v3_final.csv): 「小数(点以下)第N位」指定問の gold は例外なく
+# 裸数値 (idx17=2.21 / 29=6.088138~6.288138 / 30=1.18 / 33/54/57/63/79/83/99 いずれも単位なし)。ゆえに
+# 小数指定問で末尾単位を落とす変換は fix(idx79) か no-op にしかならず、単位込み gold を壊さない
+# (通貨「いくらですか」等は小数第N位の書式指定を持たないので非該当)。
+# Fail-closed:
+#   * 発火は質問が「小数第N位」書式指定を持つ場合のみ(単位そのものを問う問いは非該当);
+#   * 落とすのは「末尾の(小数)数値 + 単位サフィックス」形のみ — 数値は小数点必須(整数回答 idx27「5」は非対象)、
+#     単位は句読点/括弧/空白/数字を含まない短い(≤12字)トークンに限る(説明文・括弧注記は別契約が担当);
+#   * 数値トークン保存ガード(:func:`_numeric_tokens_preserved`)で数値の改変を拒否;
+#   * 複数行回答は散文とみなしスキップ;
+#   * ``RAG_DECIMAL_UNIT_STRIP`` (default OFF ⇒ serve byte-identical)。
+_DECIMAL_SPEC_Q_RE = re.compile(r"小数(?:点以下)?第\s*[0-9０-９一二三四五六七八九十]+\s*位")
+# 末尾の「(小数)数値 + 単位サフィックス」。単位は句読点・括弧・空白・数字を含まない 1〜12 字トークン。
+_TRAILING_DECIMAL_UNIT_RE = re.compile(
+    r"(?P<num>-?\d[\d,]*\.\d+)\s*(?P<unit>[^\d\s、。．，,・()（）\[\]「」『』]{1,12})\s*$")
+
+
+def decimal_unit_strip_enabled() -> bool:
+    """SOT-2682 — 小数指定問の単位 strip が発火するか (``RAG_DECIMAL_UNIT_STRIP``, default OFF)。"""
+    return _env_flag("RAG_DECIMAL_UNIT_STRIP", False)
+
+
+def strip_decimal_spec_unit(question: str, value: str) -> "tuple[str, list[str]]":
+    """小数第N位指定問の回答末尾に付いた単位サフィックスを落とす、値保存の書式契約 (SOT-2682)。
+
+    Returns ``(new_value, fired_rules)`` — ``fired_rules`` は変化なしなら空。質問が「小数第N位」書式
+    指定を持つときだけ発火し、末尾の (小数)数値+単位 の単位のみを除去する(数値トークンは保存)。整数のみの
+    回答・単位のない回答・複数行回答・書式指定なしの問いはいずれも no-op。
+    """
+    rules: list[str] = []
+    if not value or "\n" in value.strip():
+        return value, rules
+    if not _DECIMAL_SPEC_Q_RE.search(question or ""):
+        return value, rules
+    text = value.strip()
+    m = _TRAILING_DECIMAL_UNIT_RE.search(text)
+    if not m:
+        return value, rules
+    new = (text[: m.start()] + m.group("num")).rstrip()
+    if not new or not _numeric_tokens_preserved(new, text):
+        return value, rules
+    rules.append("decimal_spec_unit_strip")
+    return new, rules
+
+
 def _parse_small_int(raw: str) -> "int | None":
     """Parse a small positive integer written in ASCII/fullwidth digits or 一〜十 kanji (precision桁 use)."""
     s = raw.translate(_FULLWIDTH_DIGITS).strip()

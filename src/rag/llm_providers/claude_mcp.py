@@ -651,6 +651,15 @@ def investigate_question(question: str, *, tools: Sequence[AgentTool],
                                  "rules": list((strip_tel or {}).get("rules", [])) + nfired}
                     answer = Answer(answer=normed, confidence=answer.confidence,
                                     evidence=answer.evidence, method=answer.method + " +value_norm")
+            # SOT-2682 — 小数指定問の単位 strip (RAG_DECIMAL_UNIT_STRIP, default OFF). 値保存(書式のみ):
+            # 「小数第N位で答えて」問への回答末尾の単位サフィックスだけを落とす (idx79「7.00時間/タスク」→「7.00」)。
+            if _fmt.decimal_unit_strip_enabled():
+                dstripped, dfired = _fmt.strip_decimal_spec_unit(question, answer.answer)
+                if dfired:
+                    strip_tel = {"applied": True,
+                                 "rules": list((strip_tel or {}).get("rules", [])) + dfired}
+                    answer = Answer(answer=dstripped, confidence=answer.confidence,
+                                    evidence=answer.evidence, method=answer.method + " +decimal_unit_strip")
         inv = Investigation(
             question=question, answer=answer, iterations=iterations, tool_calls=tool_calls,
             usage=usage, model=model_label, elapsed_s=elapsed, stop_reason=stop_reason,
