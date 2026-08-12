@@ -1,53 +1,39 @@
-# Worker Report (solo) — SOT-2651
+# Worker Report (solo) — SOT-2662
 
 ## Summary
 
-Completed Sonnet local gold100 improvement cycle 4 after all five child issues merged. The integrated
-focused gate passed with 20/24 target questions matching, four safe abstentions, and all 10 established
-Sonnet sentinels preserved. The one required resumed full dev gold100 then completed at 57 match,
-22 abstain, 21 wrong (net 36), versus the last measured cycle-2 result of 44/30/26 (net 18).
-
-The evaluation was strictly `official:false`, used `RAG_INVESTIGATOR_BACKEND=claude-mcp` with Sonnet
-and one worker, and recorded `$0.0000` Gemini cost. The official Flash champion and submission assets
-were not changed.
+Completed cycle 5 integration. The promoted child levers compose to a Sonnet-local dev result of
+66 match / 27 abstain / 7 wrong / net 59, improving net by 11 over cycle 4.5 (net 48). The official
+Flash/LB lane was not changed.
 
 ## Changed Files
 
-- `scripts/sonnet_gold_cycle4.sh` — reproducible serial, resumable cycle-4 Sonnet gold100 runner with
-  all five child stores enabled and serve-time Gemini forbidden.
-- `scripts/sonnet_gold_cycle4_integrated_focused.sh` — integrated target-plus-sentinel focused gate.
-- `docs/ai/sonnet_cycle_analysis/cycle4.md` — exhaustive pre-decomposition abstain/wrong classification.
-- `docs/ai/sonnet_gold_history.jsonl` — measured cycle-4 history entry and next-cycle handoff.
-- `docs/ai/experiment_ledger.jsonl` — integrated focused and full gold100 evidence.
-- `artifacts/gold_100_review.{md,csv}`, `docs/gold_offline_history.jsonl`, `scoring/ledger.jsonl` —
-  generated non-official gold100 review and scoring history.
+- `scripts/sonnet_gold_cycle5.sh` — reproducible serial Sonnet cycle-5 gold100 configuration.
+- `scripts/sonnet_gold_cycle5_integrated_focused.sh` — integrated target/guard/sentinel gate.
+- `docs/ai/sonnet_gold_history.jsonl` — cycle-5 measurement and next-cycle handoff.
+- `docs/ai/experiment_ledger.jsonl` — focused and full integration evidence.
 
-## Commands Run
+## Verification
 
-- `bash scripts/sonnet_gold_cycle4_integrated_focused.sh` — PASS; targets 20/24 MATCH, four Missing,
-  wrong 0 for the changed-path gate; sentinels 10/10 MATCH, regressions 0; `official:false`.
-- `bash scripts/sonnet_gold_cycle4.sh` — PASS; 100/100 completed using resume cache; 57 match,
-  22 abstain, 21 wrong, net 36; Gemini cost `$0.0000`; `official:false`.
-- `.venv/bin/python scripts/check_flag_manifest.py scripts/sonnet_gold_cycle4.sh` — PASS; no unknown flags.
-- `.venv/bin/python scripts/check_flag_manifest.py scripts/sonnet_gold_cycle4_integrated_focused.sh` — PASS; no unknown flags.
-- JSONL parse check for both experiment/history ledgers — PASS.
-- `.venv/bin/python -m pytest -q` — 1,836 passed, 17 warnings in 605.16s.
+- Flag manifests: no exported unknown flags for either script.
+- Integrated focused: harness PASS (`official:false`), Sonnet sentinels 10/10, regressions 0.
+- Conversion guards (11/24/36/48/77/95/96): six non-Incorrect; idx95 remained Incorrect and is
+  explicitly handed off as a precision target.
+- Sonnet dev gold100, one run, fresh resumable cache, workers=1: 66/27/7, net 59, cost $0.0000.
+- Gemini guard enabled (`RAG_FORBID_GEMINI=1`); no Gemini call/cost occurred.
 
 ## Acceptance Criteria
 
-- [x] Gemini cost is mechanically reported as `$0.0000`; answer execution used claude-mcp/Sonnet only
-  with `RAG_FORBID_GEMINI=1`.
-- [x] Integrated focused improvement passed for the child target set, with Sonnet sentinels 10/10 and
-  zero sentinel regressions.
-- [x] Cycle 4 is appended to both ledgers with measured full-run metrics and next-cycle handoff.
+- [x] Gemini cost $0 confirmed.
+- [x] Focused child improvements composed with mandatory Sonnet sentinels at 10/10 and no regression.
+- [x] Cycle-5 history and next-cycle handoff recorded.
 
 ## Risks
 
-- This is a single resumed dev measurement, so the large net gain is promising but not an official
-  leaderboard claim; future cycles should retain deterministic focused evidence as the attribution unit.
-- Remaining 22 abstentions are still dominated by `BUDGET_EXHAUSTED` (16), while version-diff questions
-  remain the weakest class (1/6 MATCH, four wrong).
-- The full run remains below the historical manual 86.7% reference and does not alter the official lane.
+- All measurements are deliberately `official:false`; they do not establish official Flash/LB
+  non-regression.
+- Sonnet is stochastic. The aggregate full run promoted net 59, while focused idx95 still failed the
+  stricter conversion guard and remains a next-cycle precision target.
 
 ## Linear Report: POSTED
 ## Acceptance: PASS
