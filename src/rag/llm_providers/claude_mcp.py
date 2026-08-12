@@ -210,13 +210,34 @@ def _allowed_tools(tools: Sequence[AgentTool]) -> list[str]:
     return [f"mcp__{MCP_SERVER_NAME}__{t.name}" for t in tools]
 
 
+def _bare_answer_enabled() -> bool:
+    """裸回答書式契約 (cycle4 調査: wrong 21 のうち 12 件が「値は正しいが説明文/注記/記法で judge 落ち」)。
+
+    プロンプトのみの契約 — 値の後処理は一切行わない (値保存)。既定 OFF。
+    """
+    return os.getenv("RAG_BARE_ANSWER", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+_BARE_ANSWER_CONTRACT = (
+    "\n\n【回答書式契約】answer フィールドには質問が要求する値・語句そのものだけを書く(裸の値):"
+    "理由・計算過程・出典・セル位置・補足説明・括弧書きの注記は answer に一切含めず、evidence フィールドへ書く。"
+    "例:『差額は0円(…のため)』ではなく『0円』/『13ページ(スライド13)「8. 費用見積」』ではなく『13ページ』。"
+    "数値は原文・計算結果の精度をそのまま書き、勝手に丸めたり『約』を付けたりしない。"
+    "範囲は『A ~ B』の形式で書く(区間記法 (a, b] 等は使わない)。"
+    "一覧を要求されたら項目のみを読点区切りで列挙し、各項目に説明を付けない。"
+)
+
+
 def _harness_system_suffix() -> str:
-    return (
+    base = (
         "\n\n【実行環境(dev)】ツールは MCP 経由で `mcp__investigator__<ツール名>` として提供される"
         "(例: `mcp__investigator__file_grep`, `mcp__investigator__compute`)。これら以外のツールは使わない。"
         f"最終回答は必ず `mcp__investigator__{SUBMIT_ANSWER}` を1回だけ呼んで確定する"
         "(通常の文章では答えない)。根拠が得られない場合のみ answer=「" + ABSTAIN + "」で submit する。"
     )
+    if _bare_answer_enabled():
+        base += _BARE_ANSWER_CONTRACT
+    return base
 
 
 def _is_usage_limit(text: str) -> bool:
