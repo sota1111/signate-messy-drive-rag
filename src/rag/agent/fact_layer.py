@@ -325,12 +325,21 @@ def _report_attr_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] 
         return None
 
 
+def _case_finance_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | None":
+    """SOT-2654 財務・工数 lookup tool (default OFF)."""
+    try:
+        from src.rag.agent import case_finance_lane
+        return case_finance_lane.tool()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     """The 4 fact-layer tools, or ``[]`` when the layer is OFF (⇒ tool set / MCP surface byte-identical)."""
     if not enabled():
         return []
-    extra = _report_attr_tool()
-    return ([] if extra is None else [extra]) + [
+    optional = [x for x in (_report_attr_tool(), _case_finance_tool()) if x is not None]
+    return optional + [
         (CASE_FILTER,
          "案件マスタ(全案件×標準属性, 各セル出典付き)を属性一致でフィルタし、該当案件を出典付きで返す。"
          "『APR-M3の案件を略称で列挙し契約金額(税込)を合計』『完了かつAPR-M1で顧客データ≥10000行の案件』の"
@@ -661,6 +670,14 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
             result = _enum_lane(question)
         else:
             result = None
+        # SOT-2654 spans numeric and simple-lookup contracts. The optional lane performs its own strict
+        # semantic binding and is default OFF, so unsupported questions remain byte-identical fallbacks.
+        if result is None:
+            try:
+                from src.rag.agent import case_finance_lane
+                result = case_finance_lane.resolve(question)
+            except Exception:  # noqa: BLE001
+                result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path
         return None
     if result is None or not _contract.is_contract(result):

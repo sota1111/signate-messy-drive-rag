@@ -314,6 +314,20 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  report attr store skipped: {type(e).__name__}: {e}")
 
+    # Case finance/effort store (SOT-2654): all-case operands and cross-case derived tables. Runtime
+    # consumption is separately opt-in, preserving the default answer path byte-for-byte.
+    try:
+        from src.rag.index import case_finance_store
+        cfs = case_finance_store.build(refs)
+        if verbose:
+            cert = cfs["report"]["certificate"]
+            print(f"  case finance store: {cfs['cases']} cases "
+                  f"(universe_ok={cert['row_count_equals_universe']}) "
+                  f"-> {case_finance_store.default_out_path()}")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  case finance store skipped: {type(e).__name__}: {e}")
+
     if verbose:
         print(f"embedding {len(chunks)} chunks...")
     texts = [c.text for c in chunks]
