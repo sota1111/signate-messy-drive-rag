@@ -388,6 +388,15 @@ def _doc_reach_tools() -> "list[tuple[str, str, dict[str, Any], Callable[..., An
         return []
 
 
+def _raw_artifact_tools() -> "list[tuple[str, str, dict[str, Any], Callable[..., Any]]]":
+    """SOT-2678 分析成果物 raw ファイル lookup ツール群 (default OFF ⇒ [] ⇒ surface byte-identical)。"""
+    try:
+        from src.rag.agent import raw_artifact_lane
+        return raw_artifact_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return []
+
+
 def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     """The 4 fact-layer tools, or ``[]`` when the layer is OFF (⇒ tool set / MCP surface byte-identical)."""
     if not enabled():
@@ -397,6 +406,7 @@ def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
                             _schedule_tool())
                 if x is not None]
     optional += _doc_reach_tools()
+    optional += _raw_artifact_tools()
     return optional + [
         (CASE_FILTER,
          "案件マスタ(全案件×標準属性, 各セル出典付き)を属性一致でフィルタし、該当案件を出典付きで返す。"
