@@ -63,6 +63,7 @@ from src.rag.tools.highlight_extract import highlight_extract
 from src.rag.tools.pdf_faux_italic import emphasized_words
 from src.rag.tools.profile import CorpusProfile
 from src.rag.tools.seating_chart import seating_lookup
+from src.rag.tools import text_search as _text_search
 
 # --------------------------------------------------------------------------- loop configuration
 DEFAULT_MAX_TURNS = 12            # hard cap on model turns per question (tool rounds + the final answer)
@@ -477,11 +478,22 @@ _PROMPT_FACT_LAYER = (
     "operand)を返すので、その value を根拠に submit_answer する。返り値が空/未解決のときのみ従来の探索に戻す。\n"
 )
 
+# SOT-2657 — lexical-index tool discipline. Appended ONLY when RAG_TEXT_FTS is on (default OFF ⇒ the
+# prompt is byte-identical), mirroring the RAG_FACT_LAYER gate. Steers the loop to text_search as the
+# first choice for literal/字句 discovery, with file_grep as the fallback only when the index misses.
+_PROMPT_TEXT_SEARCH = (
+    "8b. 全文字句インデックス(有効時): エラー文字列・フラグ名・ID・固有語などのリテラルが『コーパスの"
+    "どこにあるか』を探すときは、file_grep の全走査より先に text_search を使う。全文を索引済みなので"
+    "ミリ秒で所在(doc_id・ページ/シート/セル/行)付きの上位ヒットを返し、希少トークンほど上位に来る。"
+    "返り値が空のときだけ file_grep にフォールバックする(同じ語での grep 反復は避ける)。\n"
+)
+
 SYSTEM_PROMPT = (
     _PROMPT_HEAD
     + (_PROMPT_EXPLORE_NEUTRAL if NEUTRAL_PROMPT else _PROMPT_EXPLORE_LEGACY)
     + _PROMPT_TOOLS
     + (_PROMPT_FACT_LAYER if _fact_layer.enabled() else "")
+    + (_PROMPT_TEXT_SEARCH if _text_search.enabled() else "")
     + (_PROMPT_COMMIT_NEUTRAL if NEUTRAL_PROMPT else _PROMPT_COMMIT_LEGACY)
 )
 
@@ -1019,6 +1031,18 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
             lambda question, predicate=None, entry_types=None, project=None:
                 _enum_scan.enum_scan_tool(question, predicate=predicate,
                                           entry_types=entry_types, project=project),
+        ))
+    # SOT-2657 (Cerebras 型検索基盤 1/5): full-corpus lexical index (FTS5+IDF). Additively exposed ONLY
+    # when RAG_TEXT_FTS is on, so the champion serve tool set / function-call schema / MCP surface stay
+    # byte-identical by default. Registering here is the single source of truth — :mod:`src.rag.mcp.server`
+    # builds its tools/list from ``build_tools`` too, so the tool auto-publishes to MCP.
+    if _text_search.enabled():
+        tools.append(AgentTool(
+            _text_search.TOOL_NAME,
+            _text_search.TOOL_DESCRIPTION,
+            _text_search.TOOL_PARAMETERS,
+            lambda query, project=None, ext=None, limit=20: _text_search.text_search(
+                query, project=project, ext=ext, limit=limit),
         ))
     # SOT-2647 (事前計算事実層 5/5): the 4 precomputed stores (案件/ID/派生メトリクス/版差分) as first-class
     # tools — case_filter / id_lookup / metric_lookup / diff_lookup. Additively exposed ONLY when

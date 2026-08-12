@@ -367,6 +367,25 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  distill store skipped: {type(e).__name__}: {e}")
 
+    # SOT-2657 (Cerebras 型検索基盤 1/5): full-corpus lexical index (FTS5+IDF). Transcribes every
+    # document's text into a searchable, IDF-ranked SQLite FTS5 store so text_search can answer literal
+    # discovery in milliseconds instead of file_grep re-extracting the whole corpus. Gated by
+    # RAG_TEXT_FTS_BUILD (default OFF ⇒ existing artifact kept); serve consultation gated by RAG_TEXT_FTS.
+    try:
+        from src.rag.index import text_fts
+        if text_fts.build_enabled():
+            tf = text_fts.build(refs)
+            if verbose:
+                rep = tf["report"]
+                print(f"  text fts: {rep['records']} rows over {rep['docs']} docs "
+                      f"(tokens={rep['tokens_distinct']}, skipped={rep['skipped']}) "
+                      f"-> {text_fts.default_out_path()}")
+        elif verbose:
+            print("  text fts: build skipped (RAG_TEXT_FTS_BUILD off; existing artifact kept)")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  text fts skipped: {type(e).__name__}: {e}")
+
     if verbose:
         print(f"embedding {len(chunks)} chunks...")
     texts = [c.text for c in chunks]
