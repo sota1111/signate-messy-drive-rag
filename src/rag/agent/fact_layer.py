@@ -334,11 +334,21 @@ def _case_finance_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]]
         return None
 
 
+def _action_row_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | None":
+    """SOT-2652 action-row lookup tool (default OFF ⇒ None ⇒ surface byte-identical)."""
+    try:
+        from src.rag.agent import action_row_lane
+        return action_row_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return None
+
+
 def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     """The 4 fact-layer tools, or ``[]`` when the layer is OFF (⇒ tool set / MCP surface byte-identical)."""
     if not enabled():
         return []
-    optional = [x for x in (_report_attr_tool(), _case_finance_tool()) if x is not None]
+    optional = [x for x in (_report_attr_tool(), _case_finance_tool(), _action_row_tool())
+                if x is not None]
     return optional + [
         (CASE_FILTER,
          "案件マスタ(全案件×標準属性, 各セル出典付き)を属性一致でフィルタし、該当案件を出典付きで返す。"
@@ -677,6 +687,14 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
                 from src.rag.agent import case_finance_lane
                 result = case_finance_lane.resolve(question)
             except Exception:  # noqa: BLE001
+                result = None
+        # SOT-2652 — action-row（AI/タスク行）ストアの simple_lookup 直答レーン（idx20/70 型）。上位レーンが
+        # 束縛できない時のみ後置。RAG_ACTION_ROW_STORE OFF ⇒ action_row_lane.resolve() は None ⇒ byte-identical。
+        if result is None:
+            try:
+                from src.rag.agent import action_row_lane
+                result = action_row_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path
         return None
