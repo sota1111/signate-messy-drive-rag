@@ -294,6 +294,26 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  diff store skipped: {type(e).__name__}: {e}")
 
+    # Report attribute store (SOT-2655 / 事前計算事実層 追補 — cycle4 クラスタD): precompute per-案件 numeric
+    # attributes from 最終報告/調査系 文書 + 分析成果物 — 最良モデルのハイパーパラメータ表 (metrics.json
+    # model_params), 将来フェーズの想定工数 (報告本文の フェーズX/工数 行), 高影響特徴量とターゲット相関 —
+    # so scanned-PDF numeric abstains (idx5 max_depth / idx28 相関最大特徴量 / idx64 フェーズ工数合計,
+    # BUDGET_EXHAUSTED) reduce to an O(1) lookup instead of file_grep that never reaches a scan's body.
+    # Question-independent & LLM-free (reads persisted OCR + text-layer + analysis JSON + train tables).
+    # Additive and fully guarded; runtime consultation is opt-in (RAG_REPORT_ATTR_STORE) so the champion
+    # serve path is byte-identical.
+    try:
+        from src.rag.index import report_attr_store
+        ras = report_attr_store.build(refs)
+        if verbose:
+            rep = ras["report"]
+            print(f"  report attr store: {ras['cases']} cases "
+                  f"(model={rep['with_model']}, phases={rep['with_phases']}, "
+                  f"features={rep['with_features']}) -> {report_attr_store.default_out_path()}")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  report attr store skipped: {type(e).__name__}: {e}")
+
     if verbose:
         print(f"embedding {len(chunks)} chunks...")
     texts = [c.text for c in chunks]

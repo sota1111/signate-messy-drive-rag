@@ -316,11 +316,21 @@ def _metric_keys(rec: Mapping[str, Any]) -> list[str]:
 _STR = {"type": "string"}
 
 
+def _report_attr_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | None":
+    """SOT-2655 報告数値属性 lookup ツール（RAG_REPORT_ATTR_STORE OFF ⇒ None ⇒ surface byte-identical）。"""
+    try:
+        from src.rag.agent import report_attr_lane
+        return report_attr_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return None
+
+
 def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     """The 4 fact-layer tools, or ``[]`` when the layer is OFF (⇒ tool set / MCP surface byte-identical)."""
     if not enabled():
         return []
-    return [
+    extra = _report_attr_tool()
+    return ([] if extra is None else [extra]) + [
         (CASE_FILTER,
          "案件マスタ(全案件×標準属性, 各セル出典付き)を属性一致でフィルタし、該当案件を出典付きで返す。"
          "『APR-M3の案件を略称で列挙し契約金額(税込)を合計』『完了かつAPR-M1で顧客データ≥10000行の案件』の"
@@ -638,6 +648,15 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
     try:
         if contract in _DERIVED:
             result = _derived_lane(question)
+            if result is None:
+                # SOT-2655 — 報告数値属性ストア(最良モデルparam/フェーズ工数/高影響特徴量相関)の直答レーン。
+                # 派生メトリクスレーンが束縛できない NUMERIC のみに後置(既存挙動は不変)。RAG_REPORT_ATTR_STORE
+                # OFF なら report_attr_lane.resolve() は None ⇒ byte-identical。
+                try:
+                    from src.rag.agent import report_attr_lane
+                    result = report_attr_lane.resolve(question)
+                except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                    result = None
         elif contract in _ENUM:
             result = _enum_lane(question)
         else:
