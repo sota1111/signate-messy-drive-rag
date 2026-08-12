@@ -50,6 +50,8 @@ from src.rag.agent.investigator import (
     Investigation,
     Usage,
     _answer_from_args,
+    fanout_finisher_budget,
+    fanout_finisher_enabled,
     is_abstain,
     plan_fanout_budget,
     plan_fanout_enabled,
@@ -197,6 +199,13 @@ def _mcp_config(tool_log: str, max_tool_calls: int,
     env = {"RAG_MCP_TOOL_LOG": tool_log}
     if max_tool_calls and max_tool_calls > 0:
         env["RAG_MCP_MAX_TOOL_CALLS"] = str(int(max_tool_calls))
+    # SOT-2664 — carry the bounded finisher config alongside the per-question budget so the launched
+    # server enables it deterministically (does not rely on ambient-env inheritance). OFF ⇒ keys omitted
+    # ⇒ byte-identical config.
+    _fin = fanout_finisher_budget()
+    if _fin > 0:
+        env["RAG_FANOUT_FINISHER"] = "1"
+        env["RAG_FANOUT_FINISHER_MAX"] = str(int(_fin))
     if question:
         env["RAG_MCP_QUESTION"] = question
     if contract:
@@ -439,6 +448,11 @@ def _plan_fanout_telemetry(tool_calls: Sequence[str], budget: int) -> dict[str, 
     # supplement = narrowing tool calls that are NOT the unified search (stage ③); when search never
     # fired, every non-submit call counts as a supplement probe (the flow degraded to individual tools).
     supplement = (len(non_submit) - search_calls) if search_calls else len(non_submit)
+    # SOT-2664 — non-terminal tool turns executed beyond the plan-fanout budget. When the bounded finisher
+    # is ON these are the extra targeted raw-evidence reads it granted; when OFF this is always 0 (the
+    # server refuses every over-budget call), so the field doubles as a finisher-fired indicator.
+    finisher_max = fanout_finisher_budget()
+    finisher_calls = max(0, len(non_submit) - int(budget)) if budget and budget > 0 else 0
     return {
         "enabled": True,
         "budget": int(budget),
@@ -448,6 +462,9 @@ def _plan_fanout_telemetry(tool_calls: Sequence[str], budget: int) -> dict[str, 
         "supplement_calls": int(max(0, supplement)),
         "extra_searches": int(max(0, search_calls - 1)),
         "tool_turns": int(len(non_submit)),
+        "finisher_enabled": bool(finisher_max > 0),
+        "finisher_max": int(finisher_max),
+        "finisher_calls": int(finisher_calls),
     }
 
 

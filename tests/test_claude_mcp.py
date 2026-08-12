@@ -145,7 +145,8 @@ def test_plan_fanout_on_uses_five_nonterminal_calls_for_six_total(monkeypatch):
     assert "要求外の補足を混ぜない" in inv._PROMPT_PLAN_FANOUT
 
 
-def test_plan_fanout_telemetry_counts_search_and_supplements():
+def test_plan_fanout_telemetry_counts_search_and_supplements(monkeypatch):
+    monkeypatch.delenv("RAG_FANOUT_FINISHER", raising=False)
     tel = claude_mcp._plan_fanout_telemetry(
         ["search", "metric_lookup", "file_grep", "submit_answer"], 5)
     assert tel == {
@@ -157,7 +158,43 @@ def test_plan_fanout_telemetry_counts_search_and_supplements():
         "supplement_calls": 2,
         "extra_searches": 0,
         "tool_turns": 3,
+        "finisher_enabled": False,
+        "finisher_max": 0,
+        "finisher_calls": 0,
     }
+
+
+# -- bounded plan-fanout finisher (SOT-2664) -------------------------------------------------------
+def test_fanout_finisher_off_by_default(monkeypatch):
+    monkeypatch.delenv("RAG_FANOUT_FINISHER", raising=False)
+    assert inv.fanout_finisher_enabled() is False
+    assert inv.fanout_finisher_budget() == 0
+    # eligibility is a pure predicate — independent of the enabled flag (the server multiplies it in)
+    assert inv.fanout_finisher_eligible("read_office", {"file": "a.pptx"}) is True
+
+
+def test_fanout_finisher_budget_reads_env(monkeypatch):
+    monkeypatch.setenv("RAG_FANOUT_FINISHER", "1")
+    assert inv.fanout_finisher_budget() == inv.FANOUT_FINISHER_DEFAULT_MAX
+    monkeypatch.setenv("RAG_FANOUT_FINISHER_MAX", "5")
+    assert inv.fanout_finisher_budget() == 5
+    monkeypatch.setenv("RAG_FANOUT_FINISHER_MAX", "0")  # invalid (must be >0) ⇒ default
+    assert inv.fanout_finisher_budget() == inv.FANOUT_FINISHER_DEFAULT_MAX
+
+
+def test_fanout_finisher_eligible_only_targeted_reads():
+    # targeted raw-evidence readers with a resolved file target qualify
+    assert inv.fanout_finisher_eligible("read_office", {"file": "b.pptx"}) is True
+    assert inv.fanout_finisher_eligible("format_events", {"file": "m.xlsx", "fill": "黄"}) is True
+    assert inv.fanout_finisher_eligible("compute", {"file": "t.csv", "expr": "df.x.sum()"}) is True
+    # exploratory/search/resolve tools never qualify (the abstain→wrong guard)
+    assert inv.fanout_finisher_eligible("file_grep", {"file": "x", "query": "q"}) is False
+    assert inv.fanout_finisher_eligible("find_files", {"query": "q"}) is False
+    assert inv.fanout_finisher_eligible("version_diff", {"question": "q"}) is False
+    assert inv.fanout_finisher_eligible("canonical_route", {"question": "q"}) is False
+    # a targeted reader still searching for its file (empty/missing target) does not qualify
+    assert inv.fanout_finisher_eligible("read_office", {"file": ""}) is False
+    assert inv.fanout_finisher_eligible("read_office", {}) is False
 
 
 def test_plan_fanout_wires_cap_and_records_intervention(monkeypatch):
