@@ -37,7 +37,7 @@ import time
 from typing import Any, Mapping, Sequence
 
 from src.rag.agent.investigator import (
-    SUBMIT_ANSWER, AgentTool, build_tools, dispatch, is_raw_file_tool)
+    SUBMIT_ANSWER, AgentTool, build_tools, dispatch, is_raw_file_tool, scored_answer_text)
 from src.rag.tools.profile import CorpusProfile
 
 SERVER_NAME = "signate-investigator"
@@ -221,7 +221,9 @@ class InvestigatorMCPServer:
         from src.rag.agent import commit_gate as _commit_gate  # lazy — avoids the exec_verifier cycle
         if not _commit_gate.enabled():
             return None  # OFF ⇒ byte-identical
-        submitted = str((args or {}).get("answer", "") or "")
+        # SOT-2670 — the gate validates the SCORED answer, which is bare_answer when RAG_TWO_TIER_ANSWER
+        # is ON (else the legacy ``answer`` field, verbatim ⇒ byte-identical).
+        submitted = scored_answer_text(args)
         decision = _commit_gate.evaluate(
             self.question, self.contract, submitted,
             session_tool_history=self._tool_history,
