@@ -344,6 +344,23 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  action row store skipped: {type(e).__name__}: {e}")
 
+    # xlsx visual facts store (SOT-2653 / 事前計算事実層 追補 — クラスタB): every xlsx's chart series →
+    # column headers, all static/CF-highlighted cells (with colour family, row/col labels), colour-family
+    # min/max/range summaries, and derived full-row / full-column highlight & correlation-sheet structures.
+    # LLM-free (openpyxl reads formatting/defined-names/CF only); runtime consultation is opt-in
+    # (RAG_VISUAL_STORE) so the champion serve path is byte-identical.
+    try:
+        from src.rag.index import visual_store
+        vst = visual_store.build(refs)
+        if verbose:
+            rep = vst["report"]
+            print(f"  visual store: {vst['docs']} docs "
+                  f"(charts={rep['charts']}, highlights={rep['highlighted_cells']}, "
+                  f"cf={rep['cf_rules']}) -> {visual_store.default_out_path()}")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  visual store skipped: {type(e).__name__}: {e}")
+
     # Document distillation store (SOT-2658 / Cerebras 型検索基盤 2/5): distil every document (xlsx per-
     # sheet) once at build time via Gemini (前処理限定の使用) into a normalized "この文書は何に答えられるか"
     # record (answerable_questions / summary / key_facts / mentioned_*), with an anti-hallucination guard
