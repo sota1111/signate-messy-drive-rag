@@ -75,6 +75,11 @@ export RAG_FANOUT_FINISHER_MAX="${RAG_FANOUT_FINISHER_MAX:-3}"
 export RAG_INVESTIGATOR_BACKEND=claude-mcp
 export RAG_CLAUDE_MCP_MODEL=sonnet
 export RAG_MCP_TOOL_LOG=artifacts/sonnet_child_fanout_finisher_tool_calls.jsonl
+# NO resume cache: the finisher changes serve behaviour, but the resume key is only (model, question) —
+# NOT config — so the shared default sidecar (artifacts/claude_mcp_resume.jsonl) would REPLAY stale
+# answers from a prior run and silently mask the change under test. Disable it so target AND sentinels
+# re-derive live under the exact axis config.
+export RAG_CLAUDE_MCP_RESUME=0
 
 # 一次 churn 4 + precision ガード 7 (Incorrect へ逆流しないこと)。
 TARGET="${TARGET:-16,49,75,83,11,24,36,48,77,95,96}"
