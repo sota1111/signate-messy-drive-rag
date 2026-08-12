@@ -64,6 +64,7 @@ from src.rag.tools.pdf_faux_italic import emphasized_words
 from src.rag.tools.profile import CorpusProfile
 from src.rag.tools.seating_chart import seating_lookup
 from src.rag.tools import text_search as _text_search
+from src.rag.tools import unified_search as _unified_search
 
 # --------------------------------------------------------------------------- loop configuration
 DEFAULT_MAX_TURNS = 12            # hard cap on model turns per question (tool rounds + the final answer)
@@ -488,12 +489,23 @@ _PROMPT_TEXT_SEARCH = (
     "返り値が空のときだけ file_grep にフォールバックする(同じ語での grep 反復は避ける)。\n"
 )
 
+# SOT-2659 — unified fan-out search discipline. Appended ONLY when RAG_UNIFIED_SEARCH is on (default OFF ⇒
+# prompt byte-identical). Steers the loop to spend ONE turn on ``search`` first (parallel fan-out over every
+# retriever, RRF-fused) and reserve the individual tools for narrowing that result — the direct BUDGET32 fix.
+_PROMPT_UNIFIED_SEARCH = (
+    "8c. 統合検索(有効時): 探索の最初の一手は search を1発呼ぶ。全リトリーバ(字句FTS・蒸留・IDマスタ逆引き・"
+    "版差分・案件ファイル解決)を内部で並列実行し RRF 融合・文脈復元した results と coverage(どの方式が当てたか)を"
+    "1ターンで返すので、text_search / id_lookup / diff_lookup / canonical_route を1個ずつ順に試すな。個別ツール"
+    "(case_filter/metric_lookup/format_events 等)は search の結果を絞り込む用途に限って使う。\n"
+)
+
 SYSTEM_PROMPT = (
     _PROMPT_HEAD
     + (_PROMPT_EXPLORE_NEUTRAL if NEUTRAL_PROMPT else _PROMPT_EXPLORE_LEGACY)
     + _PROMPT_TOOLS
     + (_PROMPT_FACT_LAYER if _fact_layer.enabled() else "")
     + (_PROMPT_TEXT_SEARCH if _text_search.enabled() else "")
+    + (_PROMPT_UNIFIED_SEARCH if _unified_search.enabled() else "")
     + (_PROMPT_COMMIT_NEUTRAL if NEUTRAL_PROMPT else _PROMPT_COMMIT_LEGACY)
 )
 
@@ -1042,6 +1054,19 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
             _text_search.TOOL_DESCRIPTION,
             _text_search.TOOL_PARAMETERS,
             lambda query, project=None, ext=None, limit=20: _text_search.text_search(
+                query, project=project, ext=ext, limit=limit),
+        ))
+    # SOT-2659 (Cerebras 型検索基盤 3/5): unified fan-out ``search`` — one call runs every query-addressable
+    # retriever (FTS/蒸留/id_master/版差分/registry) in parallel, RRF-fuses, dedups, caps per file, and
+    # re-expands context. Additively exposed ONLY when RAG_UNIFIED_SEARCH is on, so the champion serve tool
+    # set / function-call schema / MCP surface stay byte-identical by default. Registering here is the single
+    # source of truth — :mod:`src.rag.mcp.server` builds tools/list from ``build_tools`` too (auto-publishes).
+    if _unified_search.enabled():
+        tools.append(AgentTool(
+            _unified_search.TOOL_NAME,
+            _unified_search.TOOL_DESCRIPTION,
+            _unified_search.TOOL_PARAMETERS,
+            lambda query, project=None, ext=None, limit=10: _unified_search.search(
                 query, project=project, ext=ext, limit=limit),
         ))
     # SOT-2647 (事前計算事実層 5/5): the 4 precomputed stores (案件/ID/派生メトリクス/版差分) as first-class
