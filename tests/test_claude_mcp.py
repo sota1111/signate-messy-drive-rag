@@ -145,6 +145,34 @@ def test_plan_fanout_on_uses_five_nonterminal_calls_for_six_total(monkeypatch):
     assert "要求外の補足を混ぜない" in inv._PROMPT_PLAN_FANOUT
 
 
+def test_plan_fanout_budget_calibration_sweep(monkeypatch):
+    """SOT-2663 — the plan-fanout stage budget is calibratable via RAG_PLAN_FANOUT_MAX_TURNS.
+
+    The cycle5 C1 budget-calibration axis sweeps 5→8/10/12 to recover the finisher-excluded residual
+    churn (compute/retry, e.g. idx83/92). Pin the calibration semantics: each swept value takes effect
+    when RAG_PLAN_FANOUT is on, never loosens a tighter incoming caller cap, and stays fully gated OFF.
+    """
+    monkeypatch.setenv("RAG_PLAN_FANOUT", "1")
+    # default (unset) keeps the structural 5-turn ceiling.
+    monkeypatch.delenv("RAG_PLAN_FANOUT_MAX_TURNS", raising=False)
+    assert inv.plan_fanout_budget(18) == inv.PLAN_FANOUT_DEFAULT_MAX_TURNS == 5
+    # each swept calibration value takes effect (loosening the budget only up to the caller cap).
+    for cal in (8, 10, 12):
+        monkeypatch.setenv("RAG_PLAN_FANOUT_MAX_TURNS", str(cal))
+        assert inv.plan_fanout_budget(18) == cal
+        # a tighter incoming caller cap is never loosened by a larger calibration.
+        assert inv.plan_fanout_budget(6) == 6
+    # non-positive / garbage calibration values fall back to the structural default, not a looser budget.
+    for bad in ("0", "-3", "abc", ""):
+        monkeypatch.setenv("RAG_PLAN_FANOUT_MAX_TURNS", bad)
+        assert inv.plan_fanout_budget(18) == 5
+    # the whole axis is gated by RAG_PLAN_FANOUT: OFF ⇒ the caller budget is returned byte-identical
+    # regardless of the calibration env, so OFF serve is unchanged.
+    monkeypatch.setenv("RAG_PLAN_FANOUT", "0")
+    monkeypatch.setenv("RAG_PLAN_FANOUT_MAX_TURNS", "12")
+    assert inv.plan_fanout_budget(18) == 18
+
+
 def test_plan_fanout_telemetry_counts_search_and_supplements(monkeypatch):
     monkeypatch.delenv("RAG_FANOUT_FINISHER", raising=False)
     tel = claude_mcp._plan_fanout_telemetry(
