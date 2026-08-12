@@ -370,12 +370,22 @@ def _derived_coverage_tool() -> "tuple[str, str, dict[str, Any], Callable[..., A
         return None
 
 
+def _schedule_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | None":
+    """SOT-2680 スケジュール/ID/体制クロス参照 lookup tool (default OFF ⇒ None ⇒ surface byte-identical)."""
+    try:
+        from src.rag.agent import schedule_lane
+        return schedule_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return None
+
+
 def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     """The 4 fact-layer tools, or ``[]`` when the layer is OFF (⇒ tool set / MCP surface byte-identical)."""
     if not enabled():
         return []
     optional = [x for x in (_report_attr_tool(), _case_finance_tool(), _action_row_tool(),
-                            _visual_tool(), _heading_page_tool(), _derived_coverage_tool())
+                            _visual_tool(), _heading_page_tool(), _derived_coverage_tool(),
+                            _schedule_tool())
                 if x is not None]
     return optional + [
         (CASE_FILTER,
@@ -748,6 +758,15 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
             try:
                 from src.rag.agent import derived_coverage_lane
                 result = derived_coverage_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
+        # SOT-2680 — スケジュール/ID/体制クロス参照の決定論直答レーン（ID種別集計 idx92 / チェックポイント→
+        # タスク idx96 / マイルストーン×役職→タスク idx94 / 役職→タスク数 idx72）。上位レーンが束縛できない時
+        # のみ後置。RAG_SCHEDULE_STORE OFF ⇒ schedule_lane.resolve() は None ⇒ byte-identical。
+        if result is None:
+            try:
+                from src.rag.agent import schedule_lane
+                result = schedule_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path
