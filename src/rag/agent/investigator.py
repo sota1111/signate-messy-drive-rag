@@ -585,6 +585,91 @@ def plan_fanout_budget(default_budget: int) -> int:
     return budget
 
 
+# SOT-2664 — bounded plan-fanout finisher (default OFF). Cycle5 分析: RAG_PLAN_FANOUT の 5 ターン段予算で
+# 棄権した abstain 34 の大半は iteration 6〜12 で「次に呼ぶべきツールと対象ファイルを特定済みのまま、最後の
+# 1手前で予算切れ」した churn (idx16=format_events 直前 / idx49=3件目会議録の format_events 残し /
+# idx75=特定済み提案書への read_office 残し / idx83=係数シート compute 残し / idx77=highlight_extract 直前)。
+# finisher は予算切れ後に、既に対象文書が特定済みの《狙い撃ちの生証拠読み取り》だけを有界回数だけ追加許可する。
+# これは予算の一律緩和ではない: 下の狙い撃ちリーダー群で、かつ具体ファイル target を伴う呼び出しに限る。検索/
+# 探索/解決系ツールは予算切れのまま (budget_exhausted) なので、abstain→wrong を生む放浪探索を再開できない
+# (=明示的な wrong 化防止ゲート)。既定 OFF ⇒ SYSTEM_PROMPT もサーバ挙動も byte-identical。
+#
+# 対象ツール: 特定済みの《1 文書》から証拠を抽出するだけで確定する狙い撃ちリーダーに限る。
+# 除外する系統と理由:
+#   - 探索・横断・解決系 (find_files/file_grep/canonical_route/version_diff/corpus_aggregate/enum_scan/
+#     seating_lookup): 予算切れのまま = 放浪探索を再開させない。
+#   - compute: 派生計算・横断集計の churn ドライバ。各 compute(file=X) は「対象特定済み」に見えるが、「欠損値
+#     行数最多の案件」(idx24) のような《全案件を1件ずつ回す列挙》では file が回転するだけで実質は探索であり、
+#     有界継続を与えると abstain→wrong に逆流する (SOT-2664 focused: idx24 が 予算切れ棄権 → 白峰 で Incorrect
+#     化を実測)。数値確定は budget 内の 1 式でまとめる既存規律 (プロンプト③) に委ねる。
+FANOUT_FINISHER_TOOLS: frozenset[str] = frozenset({
+    "read_office", "decrypt", "read_chart_values", "caption_image",
+    "pdf_emphasis", "pptx_pivot", "highlight_extract", "font_emphasis", "format_events",
+})
+# The argument keys that name a concretely-resolved document target. A finisher-eligible call must carry a
+# non-empty one — i.e. the model already knows WHICH file to read, it is not still searching for it.
+FANOUT_FINISHER_TARGET_KEYS: frozenset[str] = frozenset({"file"})
+# Default extra targeted reads granted past the budget when the finisher fires. Env-tunable via
+# ``RAG_FANOUT_FINISHER_MAX``. Default 1 = literally "最後の1手前" (cut off ONE move early, cycle5 framing):
+# grant exactly the single located read that completes the answer. SOT-2664 focused evidence: the rescued
+# primaries idx16/49/75 each needed exactly ONE over-budget read (over_budget=1 → Perfect), whereas
+# granting more (max=3) let idx95 assemble a *wrong* version-diff commit from a 2nd read — an
+# abstain→wrong reflow (OFF control: Missing; ON with max=3: Incorrect). Capping at 1 keeps the finisher a
+# single completing move, not a multi-read continuation that drifts back into exploration.
+FANOUT_FINISHER_DEFAULT_MAX = 1
+
+
+def fanout_finisher_enabled() -> bool:
+    """Whether the bounded plan-fanout finisher is active (SOT-2664). Gated by ``RAG_FANOUT_FINISHER``
+    (default OFF ⇒ the budget gate is byte-identical to the RAG_PLAN_FANOUT-only behaviour)."""
+    return _bool_env("RAG_FANOUT_FINISHER", False)
+
+
+def fanout_finisher_max() -> int:
+    """The extra targeted-read budget the finisher grants past the exhausted plan-fanout budget."""
+    budget = FANOUT_FINISHER_DEFAULT_MAX
+    raw = os.getenv("RAG_FANOUT_FINISHER_MAX")
+    if raw is not None and raw.strip():
+        try:
+            v = int(raw.strip())
+            if v > 0:
+                budget = v
+        except ValueError:
+            pass
+    return budget
+
+
+def fanout_finisher_budget() -> int:
+    """Extra targeted-read budget for the finisher, or ``0`` when disabled (SOT-2664).
+
+    A single 0-vs-positive switch the MCP server reads once at build time, mirroring how it reads
+    ``RAG_MCP_MAX_TOOL_CALLS`` — 0 ⇒ finisher OFF ⇒ the budget gate is byte-identical.
+    """
+    return fanout_finisher_max() if fanout_finisher_enabled() else 0
+
+
+def _fanout_finisher_has_target(args: Mapping[str, Any]) -> bool:
+    """Whether ``args`` names a concretely-resolved document target (a non-empty target key)."""
+    if not isinstance(args, Mapping):
+        return False
+    for key in FANOUT_FINISHER_TARGET_KEYS:
+        val = args.get(key)
+        if isinstance(val, str) and val.strip():
+            return True
+    return False
+
+
+def fanout_finisher_eligible(name: str, args: Mapping[str, Any]) -> bool:
+    """Whether a budget-boundary tool call qualifies for the bounded finisher (SOT-2664).
+
+    Pure predicate (no env read): a finisher-eligible call is a targeted raw-evidence reader that already
+    carries a concretely-resolved document target. Every exploratory/search/resolve tool, and any reader
+    whose target is still unresolved, returns False — so the finisher can only *finish* an already-located
+    read, never re-open exploration. The server multiplies this by its own enabled/remaining-count check.
+    """
+    return name in FANOUT_FINISHER_TOOLS and _fanout_finisher_has_target(args)
+
+
 SYSTEM_PROMPT = (
     _PROMPT_HEAD
     + (_PROMPT_EXPLORE_NEUTRAL if NEUTRAL_PROMPT else _PROMPT_EXPLORE_LEGACY)

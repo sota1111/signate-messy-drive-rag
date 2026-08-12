@@ -50,6 +50,8 @@ from src.rag.agent.investigator import (
     Investigation,
     Usage,
     _answer_from_args,
+    fanout_finisher_budget,
+    fanout_finisher_enabled,
     is_abstain,
     plan_fanout_budget,
     plan_fanout_enabled,
@@ -197,6 +199,13 @@ def _mcp_config(tool_log: str, max_tool_calls: int,
     env = {"RAG_MCP_TOOL_LOG": tool_log}
     if max_tool_calls and max_tool_calls > 0:
         env["RAG_MCP_MAX_TOOL_CALLS"] = str(int(max_tool_calls))
+    # SOT-2664 — carry the bounded finisher config alongside the per-question budget so the launched
+    # server enables it deterministically (does not rely on ambient-env inheritance). OFF ⇒ keys omitted
+    # ⇒ byte-identical config.
+    _fin = fanout_finisher_budget()
+    if _fin > 0:
+        env["RAG_FANOUT_FINISHER"] = "1"
+        env["RAG_FANOUT_FINISHER_MAX"] = str(int(_fin))
     if question:
         env["RAG_MCP_QUESTION"] = question
     if contract:
@@ -439,6 +448,15 @@ def _plan_fanout_telemetry(tool_calls: Sequence[str], budget: int) -> dict[str, 
     # supplement = narrowing tool calls that are NOT the unified search (stage ③); when search never
     # fired, every non-submit call counts as a supplement probe (the flow degraded to individual tools).
     supplement = (len(non_submit) - search_calls) if search_calls else len(non_submit)
+    # SOT-2664 — non-terminal tool USES the model emitted beyond the plan-fanout budget. This counts both
+    # the reads the bounded finisher actually GRANTED (≤ finisher_max, targeted+resolved only) AND any
+    # over-budget calls the server REFUSED with budget_exhausted (they still appear as tool_use blocks in
+    # the stream), so it is an over-budget *attempt* count, not the granted count — the true granted count
+    # is server-side (≤ finisher_max). When the finisher is OFF the server refuses every over-budget call,
+    # but the model may still emit (and get refused on) such attempts, so read this together with
+    # ``finisher_enabled``.
+    finisher_max = fanout_finisher_budget()
+    over_budget_calls = max(0, len(non_submit) - int(budget)) if budget and budget > 0 else 0
     return {
         "enabled": True,
         "budget": int(budget),
@@ -448,6 +466,9 @@ def _plan_fanout_telemetry(tool_calls: Sequence[str], budget: int) -> dict[str, 
         "supplement_calls": int(max(0, supplement)),
         "extra_searches": int(max(0, search_calls - 1)),
         "tool_turns": int(len(non_submit)),
+        "finisher_enabled": bool(finisher_max > 0),
+        "finisher_max": int(finisher_max),
+        "over_budget_calls": int(over_budget_calls),
     }
 
 

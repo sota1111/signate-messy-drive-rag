@@ -37,7 +37,8 @@ import time
 from typing import Any, Mapping, Sequence
 
 from src.rag.agent.investigator import (
-    SUBMIT_ANSWER, AgentTool, build_tools, dispatch, is_raw_file_tool, scored_answer_text)
+    SUBMIT_ANSWER, AgentTool, build_tools, dispatch, fanout_finisher_budget,
+    fanout_finisher_eligible, is_raw_file_tool, scored_answer_text)
 from src.rag.tools.profile import CorpusProfile
 
 SERVER_NAME = "signate-investigator"
@@ -133,7 +134,7 @@ class InvestigatorMCPServer:
 
     def __init__(self, tools: Sequence[AgentTool], logger: ToolCallLogger | None = None,
                  max_tool_calls: int = 0, *, question: str = "", contract: str | None = None,
-                 commit_gate_log: str | None = None) -> None:
+                 commit_gate_log: str | None = None, finisher_max: int = 0) -> None:
         self.tools = list(tools)
         self.by_name = {t.name: t for t in self.tools}
         self.logger = logger or ToolCallLogger(None)
@@ -142,6 +143,11 @@ class InvestigatorMCPServer:
         # (default), so the SOT-2626 MCP behaviour is byte-identical unless a budget is explicitly set.
         self.max_tool_calls = max(0, int(max_tool_calls or 0))
         self._non_terminal_calls = 0
+        # SOT-2664 — bounded plan-fanout finisher: extra targeted raw-evidence reads granted past the
+        # budget so a "one concrete read away" question completes instead of churning to a
+        # BUDGET_EXHAUSTED abstain. 0 ⇒ disabled ⇒ the budget gate below is byte-identical.
+        self.finisher_max = max(0, int(finisher_max or 0))
+        self._finisher_used = 0
         # SOT-2640 — commit-gate session state. ``submit_answer`` is the gate's execution point for the
         # guard-less claude-mcp backend: the question/contract identify the commit, ``_tool_history`` is
         # the session's successful tool records the gate grounds numerics against, and ``_commit_gate_rejects``
@@ -177,11 +183,21 @@ class InvestigatorMCPServer:
         # Returned as a normal (non-error) tool result so the model reads and acts on it.
         if (self.max_tool_calls and name != SUBMIT_ANSWER
                 and self._non_terminal_calls >= self.max_tool_calls):
-            msg = (f"budget_exhausted: reached the {self.max_tool_calls}-call tool budget for this "
-                   f"question. Do not call more exploratory tools — call {SUBMIT_ANSWER} now with your "
-                   f"best grounded answer, or answer='わかりません' if no evidence was found.")
-            self.logger.record(name, args, 0.0, ok=False, error="budget_exhausted")
-            return {"content": [{"type": "text", "text": msg}], "isError": False}
+            # SOT-2664 — bounded plan-fanout finisher: if the model is one already-located targeted
+            # raw-evidence read away from an answer, grant up to ``finisher_max`` extra such reads instead
+            # of refusing (fall through to the normal dispatch, which counts + records the call). Only the
+            # targeted readers with a resolved file target qualify (``fanout_finisher_eligible``); every
+            # exploratory/search/resolve tool keeps hitting budget_exhausted, so the finisher cannot
+            # re-open the wandering exploration that turns abstains into wrong answers.
+            if (self.finisher_max and self._finisher_used < self.finisher_max
+                    and fanout_finisher_eligible(name, args)):
+                self._finisher_used += 1
+            else:
+                msg = (f"budget_exhausted: reached the {self.max_tool_calls}-call tool budget for this "
+                       f"question. Do not call more exploratory tools — call {SUBMIT_ANSWER} now with your "
+                       f"best grounded answer, or answer='わかりません' if no evidence was found.")
+                self.logger.record(name, args, 0.0, ok=False, error="budget_exhausted")
+                return {"content": [{"type": "text", "text": msg}], "isError": False}
         # SOT-2640 — commit gate at the submit_answer execution point. Returns a response dict when the gate
         # is active AND governs this submit (REJECT retry feedback, or a COMMIT/ABSTAIN marker for the
         # client to honor); returns None when the gate is OFF/observational so the normal dispatch below runs
@@ -312,7 +328,8 @@ def build_server(profile: CorpusProfile | None = None,
                  log_path: str | None = None,
                  max_tool_calls: int | None = None,
                  *, question: str | None = None, contract: str | None = None,
-                 commit_gate_log: str | None = None) -> InvestigatorMCPServer:
+                 commit_gate_log: str | None = None,
+                 finisher_max: int | None = None) -> InvestigatorMCPServer:
     """Build the server over ``build_tools`` and enforce the read-only invariant.
 
     Raises ``RuntimeError`` if any exposed tool name looks like a write/shell capability, so the
@@ -320,6 +337,10 @@ def build_server(profile: CorpusProfile | None = None,
 
     ``max_tool_calls`` (SOT-2627) caps the non-terminal tool calls per session; ``None`` reads the
     ``RAG_MCP_MAX_TOOL_CALLS`` env (0/unset ⇒ disabled = byte-identical SOT-2626 behaviour).
+
+    ``finisher_max`` (SOT-2664) is the extra targeted-read budget the bounded plan-fanout finisher grants
+    past the exhausted budget; ``None`` reads it from ``RAG_FANOUT_FINISHER`` / ``RAG_FANOUT_FINISHER_MAX``
+    (0/unset ⇒ finisher OFF = byte-identical budget gate).
 
     ``question`` / ``contract`` / ``commit_gate_log`` (SOT-2640) supply the commit-gate context; ``None``
     reads ``RAG_MCP_QUESTION`` / ``RAG_MCP_CONTRACT`` / ``RAG_MCP_COMMIT_GATE_LOG`` (unset ⇒ empty, and the
@@ -340,8 +361,10 @@ def build_server(profile: CorpusProfile | None = None,
     q = question if question is not None else (os.getenv("RAG_MCP_QUESTION") or "")
     c = contract if contract is not None else (os.getenv("RAG_MCP_CONTRACT") or None)
     cg_log = commit_gate_log if commit_gate_log is not None else (os.getenv("RAG_MCP_COMMIT_GATE_LOG") or None)
+    fin_max = finisher_max if finisher_max is not None else fanout_finisher_budget()
     return InvestigatorMCPServer(tools, ToolCallLogger(path), max_tool_calls=max_tool_calls,
-                                 question=q, contract=c, commit_gate_log=cg_log)
+                                 question=q, contract=c, commit_gate_log=cg_log,
+                                 finisher_max=fin_max)
 
 
 def serve_stdio(server: InvestigatorMCPServer, stdin: Any, stdout: Any) -> None:
