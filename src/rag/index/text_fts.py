@@ -342,6 +342,22 @@ def _idf_map(conn: sqlite3.Connection, path: Path) -> dict[str, float]:
     return out
 
 
+def idf_vocab(path: Path | None = None) -> dict[str, float]:
+    """Corpus token → IDF weight (the whole vocabulary), for deterministic query-vocabulary bridging.
+
+    Returns ``{}`` when disabled/absent/unreadable so callers (e.g. :mod:`src.rag.tools.query_distill`'s
+    corpus-vocabulary retry) fail-open to no substitution. A copy is returned so callers cannot mutate the
+    cached map.
+    """
+    if not enabled():
+        return {}
+    out = path or default_out_path()
+    conn = _connect(out)
+    if conn is None:
+        return {}
+    return dict(_idf_map(conn, out))
+
+
 def _match_expr(qtokens: Sequence[str]) -> str:
     """FTS5 MATCH expression: OR of the query tokens, each double-quoted (phrase-literal)."""
     return " OR ".join('"' + t.replace('"', '""') + '"' for t in qtokens)
