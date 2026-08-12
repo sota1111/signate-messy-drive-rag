@@ -78,6 +78,80 @@ def test_pipe_row_extraction_status_kind():
     assert by_id["ai05"]["owner"] == "伊藤 翔太" and by_id["ai05"]["due"] == "2025-05-20"
 
 
+# OCR 空白区切り・列折返しのアクション表（京橋/蒼樹会 型スキャンPDF, SOT-2667）。パイプ無し。
+_OCR_MINUTES_M02 = (
+    "[ページ1]\n会議ID: M02\n"
+    "6. アクションアイテム\n"
+    "ID Action Owner Due Date Status\n"
+    "A01 M01 議事 佐藤 健一 2025-10-03 Open\n録作成\n"
+    "A02 単一正本 佐藤 健一 2025-10-03 Open\n登録\n"
+    "A04 EDA 実行完 鈴木 美咲 / 井上 2025-10-14 Closed(完\n了)\n"
+    "A10 中間報告の 井上 里奈 / 佐藤 2025-10-31 Open\n反映方針\n"
+    "7. リスクと懸念事項\n本文（表領域外なので拾わない） A99 ダミー Open\n"
+)
+_OCR_MINUTES_M03 = (
+    "[ページ1]\n会議ID: M03\n"
+    "6. アクションアイテム\n"
+    "ID Action Owner Due Date Status\n"
+    "A01 M01 議事録 佐藤 健一 2025-10-03 Closed\n作成\n"
+    "A02 単一正本を 佐藤 健一 2025-10-03 Closed\n登録\n"
+    "A04 EDA 完了 鈴木 美咲 2025-10-14 Closed\n"
+    "A10 中間報告の 井上 里奈 / 佐藤 2025-10-31 Closed\n反映\n"
+    "A11 検収判定 高橋 恒一 2025-11-12 Open\n"
+)
+
+
+def test_ocr_action_rows_extraction():
+    rows = ars._ocr_action_rows(_OCR_MINUTES_M02, "min.pdf")
+    by_id = {r["id_key"]: r for r in rows}
+    # ID / 状態は行頭行から確定。表領域外の "A99" は拾わない。
+    assert set(by_id) == {"a01", "a02", "a04", "a10"}
+    assert by_id["a01"]["status_kind"] == "open"
+    assert by_id["a04"]["status_kind"] == "done"  # "Closed(完" → done
+    assert by_id["a10"]["status_kind"] == "open"
+    assert all(r.get("ocr") for r in rows) and by_id["a01"].get("region")
+
+
+def test_ocr_fallback_only_when_no_pipe(monkeypatch):
+    # パイプ表があれば OCR フォールバックは走らない（既存抽出を非破壊）。
+    class R:
+        rel = "プロジェクト/白峰信用リスク評価株式会社/05.会議/会議録/会議録_2025-05-27.pdf"
+        project = "白峰信用リスク評価株式会社"
+        category = "meeting"
+        name = "会議録_2025-05-27.pdf"
+        ext = "pdf"
+        path = "/x"
+    monkeypatch.setattr(ars, "_doc_text", lambda ref: _MINUTES_TEXT)
+    rec = ars.compute_doc(R())
+    assert rec is not None and len(rec["action_rows"]) == 3
+    assert all(not a.get("ocr") for a in rec["action_rows"])  # パイプ由来（ocr フラグ無し）
+
+
+def test_compute_doc_ocr_records_meeting_id(monkeypatch):
+    class R:
+        rel = "プロジェクト/京橋信用ソリューションズ株式会社/05.会議/会議録/会議録_2025-10-29.pdf"
+        project = "京橋信用ソリューションズ株式会社"
+        category = "meeting"
+        name = "会議録_2025-10-29.pdf"
+        ext = "pdf"
+        path = "/x"
+    monkeypatch.setattr(ars, "_doc_text", lambda ref: _OCR_MINUTES_M02)
+    rec = ars.compute_doc(R())
+    assert rec is not None and rec["meeting_id"] == "M02"
+    assert {a["id_key"] for a in rec["action_rows"]} == {"a01", "a02", "a04", "a10"}
+
+
+def test_ocr_action_content_excludes_wrapped_owner_tail():
+    text = (
+        "6. アクションアイテム\nID Action Owner Due Date Status\n"
+        "A10 前処理 岡田佑 2025-04- Open\n"
+        "パイプ 樹/鈴木 28\nライン\n美咲\n実装:\n0値を\n疑似欠損(NA)扱い\n"
+        "7. リスクと懸念事項\n"
+    )
+    row = ars._ocr_action_rows(text, "minutes.pdf")[0]
+    assert row["content"] == "前処理パイプライン実装:0値を疑似欠損(NA)扱い"
+
+
 def test_norm_id_and_owner_key():
     assert ars.norm_id("AI-05") == ars.norm_id("ai05") == "ai05"
     assert ars.norm_id("A10") == "a10"
@@ -195,6 +269,55 @@ def test_open_followup_not_completed_lane(store):
 def test_open_followup_defers_on_date_mismatch(store):
     # 会議録/報告が無い日付を指定 ⇒ 束縛できず defer。
     assert arl.resolve("白峰信用リスク評価の6月17日の報告資料で優先フォロー対象で会議録で完了でないID?") is None
+
+
+# --------------------------------------------------------------------------- (idx45) completed between meetings
+def _kyobashi_rows():
+    m2 = "プロジェクト/京橋信用ソリューションズ株式会社/05.会議/会議録/会議録_2025-10-29.pdf"
+    m3 = "プロジェクト/京橋信用ソリューションズ株式会社/05.会議/会議録/会議録_2025-11-11.pdf"
+    def ar(i, sk):
+        return {"id": i, "id_key": ars.norm_id(i), "content": "", "status_kind": sk,
+                "ocr": True, "source": {"doc_id": m2, "page": 0}}
+    return [
+        {"doc_id": m2, "project": "京橋信用ソリューションズ株式会社", "category": "meeting",
+         "date": "2025-10-29", "meeting_id": "M02", "doc_name": "会議録_2025-10-29.pdf",
+         "action_rows": [ar("A01", "open"), ar("A02", "open"), ar("A03", "open"),
+                         ar("A04", "done"), ar("A05", "done"), ar("A06", "open"),
+                         ar("A07", "open"), ar("A08", "open"), ar("A09", "open"), ar("A10", "open")]},
+        {"doc_id": m3, "project": "京橋信用ソリューションズ株式会社", "category": "meeting",
+         "date": "2025-11-11", "meeting_id": "M03", "doc_name": "会議録_2025-11-11.pdf",
+         "action_rows": [ar("A01", "done"), ar("A02", "done"), ar("A03", "done"),
+                         ar("A06", "open"), ar("A07", "done"), ar("A08", "done"),
+                         ar("A09", "done"), ar("A10", "done"), ar("A11", "open")]},
+    ]
+
+
+@pytest.fixture
+def kyobashi(monkeypatch):
+    monkeypatch.setattr(ars, "load", lambda path=None: _kyobashi_rows())
+    monkeypatch.setenv("RAG_ACTION_ROW_STORE", "1")
+    monkeypatch.setenv("RAG_FACT_LAYER", "1")
+    return None
+
+
+def test_completed_between_meetings_lane(kyobashi):
+    r = arl.resolve("京橋信用ソリューションズの会議録_2025-10-29.pdfと会議録_2025-11-11.pdfにおいて、"
+                    "会議ID M2 から M3 にかけて完了したアクションアイテムのIDをすべて挙げてください。")
+    assert r is not None and r["value"] == "A01、A02、A03、A07、A08、A09、A10"
+    assert r["method"]["selection"] == "completed_action_ids_between_meetings"
+
+
+def test_completed_between_meetings_via_meeting_id(kyobashi):
+    # 日付を書かず会議IDだけで名指しても M02/M03 を特定できる。
+    r = arl.resolve("京橋信用ソリューションズで会議ID M02 から M03 にかけて完了したアクションアイテムの"
+                    "IDをすべて挙げてください。")
+    assert r is not None and r["value"] == "A01、A02、A03、A07、A08、A09、A10"
+
+
+def test_completed_between_meetings_defers_single_meeting(kyobashi):
+    # 会議が1つしか名指されない ⇒ 突合できず defer（精度優先）。
+    r = arl.resolve("京橋信用ソリューションズの会議録_2025-10-29.pdf で完了したアクションアイテムのIDは?")
+    assert r is None
 
 
 # --------------------------------------------------------------------------- tool contract
