@@ -1,20 +1,31 @@
-# Final Report — SOT-2648
+# Final Report — SOT-2651
 
-Sonnet gold improvement cycle 1 is implemented and verified. The new default-OFF no-Gemini guard,
-serial/resumable Sonnet runners, 10-question sentinel set, and cycle ledger are in place.
+## Outcome
 
-The final focused gate passed: idx63 and idx87 changed from abstain to correct, idx38/57 remained safely
-abstained, and all 10 sentinels passed with zero regressions. The full `official:false` Sonnet dev
-gold100 then completed at 39 match / 28 abstain / 33 wrong (net 6) and `$0.0000` Gemini cost. Because
-that is below cycle-0 net 18, the axis is explicitly rejected for promotion and the official Flash
-champion remains unchanged.
+Sonnet gold100 cycle 4 completed on the integrated outputs of SOT-2652 through SOT-2656. The mandatory
+focused gate passed (20/24 targets MATCH, four safe abstentions, 10/10 sentinels, zero regressions), and
+the single resumed full dev run measured 57 match / 22 abstain / 21 wrong, net 36. This is an
+`official:false` local result; Gemini cost was mechanically recorded as `$0.0000`.
 
-Verification: 26 focused guard tests and the complete 1,619-test suite passed. The next cycle should
-re-anchor against repeated Sonnet samples, add question-independent coverage for idx38/57-class gaps,
-and address verbose otherwise-correct answers with a generic value-preserving format contract.
+## Quality Gates
 
-## Linear Report: POSTED
+- Flag manifests: PASS for both cycle-4 scripts; no unknown flags.
+- JSONL validation: PASS for experiment and score/history ledgers.
+- Full test suite: PASS — 1,836 tests, 17 warnings.
+- Diff review: PASS — changes are limited to cycle-4 runners, reports, and generated local evaluation ledgers/reviews.
+- E2E: N/A — no browser/UI surface exists in this Python RAG repository.
+
+## Acceptance
+
+- Gemini answer-time cost `$0`: PASS.
+- Focused improvement with zero sentinel regression: PASS.
+- Cycle ledger and next-cycle handoff: PASS.
+
+## Remaining Risk
+
+This is one resumed dev measurement rather than an official leaderboard result. Remaining abstentions are
+mostly budget exhaustion (16/22), and version-diff remains the weakest class (one match, four wrong among
+six questions); those are the recommended next-cycle axes.
 
 ## Acceptance: PASS
-
 ## Next Action: READY_FOR_REVIEW
