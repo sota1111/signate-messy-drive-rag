@@ -35,12 +35,46 @@ Design invariants (shared with the Stage0 router / Stage3 formatting)
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from src.rag.agent import det_pipeline as _det_pipeline
 
 # The contract type this pipeline owns (question_contract.VERSION_DIFF).
 CONTRACT_TYPE = "version_diff"
+
+_SUBJECT_ON = ("1", "true", "yes", "on")
+
+
+def _subject_prefix_enabled() -> bool:
+    """SOT-2665 (cycle5 C2) — commit a lone substantive *block insert* and prefix the answer with the
+    document subject (文書名) so a version-diff ADD reads as gold書式 wants it (idx0:「提案書スライド6…に、
+    …が追記された」— the champion LLM answer was value-perfect but dropped the「提案書」文書名プレフィクス).
+
+    Default OFF ⇒ the ADD path is never taken and the modify path is byte-identical: with the flag off
+    :func:`_select_single_substantive` still returns ``None`` for a lone add (unchanged champion serve).
+    """
+    return os.getenv("RAG_VDIFF_SUBJECT", "0").strip().lower() in _SUBJECT_ON
+
+
+def _doc_subject(pair) -> str:
+    """The logical document name for the answer prefix — the latest file's stem, version-token stripped.
+
+    ``提案書.pptx`` → ``提案書`` ; ``提案書_v3.pptx`` → ``提案書`` (the rev suffix is dropped via the same
+    parser :func:`find_pairs` uses). Read verbatim from the corpus filename — never invented, no gold
+    string. Returns ``""`` when the stem is unavailable (⇒ no prefix, degrade to the bare render).
+    """
+    from src.rag import diffpair
+
+    stem = (getattr(pair.new, "stem", "") or "").strip()
+    if not stem:
+        return ""
+    try:
+        parsed = diffpair._parse_version(stem)
+    except Exception:  # noqa: BLE001 — a parser miss must degrade to the raw stem, never raise
+        parsed = None
+    base = parsed[0] if parsed else stem
+    return (base or "").strip(" _-").strip()
 
 
 def _select_single_substantive(question: str):
@@ -66,9 +100,15 @@ def _select_single_substantive(question: str):
     change = substantive[0].change
     # An in-place value change is the purest deterministic edit; a lone block add/delete is more often a
     # reorganization whose substantive locus is ambiguous — leave those to the LLM loop.
-    if change.kind != "modify" or not (change.before and change.after):
-        return None
-    return change, pair
+    if change.kind == "modify" and change.before and change.after:
+        return change, pair
+    # SOT-2665 (C2, flag-gated): a lone substantive *block insert* IS locatable — diffpair already carries
+    # its slide/page locator + shared heading in ``change.label`` (idx0:「スライド6『4. 分析アプローチ…』」).
+    # Commit it (with a document-subject prefix in :func:`pipeline`) only when the flag is on; otherwise
+    # fall back exactly as before (champion serve unchanged).
+    if _subject_prefix_enabled() and change.kind == "add" and change.after and not change.before:
+        return change, pair
+    return None
 
 
 def _context_label(pair, change) -> str:
@@ -120,6 +160,33 @@ def pipeline(question: str, *, profile: Any = None) -> "dict[str, Any] | None":
     if selected is None:
         return None
     change, pair = selected
+
+    # SOT-2665 (C2): a committed block insert renders as「<文書名><locator/heading>に、<追加内容>が追記された」.
+    # ``change.label`` already holds diffpair's slide/page locator + shared heading; the only piece the gold
+    # 書式 adds is the document name (idx0), recovered deterministically from the latest filename stem.
+    if change.kind == "add":
+        subject = _doc_subject(pair)
+        loc = (change.label or "").strip()
+        head = f"{subject}{loc}" if loc else subject
+        rendered = f"{head}に、{change.after}が追記された" if head else f"{change.after}が追記された"
+        evidence = {
+            "file": pair.new.rel,
+            "old_file": pair.old.rel,
+            "version_basis": pair.basis,
+            "structural_location": loc,
+            "document_subject": subject,
+            "before": change.before,
+            "after": change.after,
+            "change_kind": change.kind,
+        }
+        method = {
+            "engine": "diffpair",
+            "contract": CONTRACT_TYPE,
+            "selection": "single_substantive_add",
+            "naturalize": False,
+            "confidence": 1.0,
+        }
+        return {"value": rendered, "evidence": evidence, "method": method}
 
     label = _context_label(pair, change)
     # Gold 書式 for a version-diff answer is a flowing prose sentence (「<行ラベル>が<旧>から<新>に変更」),
