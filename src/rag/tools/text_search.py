@@ -66,14 +66,43 @@ def text_search(query: str, *, project: str | None = None,
                              evidence={"returned": 0, "reason": "disabled"},
                              query=query, source="lexical_fts")
 
-    hits = text_fts.search(query, limit=n, project=project, ext=ext)
+    # Pre-search query distillation (SOT-2672, RAG_QUERY_DISTILL default OFF ⇒ eff_query/eff_project
+    # unchanged ⇒ byte-identical). Company→scope, condition-phrase removal, rare-token retention.
+    from src.rag.tools import query_distill as _qd
+
+    eff_query, eff_project = query, project
+    distill_diag: dict[str, Any] | None = None
+    if _qd.enabled():
+        d = _qd.distill(query, project=project)
+        eff_query = d.query or query
+        if project is None and d.scope_project:
+            eff_project = d.scope_project
+        distill_diag = d.as_diagnostic()
+
+    hits = text_fts.search(eff_query, limit=n, project=eff_project, ext=ext)
+
+    # Corpus-vocabulary retry (deterministic, once): on a zero-hit distilled query, rewrite its
+    # out-of-vocabulary tokens to body-present near-tokens via the IDF table and re-search.
+    retry_diag: dict[str, Any] | None = None
+    if not hits and _qd.enabled():
+        bridged, subs = _qd.corpus_vocab_retry(eff_query)
+        if subs:
+            retry_hits = text_fts.search(bridged, limit=n, project=eff_project, ext=ext)
+            retry_diag = {"query": bridged, "substitutions": subs, "returned": len(retry_hits)}
+            if retry_hits:
+                hits = retry_hits
+
     evidence: dict[str, Any] = {
         "returned": len(hits),
         "source": "lexical_fts",
-        "filters": {"project": project or None,
+        "filters": {"project": eff_project or None,
                     "ext": sorted({e.lower().lstrip(".") for e in (
                         [ext] if isinstance(ext, str) else list(ext or [])) if e}) or None},
     }
+    if distill_diag is not None:
+        evidence["distill"] = distill_diag
+    if retry_diag is not None:
+        evidence["vocab_retry"] = retry_diag
     if not hits:
         evidence["reason"] = "no_match"
     return contract.make(hits, engine="text_search", evidence=evidence,

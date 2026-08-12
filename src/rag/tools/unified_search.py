@@ -398,19 +398,36 @@ def search(query: str, *, project: str | None = None, ext: str | Iterable[str] |
     if hints:
         merged_hints.update(hints)
 
+    # Pre-search query distillation (SOT-2672, RAG_QUERY_DISTILL default OFF ⇒ eff_query == query and no
+    # scope/diagnostic added ⇒ byte-identical fan-out). The detected company is moved to the ``project``
+    # scope hint (so the registry/id_master/fts retrievers narrow to that 案件) and stripped from the query;
+    # condition/question phrases are removed. 蒸留前後のクエリは coverage に記録する(診断可能に).
+    from src.rag.tools import query_distill as _qd
+
+    eff_query = query
+    distill_diag: dict[str, Any] | None = None
+    if _qd.enabled():
+        d = _qd.distill(query, project=merged_hints.get("project"))
+        eff_query = d.query or query
+        if not merged_hints.get("project") and d.scope_project:
+            merged_hints["project"] = d.scope_project
+        distill_diag = d.as_diagnostic()
+
     rs = list(retrievers) if retrievers is not None else _default_retrievers()
     weights = {r.name: r.weight for r in rs}
     k = _rrf_k()
 
-    results, names_run = _run_retrievers(rs, query, merged_hints)
+    results, names_run = _run_retrievers(rs, eff_query, merged_hints)
     all_entries = _fuse(results, weights, k)
     winners = _cap_and_limit(all_entries, _per_file_cap(), n)
     _reexpand_context(winners, all_entries)
 
     value = [{"doc_id": e.doc_id, "locator": e.locator, "text": e.text, "context": e.context,
               "score": round(e.score, 6), "sources": sorted(e.sources)} for e in winners]
-    coverage = {"retrievers_run": names_run,
-                "hits_per_retriever": {name: len(hits) for name, hits in results.items()}}
+    coverage: dict[str, Any] = {"retrievers_run": names_run,
+                                "hits_per_retriever": {name: len(hits) for name, hits in results.items()}}
+    if distill_diag is not None:
+        coverage["distill"] = distill_diag
     evidence: dict[str, Any] = {"returned": len(value), "coverage": coverage,
                                 "filters": {"project": project or None,
                                             "ext": ext if isinstance(ext, str) else (
