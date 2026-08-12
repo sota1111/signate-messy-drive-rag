@@ -328,6 +328,22 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  case finance store skipped: {type(e).__name__}: {e}")
 
+    # Action-row store (SOT-2652): question-independent extraction of AI/task action rows, priority-task
+    # lists and priority-follow notes from scanned-PDF minutes/reports (idx20/34/70/93 action-row abstains).
+    # LLM-free (reads persisted OCR + text-layer); runtime consultation is opt-in (RAG_ACTION_ROW_STORE)
+    # so the champion serve path is byte-identical.
+    try:
+        from src.rag.index import action_row_store
+        ars2 = action_row_store.build(refs)
+        if verbose:
+            rep = ars2["report"]
+            print(f"  action row store: {ars2['docs']} docs "
+                  f"(rows={rep['action_rows']}, tasks={rep['priority_tasks']}, "
+                  f"follow={rep['priority_follow']}) -> {action_row_store.default_out_path()}")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  action row store skipped: {type(e).__name__}: {e}")
+
     if verbose:
         print(f"embedding {len(chunks)} chunks...")
     texts = [c.text for c in chunks]
