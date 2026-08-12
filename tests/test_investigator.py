@@ -327,25 +327,29 @@ def test_investigate_omits_pot_lane_when_lane_not_exercised():
     assert "pot_lane" not in res.to_dict()
 
 
-def test_investigate_interventions_empty_when_no_guard_flag_active():
-    """SOT-2629 — with every intervention flag OFF, the answered trace carries an EMPTY interventions dict
-    (always present so the schema is uniform), and no per-flag key. The served answer is unchanged."""
-    tools = [_tool_that_records([]), inv.SUBMIT_ANSWER_TOOL]
+def test_investigate_interventions_only_raw_file_access_when_no_guard_flag_active():
+    """SOT-2629 — with every GUARD flag OFF, the answered trace carries no per-guard key. SOT-2660 adds the
+    always-present ``raw_file_access`` KPI record (the ``compute`` call is a 生ファイル系 tool → used=True).
+    The served answer is unchanged."""
+    tools = [_tool_that_records([]), inv.SUBMIT_ANSWER_TOOL]  # AgentTool named "compute" (raw-file)
     model = ScriptedModel([
         Step(function_calls=(Call("compute", {}),), usage=Usage(10, 5)),
         _submit("20", confidence=0.9),
     ])
     res = investigate(model, "…", tools, max_turns=5)
-    assert res.interventions == {}
+    assert res.interventions == {
+        "raw_file_access": {"used": True, "tools": {"compute": 1}, "blocked": {}, "db_only": False}}
     d = res.to_dict()
-    assert d["interventions"] == {}
+    assert d["interventions"]["raw_file_access"]["used"] is True
+    assert "spin_pivot" not in d["interventions"]  # guard OFF ⇒ no guard key
     json.dumps(d, ensure_ascii=False)  # details.jsonl serialization must not raise
 
 
 def test_investigate_records_active_guard_flags_even_when_idle():
     """SOT-2629 (adversarial-review H6) — when the spin-pivot / search-cap guards are ARMED but never fire,
     the answered case's details still records ``spin_pivot: 0`` / ``search_cap_hits: 0``. This is exactly
-    the distinction cycle2 lacked: a flag ON-but-fired-0× (key present, 0) vs a flag OFF (key absent)."""
+    the distinction cycle2 lacked: a flag ON-but-fired-0× (key present, 0) vs a flag OFF (key absent).
+    SOT-2660: ``raw_file_access`` is always present alongside."""
     tools = [_tool_that_records([]), inv.SUBMIT_ANSWER_TOOL]
     model = ScriptedModel([
         Step(function_calls=(Call("compute", {}),), usage=Usage(10, 5)),
@@ -353,9 +357,64 @@ def test_investigate_records_active_guard_flags_even_when_idle():
     ])
     res = investigate(model, "…", tools, max_turns=5,
                       pivot_detection=True, search_cap={"cap": 5})
-    assert res.interventions == {"spin_pivot": 0, "search_cap_hits": 0}
+    assert res.interventions["spin_pivot"] == 0
+    assert res.interventions["search_cap_hits"] == 0
+    assert res.interventions["raw_file_access"]["used"] is True
     d = res.to_dict()
-    assert d["interventions"] == {"spin_pivot": 0, "search_cap_hits": 0}
+    assert d["interventions"]["spin_pivot"] == 0
+    assert d["interventions"]["search_cap_hits"] == 0
+
+
+# --------------------------------------------------------------------------- SOT-2660 DB_ONLY / raw-file
+def test_raw_file_classification_is_disjoint_from_db_stores():
+    """SOT-2660 — the 生ファイル系 block-list and the precomputed DB stores never overlap; DB tools are
+    allow-by-default under DB_ONLY."""
+    from src.rag.agent import fact_layer
+    assert inv.is_raw_file_tool("file_grep") and inv.is_raw_file_tool("read_office")
+    assert inv.is_raw_file_tool("compute") and inv.is_raw_file_tool("caption_image")
+    for db_tool in fact_layer.TOOL_NAMES:  # case_filter / id_lookup / metric_lookup / diff_lookup
+        assert not inv.is_raw_file_tool(db_tool)
+    assert not inv.is_raw_file_tool("verify_formula")  # pure PoT computation, no file read
+    assert not (inv.RAW_FILE_TOOLS & fact_layer.TOOL_NAMES)
+
+
+def test_dispatch_db_only_blocks_raw_file_tool(monkeypatch):
+    """SOT-2660 — with RAG_DB_ONLY ON, a 生ファイル系 tool is refused (not executed) with a reason the model
+    can act on; the refusal is returned, never raised."""
+    monkeypatch.setattr(inv, "DB_ONLY", True)
+    tools = {t.name: t for t in build_tools(CorpusProfile())}
+    out = dispatch(tools, "find_files", {"ext": "csv"})
+    assert out.get("db_only_blocked") is True
+    assert out["tool"] == "find_files"
+    assert "error" in out and "reason" in out
+
+
+def test_dispatch_db_only_allows_db_tool(monkeypatch):
+    """SOT-2660 — DB経路 tools still run under RAG_DB_ONLY (only raw-file tools are refused)."""
+    monkeypatch.setattr(inv, "DB_ONLY", True)
+    db_tool = AgentTool("case_filter", "d", {"type": "object", "properties": {}},
+                        lambda **kw: {"value": ["X社"], "evidence": {}, "method": {}})
+    out = dispatch({"case_filter": db_tool}, "case_filter", {})
+    assert out.get("db_only_blocked") is None
+    assert out["value"] == ["X社"]
+
+
+def test_investigate_db_only_records_zero_raw_used_and_blocked(monkeypatch):
+    """SOT-2660 — a DB_ONLY run: the model's raw-file call is blocked, so raw_file_access.used is False,
+    the refusal is tallied under ``blocked``, and ``db_only`` is True (the diagnostic's zero-raw-access
+    proof)."""
+    monkeypatch.setattr(inv, "DB_ONLY", True)
+    tools = [_tool_that_records([]), inv.SUBMIT_ANSWER_TOOL]  # "compute" is a raw-file tool
+    model = ScriptedModel([
+        Step(function_calls=(Call("compute", {}),), usage=Usage(10, 5)),
+        _submit("わかりません", confidence=0.0),
+    ])
+    res = investigate(model, "…", tools, max_turns=5)
+    rfa = res.interventions["raw_file_access"]
+    assert rfa["used"] is False
+    assert rfa["tools"] == {}
+    assert rfa["blocked"] == {"compute": 1}
+    assert rfa["db_only"] is True
 
 
 def test_pot_hard_lane_rejects_numeric_submit_until_verified(monkeypatch):

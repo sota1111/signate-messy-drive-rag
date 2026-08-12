@@ -234,6 +234,12 @@ class Report:
             # firings lived only in the abstain ledger (adversarial-review hole H6). Empty when no prediction
             # row carried intervention telemetry (fail-open on legacy details.jsonl).
             "interventions": _intervention_block(self.items),
+            # SOT-2660 — fallback依存率: among CORRECT answers, the share that needed a 生ファイル系 tool
+            # (raw_file_access.used). The KPI to drive toward 0 as the DB経路 (precomputed stores) widens —
+            # NOT forced to 0 (raw-file fallback is a measured safety net). Also reports the DB_ONLY diagnostic
+            # coverage (matches with zero raw access) and the not-yet-DB-ized idx list. Empty when no row
+            # carried raw_file_access telemetry (legacy details.jsonl → fail-open).
+            "fallback_dependency": _fallback_dependency_block(self.items),
         }
         if self.baseline_conversion is not None:
             out["conversion"] = self.baseline_conversion
@@ -277,6 +283,17 @@ class Report:
                     f"match={entry['match']['fired']}/{entry['match']['on']} "
                     f"abstain={entry['abstain']['fired']}/{entry['abstain']['on']} "
                     f"wrong={entry['wrong']['fired']}/{entry['wrong']['on']}")
+        fb = d.get("fallback_dependency") or {}
+        if fb.get("measured"):
+            tag = " [DB_ONLY diagnostic]" if fb.get("db_only") else ""
+            lines.append(
+                f"  fallback依存率{tag}: {fb['match_raw_dependent']}/{fb['match_total']} correct "
+                f"needed raw files ({fb['fallback_rate']:.1%}); "
+                f"DB-only coverage={fb['db_only_coverage']}"
+                + (f", blocked={fb['blocked_total']}" if fb.get("db_only") else ""))
+            if fb.get("raw_dependent_match_idx"):
+                lines.append(
+                    f"    DB化未達idx (correct-but-raw-dependent): {fb['raw_dependent_match_idx']}")
         if "conversion" in d:
             c = d["conversion"]
             lines += [
@@ -380,7 +397,9 @@ def _intervention_fired(val) -> bool:
     if isinstance(val, (int, float)):
         return val > 0
     if isinstance(val, dict):
-        for k in ("injected", "built", "enabled", "hit", "hits", "fired"):
+        # ``used`` first: raw_file_access (SOT-2660) fired iff the answer touched a raw file, regardless of
+        # the always-present db_only/tools/blocked companions (a DB_ONLY run has db_only=True everywhere).
+        for k in ("used", "injected", "built", "enabled", "hit", "hits", "fired"):
             if k in val:
                 return bool(val[k])
         return any(bool(v) for v in val.values())
@@ -422,6 +441,51 @@ def _intervention_block(items: list[Item]) -> dict:
                           "fire_rate": round(total_fired / total_on, 4) if total_on else 0.0}
         out[key] = entry
     return out
+
+
+def _fallback_dependency_block(items: list[Item]) -> dict:
+    """fallback依存率 (生ファイル依存) — SOT-2660.
+
+    From each row's ``interventions['raw_file_access']`` (``{used, tools, blocked, db_only}``), compute:
+
+    * ``fallback_rate`` — share of CORRECT (match) answers that needed a 生ファイル系 tool. The KPI to push
+      toward 0 by widening the DB経路; 0 is never forced (the fallback is a measured ~30-answer safety net).
+    * ``db_only_coverage`` — matches solved with zero raw access (the true DB-path coverage).
+    * ``raw_dependent_match_idx`` — the correct-answer indices that still needed raw files (the DB-ization
+      backlog / next store-expansion priorities).
+    * ``db_only`` — whether this run was a RAG_DB_ONLY diagnostic; ``blocked_total`` — refused raw calls.
+
+    Empty (``{"measured": False}``) when no row carried the telemetry (legacy details.jsonl → fail-open)."""
+    rows = [it for it in items if isinstance(it.interventions, dict)
+            and isinstance(it.interventions.get("raw_file_access"), dict)]
+    if not rows:
+        return {"measured": False}
+
+    def _rfa(it: Item) -> dict:
+        return it.interventions["raw_file_access"]
+
+    matches = [it for it in rows if it.is_match]
+    match_raw = [it for it in matches if _rfa(it).get("used")]
+    match_db_only = [it for it in matches if not _rfa(it).get("used")]
+    any_db_only = any(_rfa(it).get("db_only") for it in rows)
+    blocked_total = sum(sum((_rfa(it).get("blocked") or {}).values()) for it in rows)
+    # cross-run raw-file tool usage tally (どのツールが依存の主因か)
+    tool_tally: dict[str, int] = {}
+    for it in rows:
+        for name, cnt in (_rfa(it).get("tools") or {}).items():
+            tool_tally[name] = tool_tally.get(name, 0) + int(cnt)
+    return {
+        "measured": True,
+        "db_only": any_db_only,
+        "scored_rows": len(rows),
+        "match_total": len(matches),
+        "match_raw_dependent": len(match_raw),
+        "fallback_rate": round(len(match_raw) / len(matches), 4) if matches else 0.0,
+        "db_only_coverage": len(match_db_only),
+        "raw_dependent_match_idx": sorted(it.index for it in match_raw),
+        "raw_file_tool_calls": dict(sorted(tool_tally.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "blocked_total": blocked_total,
+    }
 
 
 def _abstain_state_block(items: list[Item], abstain_codes: dict[int, dict]) -> dict:

@@ -321,6 +321,40 @@ _DETERMINISTIC_ROUTES: tuple[str, ...] = (
     "seating_lookup", "read_chart_values", "file_grep",
 )
 
+# SOT-2660 — tool classification table (DB経路 vs 生ファイル系) for the fallback-dependency KPI and the
+# RAG_DB_ONLY diagnostic mode.
+#
+# ``RAW_FILE_TOOLS`` names every agent tool whose ``fn`` may open/read a RAW corpus document (office/pdf/
+# pptx/xlsx/csv content, a directory walk, or a live compute over such a file) at SERVE time. These are the
+# 生ファイルフォールバック — the safety net that (per the 2026-08-12 adversarial review) still produces ~30
+# correct answers, so it is NEVER force-disabled in production. Everything NOT in this set is a "DB経路"
+# tool: the precomputed fact-layer stores (case_filter/id_lookup/metric_lookup/diff_lookup — serve-time JSON
+# lookups built at 事前処理), the pure-computation PoT lane (verify_formula operates on model-supplied
+# candidates, no file read), and the terminal submit_answer. New DB stores are automatically "DB経路"
+# (allow-by-default under DB_ONLY); a genuinely new raw-file reader must be added here. Build-time raw reads
+# (index/store construction) do NOT count — only serve-time file access is a fallback dependency.
+RAW_FILE_TOOLS: frozenset[str] = frozenset({
+    "find_files", "file_grep", "read_office", "decrypt", "compute", "canonical_route",
+    "read_chart_values", "caption_image", "pdf_emphasis", "pptx_pivot", "highlight_extract",
+    "version_diff", "seating_lookup", "corpus_aggregate", "font_emphasis", "format_events",
+    "enum_scan",
+})
+
+
+def is_raw_file_tool(name: str) -> bool:
+    """Whether ``name`` is a 生ファイル系 tool that reads raw corpus files at serve time (SOT-2660)."""
+    return name in RAW_FILE_TOOLS
+
+
+# SOT-2660 — RAG_DB_ONLY: DIAGNOSTIC-ONLY mode (default OFF). When ON, :func:`dispatch` refuses every
+# ``RAW_FILE_TOOLS`` call with a reason so the model must answer from the DB経路 (search/index/fact-layer)
+# alone or abstain. It measures the TRUE DB-path coverage (how many questions the precomputed stores can
+# solve unaided) and surfaces the not-yet-DB-ized idx list. It must NEVER become the production default:
+# forcing DB-only in serve creates a 転記欠落=即棄権 cliff, and the raw-file fallback is a measured safety
+# net. Read at dispatch time (module-global) so BOTH the investigator loop and the MCP server honor it
+# uniformly. The champion serve path (flag OFF) is byte-identical — no raw-file call is ever intercepted.
+DB_ONLY = _bool_env("RAG_DB_ONLY", False)
+
 # SOT-2627 — investigator tool-loop backend. ``gemini`` (default) keeps the live Gemini function-calling
 # loop below byte-identical. ``claude-mcp`` delegates the WHOLE per-question loop (tool round-trips → final
 # answer) to a flat-rate Sonnet ``claude -p --mcp-config`` session driving the SOT-2626 stdio MCP server,
@@ -1205,6 +1239,18 @@ def dispatch(tools_by_name: Mapping[str, AgentTool], name: str, args: Mapping[st
     tool = tools_by_name.get(name)
     if tool is None:
         return {"error": f"unknown tool: {name}", "available": sorted(tools_by_name)}
+    # SOT-2660 — DB_ONLY diagnostic mode: refuse raw-file tools so the answer must rest on the DB経路
+    # (search/index/precomputed fact layer) alone. Returned (not raised) so the model sees the refusal and
+    # either switches to a DB tool or abstains. ``db_only_blocked`` lets the per-question telemetry count it.
+    if DB_ONLY and is_raw_file_tool(name):
+        return {
+            "error": f"RAG_DB_ONLY: 生ファイル系ツール『{name}』は診断モードで無効です。",
+            "db_only_blocked": True,
+            "tool": name,
+            "reason": ("診断モード(RAG_DB_ONLY)では生ファイルアクセスを禁止しています。"
+                       "DB経路(text/unified search・逆引き索引・事実層 case_filter/id_lookup/"
+                       "metric_lookup/diff_lookup)のみで回答するか、DB経路で解けなければ棄権してください。"),
+        }
     try:
         out = tool.fn(**dict(args or {}))
     except TypeError as e:
@@ -1720,6 +1766,22 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
     # output, only faster — every observe/iteration/ledger path around the call runs unchanged.
     evidence_cache: dict[str, Any] = {}
 
+    # SOT-2660 — per-question raw-file dependency telemetry. ``raw_file_used`` counts 生ファイル系 tool
+    # calls that actually READ a raw corpus file (successful, non-error dispatch); ``raw_file_blocked`` counts
+    # calls refused by RAG_DB_ONLY. Every real dispatch flows through ``cached_dispatch`` (first_move /
+    # fallback / main loop all call it), so this is the single per-question chokepoint. Recorded into
+    # ``interventions['raw_file_access']`` for EVERY question below (answered or abstained).
+    raw_file_used: dict[str, int] = {}
+    raw_file_blocked: dict[str, int] = {}
+
+    def _note_raw_file_access(name: str, out: Any) -> None:
+        if not is_raw_file_tool(name):
+            return
+        if isinstance(out, Mapping) and out.get("db_only_blocked"):
+            raw_file_blocked[name] = raw_file_blocked.get(name, 0) + 1
+        elif not (isinstance(out, Mapping) and "error" in out):
+            raw_file_used[name] = raw_file_used.get(name, 0) + 1
+
     def cached_dispatch(name: str, args: Mapping[str, Any] | None) -> Any:
         # SOT-2563 — propagate the *remaining* wall-clock budget to the tool call so a scan tool
         # (file_grep full scan) can derive a per-call deadline and cooperatively cancel instead of
@@ -1728,15 +1790,20 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
         remaining = timeout_s - (clock() - start)
         with call_budget.remaining_budget(remaining):
             if not EVIDENCE_CACHE:
-                return dispatch(by_name, name, args)
+                out = dispatch(by_name, name, args)
+                _note_raw_file_access(name, out)  # SOT-2660
+                return out
             try:
                 key = name + "\x00" + json.dumps(args or {}, sort_keys=True,
                                                  ensure_ascii=False, default=str)
             except (TypeError, ValueError):
-                return dispatch(by_name, name, args)  # unserialisable args → skip the cache
+                out = dispatch(by_name, name, args)  # unserialisable args → skip the cache
+                _note_raw_file_access(name, out)  # SOT-2660
+                return out
             if key in evidence_cache:
-                return evidence_cache[key]
+                return evidence_cache[key]  # cache hit: no new raw-file read
             out = dispatch(by_name, name, args)
+            _note_raw_file_access(name, out)  # SOT-2660 — count only real (non-cached) dispatches
             if not (isinstance(out, Mapping) and "error" in out):
                 evidence_cache[key] = out
             return out
@@ -2412,6 +2479,18 @@ def investigate(model: Model, question: str, tools: Sequence[AgentTool], *,
         # actually ran at the commit boundary (RAG_COMMIT_GATE ON and a submit reached it); an absent key
         # therefore means the gate was OFF or never reached ⇒ an OFF run's telemetry is byte-identical.
         loop_interventions["commit_gate"] = commit_gate_tel
+    # SOT-2660 — raw-file dependency (fallback依存) telemetry, recorded for EVERY question (answered OR
+    # abstained) so the gold_offline report / Sonnet cycle ledger can compute the fallback依存率 (share of
+    # correct answers that needed a 生ファイル系 tool). ``used`` = the answer touched a raw corpus file;
+    # ``tools`` = per-tool read counts; ``blocked`` = RAG_DB_ONLY refusals (non-empty only in DB_ONLY runs);
+    # ``db_only`` = whether the diagnostic mode was active. Always present (unlike the conditional guards
+    # above) since it is the KPI's raw signal, not a firing flag.
+    loop_interventions["raw_file_access"] = {
+        "used": bool(raw_file_used),
+        "tools": dict(raw_file_used),
+        "blocked": dict(raw_file_blocked),
+        "db_only": DB_ONLY,
+    }
     investigation = Investigation(
         question=question, answer=answer, iterations=iterations, tool_calls=tool_calls,
         usage=usage, model=model_name, elapsed_s=max(0.0, clock() - start),
