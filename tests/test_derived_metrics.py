@@ -125,6 +125,57 @@ def test_compute_case_binary_target_has_sweep(tmp_path: Path):
     assert sw is not None and sw["best_f1"] == pytest.approx(1.0)   # 線形分離 → F1=1
 
 
+# --------------------------------------------------------------------------- SOT-2679 網羅拡張
+def test_missing_row_count_all_columns_dual_verified(tmp_path: Path):
+    # 全列走査（object 列含む）。欠損を1つでも含む行 = 3行（2行目 sex 欠損 / 3行目 x 欠損 / 5行目 両方）。
+    csv = tmp_path / "train.csv"
+    csv.write_text(
+        "id,x,sex,target\n"
+        "0,1,M,0\n"          # 完全
+        "1,2,,0\n"           # sex 欠損
+        "2,,F,1\n"           # x 欠損
+        "3,4,M,1\n"          # 完全
+        "4,,,0\n",           # x,sex 両欠損
+        encoding="utf-8")
+    ref = _ref(csv, "案件MISS")
+    d = dm.compute_case(ref, [ref]).to_dict()
+    miss = d["missing"]
+    assert miss["row_count"] == 5
+    assert miss["missing_row_count"] == 3        # 1つでも欠損を含む行数
+    assert miss["complete_row_count"] == 2
+    assert d["verification"]["mismatches_dropped"] == 0   # pandas vs pure-python 一致
+
+
+def test_missing_row_count_zero_when_complete(tmp_path: Path):
+    csv = tmp_path / "train.csv"
+    csv.write_text("id,x,target\n0,1,0\n1,2,1\n", encoding="utf-8")
+    d = dm.compute_case(_ref(csv, "案件FULL"), []).to_dict()
+    assert d["missing"]["missing_row_count"] == 0 and d["missing"]["complete_row_count"] == 2
+
+
+def test_top_correlated_feature_excludes_id_and_target(tmp_path: Path):
+    # charges 型の連続目的変数（metrics.json 宣言）で target×特徴量相関の |r| 最大が確定する（idx4 型）。
+    import json as _json
+    (tmp_path / "metrics.json").write_text(_json.dumps({"target_column": "charges"}), encoding="utf-8")
+    metrics_ref = FileRef(path=tmp_path / "metrics.json", project="案件COR", category="analysis",
+                          rel="プロジェクト/案件COR/04.分析/analysis_outputs/metrics.json",
+                          name="metrics.json", ext="json")
+    csv = tmp_path / "train.csv"
+    rows = ["id,age,bmi,charges"]
+    for i in range(30):
+        # charges を bmi に強く、age に弱く相関させる（bmi が単独最大になるように）。
+        bmi = i
+        age = i % 5
+        charges = 10 * bmi + age
+        rows.append(f"{i},{age},{bmi},{charges}")
+    csv.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    ref = _ref(csv, "案件COR")
+    d = dm.compute_case(ref, [ref, metrics_ref]).to_dict()
+    top = d["correlations"]["top_feature"]
+    assert top is not None and top["feature"] == "bmi"     # id/charges は除外, bmi が |r| 最大
+    assert top["abs_r"] > 0.9
+
+
 def test_compute_case_no_numeric_columns_returns_none(tmp_path: Path):
     csv = tmp_path / "train.csv"
     csv.write_text("name,note\nfoo,bar\nbaz,qux\n", encoding="utf-8")
@@ -154,7 +205,7 @@ def test_write_is_deterministic_and_schema_headed(built_store: Path):
     from src.rag.index.derived_metrics import CaseMetrics
     recs = [CaseMetrics(**{k: rows[0][k] for k in (
         "case_id", "train_file", "row_count", "numeric_columns", "column_stats",
-        "correlations", "histograms", "ratios", "model", "verification", "sources")})]
+        "correlations", "histograms", "ratios", "model", "missing", "verification", "sources")})]
     dm.write_store(recs, built_store)
     assert built_store.read_bytes() == first
 
