@@ -51,6 +51,8 @@ from src.rag.agent.investigator import (
     Usage,
     _answer_from_args,
     is_abstain,
+    plan_fanout_budget,
+    plan_fanout_enabled,
 )
 
 CLAUDE_BIN = "claude"
@@ -361,6 +363,35 @@ def _load_commit_gate_log(path: str) -> list[dict[str, Any]]:
     return out
 
 
+def _plan_fanout_telemetry(tool_calls: Sequence[str], budget: int) -> dict[str, Any]:
+    """SOT-2661 — per-stage telemetry for the planner→fan-out→synthesis flow (SOT-2629 form).
+
+    Derives the stage accounting from the executed tool-call sequence:
+    * ①計画/②収集 — ``search_first`` / ``search_calls`` (the unified fan-out call(s));
+    * ③合成 — ``supplement_calls`` (the ≤2 additional narrowing probes after the first search).
+    ``tool_turns`` is the total investigator-tool turns (submit_answer excluded), i.e. the段数 the
+    3-stage flow is meant to hold at ≤ ``budget``.
+    """
+    from src.rag.tools import unified_search as _unified_search
+    search_name = _unified_search.TOOL_NAME
+    non_submit = [t for t in tool_calls if t != SUBMIT_ANSWER]
+    search_calls = sum(1 for t in non_submit if t == search_name)
+    first = non_submit[0] if non_submit else None
+    # supplement = narrowing tool calls that are NOT the unified search (stage ③); when search never
+    # fired, every non-submit call counts as a supplement probe (the flow degraded to individual tools).
+    supplement = (len(non_submit) - search_calls) if search_calls else len(non_submit)
+    return {
+        "enabled": True,
+        "budget": int(budget),
+        "first_tool": first,
+        "search_first": bool(first == search_name),
+        "search_calls": int(search_calls),
+        "supplement_calls": int(max(0, supplement)),
+        "extra_searches": int(max(0, search_calls - 1)),
+        "tool_turns": int(len(non_submit)),
+    }
+
+
 def investigate_question(question: str, *, tools: Sequence[AgentTool],
                          system: str | None = None, contract: str | None = None,
                          preamble: str | None = None,
@@ -396,6 +427,10 @@ def investigate_question(question: str, *, tools: Sequence[AgentTool],
     sys_prompt = (system or SYSTEM_PROMPT) + _harness_system_suffix()
     user_prompt = f"{preamble}\n\n---\n\n{question}" if preamble else question
     allowed = _allowed_tools(tools)
+    # SOT-2661 — redefine the per-question budget to the 3-stage shape when RAG_PLAN_FANOUT is on
+    # (≤5 non-terminal tool calls + the uncapped submit ⇒ ≤6 total). No-op (== max_turns) when the flag is off,
+    # so the server-side RAG_MCP_MAX_TOOL_CALLS cap stays byte-identical.
+    eff_max_turns = plan_fanout_budget(max_turns)
 
     started = time.monotonic()
     tmp = tempfile.NamedTemporaryFile("w", suffix=".mcp.json", delete=False, encoding="utf-8")
@@ -404,7 +439,7 @@ def investigate_question(question: str, *, tools: Sequence[AgentTool],
     gate_fd, gate_log_path = tempfile.mkstemp(suffix=".mcp_commit_gate.jsonl")
     os.close(gate_fd)
     try:
-        json.dump(_mcp_config(log_path, max_turns, question=question, contract=contract,
+        json.dump(_mcp_config(log_path, eff_max_turns, question=question, contract=contract,
                               commit_gate_log=gate_log_path),
                   tmp, ensure_ascii=False)
         tmp.flush()
@@ -520,6 +555,12 @@ def investigate_question(question: str, *, tools: Sequence[AgentTool],
             inv.interventions["commit_gate"] = gate_tel
         if strip_tel is not None:
             inv.interventions["format_strip_paren"] = strip_tel
+
+    # SOT-2661 — always record the 3-stage flow telemetry when RAG_PLAN_FANOUT is on (answered OR
+    # abstained: timeout/model_error paths still carry the tool sequence up to the failure). Off ⇒
+    # interventions untouched (byte-identical).
+    if plan_fanout_enabled():
+        inv.interventions["plan_fanout"] = _plan_fanout_telemetry(tool_calls, eff_max_turns)
 
     if resume is not None and inv.stop_reason != "usage_limit":
         _append_resume(resume, key, question, inv)

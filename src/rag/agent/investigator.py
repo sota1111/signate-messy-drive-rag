@@ -499,6 +499,67 @@ _PROMPT_UNIFIED_SEARCH = (
     "(case_filter/metric_lookup/format_events 等)は search の結果を絞り込む用途に限って使う。\n"
 )
 
+# SOT-2661 — planner→並列fan-out→synthesis の3段フロー規律 (Cerebras 型検索基盤 5/5, parent PLAN SOT-2602).
+# Appended ONLY when RAG_PLAN_FANOUT is on (default OFF ⇒ prompt byte-identical, mirroring the RAG_NEUTRAL_
+# PROMPT / RAG_UNIFIED_SEARCH gates). The claude-mcp (Sonnet) lane's「探索→観察→また探索」逐次ループが1問
+# 12〜18ターンを食い BUDGET_EXHAUSTED 25/30 の構造要因になっている。ReWOO(plan/observation 分離)に倣い、
+# ターンを「往復回数」から「段数」に変える: ①計画(1ターン: 型/locator 判断→search 1発) → ②並列収集
+# (unified_search が内部 fan-out) → ③合成(不足スロットのみ最大2回の追加探索→確定不能なら棄権)。旧spin対策
+# のような強制打ち切りはせず、段構成そのものが上限になる(cycle2 の precision 崩壊教訓: 打ち切りでなく構造)。
+_PROMPT_PLAN_FANOUT = (
+    "9. 調査は次の3段で行い、自由な反復探索はしない(ターンは往復回数でなく段数で使う):\n"
+    "   ①計画(1ターン): 質問から locator と型(ID逆引き/版差分/横断集計/字句所在 等)を1回で判断し、"
+    "search を1発呼ぶ。型が明確なら該当ストア(引数)も合わせて指定する。\n"
+    "   ②並列収集: search は全リトリーバを内部で並列 fan-out・RRF融合・文脈復元した証拠パケット"
+    "(results と coverage=どの方式が当てたか)を1ターンで返す。個別ツールを1個ずつ順に試すな。\n"
+    "   ③合成: 証拠パケットから回答を組む。埋まっていない証拠スロットがある場合に限り、その不足分に"
+    "絞って追加ツールを最大2回まで呼ぶ。1回の追加ツールには必要な列・集計・計算をまとめ、同じツールを"
+    "小刻みに反復しない。特に数値質問は列確認・中間値ごとの compute を避け、locator 確定後に分子・分母・"
+    "最終式を1つの compute 式でまとめて導出する。budget_exhausted が返ったら追加呼び出しを一切せず直ちに"
+    "submit_answer する。それでも確定できなければ answer=「" + ABSTAIN + "」で submit する"
+    "(性急な合成で誤答を出すより、証拠不足時は棄権が正: Incorrect=−1 < Missing=0)。\n"
+    "   submit_answer の evidence には、採用した search 結果の doc_id/locator と値を必ず明記する"
+    "(commit_gate の出典検証に使える形にする)。answer 本体は質問が要求する値・列挙だけにし、説明文・"
+    "段落番号・担当者など要求外の補足を混ぜない(根拠と手順は evidence/method に分離する)。\n"
+)
+
+
+def plan_fanout_enabled() -> bool:
+    """SOT-2661 — whether the claude-mcp lane runs the 3-stage planner→fan-out→synthesis flow.
+
+    Gated by ``RAG_PLAN_FANOUT`` (default OFF ⇒ SYSTEM_PROMPT and the per-question budget are
+    byte-identical to the legacy sequential-loop flow). The 3-stage discipline builds on the unified
+    ``search`` tool (SOT-2659) being the parallel-fan-out 実体.
+    """
+    return _bool_env("RAG_PLAN_FANOUT", False)
+
+
+# SOT-2661 — stage-shaped per-question non-terminal tool budget when RAG_PLAN_FANOUT is on: planner /
+# collect + supplement ≤2 use at most 5 tool calls, leaving the uncapped submit turn as turn 6.
+# Env-tunable via ``RAG_PLAN_FANOUT_MAX_TURNS``. This is a budget
+# *redefinition* (the 3-stage prompt is the real ceiling), NOT a mid-turn forced pivot — 打ち切りでなく構造で
+# 減らす。Never *loosens* an already-tighter incoming budget.
+PLAN_FANOUT_DEFAULT_MAX_TURNS = 5
+
+
+def plan_fanout_budget(default_budget: int) -> int:
+    """Return the stage-shaped max-turns budget when RAG_PLAN_FANOUT is on, else ``default_budget``."""
+    if not plan_fanout_enabled():
+        return default_budget
+    budget = PLAN_FANOUT_DEFAULT_MAX_TURNS
+    raw = os.getenv("RAG_PLAN_FANOUT_MAX_TURNS")
+    if raw is not None and raw.strip():
+        try:
+            v = int(raw.strip())
+            if v > 0:
+                budget = v
+        except ValueError:
+            pass
+    if default_budget and default_budget > 0:
+        return min(default_budget, budget)  # never loosen a tighter incoming cap
+    return budget
+
+
 SYSTEM_PROMPT = (
     _PROMPT_HEAD
     + (_PROMPT_EXPLORE_NEUTRAL if NEUTRAL_PROMPT else _PROMPT_EXPLORE_LEGACY)
@@ -506,6 +567,7 @@ SYSTEM_PROMPT = (
     + (_PROMPT_FACT_LAYER if _fact_layer.enabled() else "")
     + (_PROMPT_TEXT_SEARCH if _text_search.enabled() else "")
     + (_PROMPT_UNIFIED_SEARCH if _unified_search.enabled() else "")
+    + (_PROMPT_PLAN_FANOUT if plan_fanout_enabled() else "")
     + (_PROMPT_COMMIT_NEUTRAL if NEUTRAL_PROMPT else _PROMPT_COMMIT_LEGACY)
 )
 
