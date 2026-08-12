@@ -343,11 +343,21 @@ def _action_row_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] |
         return None
 
 
+def _visual_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | None":
+    """SOT-2653 xlsx visual-facts lookup tool (default OFF ⇒ None ⇒ surface byte-identical)."""
+    try:
+        from src.rag.agent import visual_lane
+        return visual_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return None
+
+
 def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     """The 4 fact-layer tools, or ``[]`` when the layer is OFF (⇒ tool set / MCP surface byte-identical)."""
     if not enabled():
         return []
-    optional = [x for x in (_report_attr_tool(), _case_finance_tool(), _action_row_tool())
+    optional = [x for x in (_report_attr_tool(), _case_finance_tool(), _action_row_tool(),
+                            _visual_tool())
                 if x is not None]
     return optional + [
         (CASE_FILTER,
@@ -694,6 +704,15 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
             try:
                 from src.rag.agent import action_row_lane
                 result = action_row_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
+        # SOT-2653 — xlsx 可視事実（chart系列→カラム / ハイライト全数 / 相関CF / 行・列ハイライト交差）の
+        # 決定論直答レーン（idx39/65/82/97 型）。上位レーンが束縛できない時のみ後置。RAG_VISUAL_STORE OFF ⇒
+        # visual_lane.resolve() は None ⇒ byte-identical。
+        if result is None:
+            try:
+                from src.rag.agent import visual_lane
+                result = visual_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path
