@@ -610,9 +610,13 @@ FANOUT_FINISHER_TOOLS: frozenset[str] = frozenset({
 # non-empty one — i.e. the model already knows WHICH file to read, it is not still searching for it.
 FANOUT_FINISHER_TARGET_KEYS: frozenset[str] = frozenset({"file"})
 # Default extra targeted reads granted past the budget when the finisher fires. Env-tunable via
-# ``RAG_FANOUT_FINISHER_MAX``. Kept small so the finisher stays a "one/two moves away" completion, not a
-# budget reset.
-FANOUT_FINISHER_DEFAULT_MAX = 3
+# ``RAG_FANOUT_FINISHER_MAX``. Default 1 = literally "最後の1手前" (cut off ONE move early, cycle5 framing):
+# grant exactly the single located read that completes the answer. SOT-2664 focused evidence: the rescued
+# primaries idx16/49/75 each needed exactly ONE over-budget read (over_budget=1 → Perfect), whereas
+# granting more (max=3) let idx95 assemble a *wrong* version-diff commit from a 2nd read — an
+# abstain→wrong reflow (OFF control: Missing; ON with max=3: Incorrect). Capping at 1 keeps the finisher a
+# single completing move, not a multi-read continuation that drifts back into exploration.
+FANOUT_FINISHER_DEFAULT_MAX = 1
 
 
 def fanout_finisher_enabled() -> bool:

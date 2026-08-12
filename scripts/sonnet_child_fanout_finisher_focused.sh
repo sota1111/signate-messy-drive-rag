@@ -68,8 +68,11 @@ export RAG_PLAN_FANOUT=1
 export RAG_BARE_ANSWER=1
 
 # --- axis under test (SOT-2664, cycle5 C1) ---
-export RAG_FANOUT_FINISHER=1
-export RAG_FANOUT_FINISHER_MAX="${RAG_FANOUT_FINISHER_MAX:-3}"
+# Honor a pre-set RAG_FANOUT_FINISHER so the same script serves as its own OFF control
+# (RAG_FANOUT_FINISHER=0 TARGET="…" bash …): OFF must reproduce the base abstain to prove any target
+# Incorrect is not finisher-attributable.
+export RAG_FANOUT_FINISHER="${RAG_FANOUT_FINISHER:-1}"
+export RAG_FANOUT_FINISHER_MAX="${RAG_FANOUT_FINISHER_MAX:-1}"
 
 # --- investigator on flat-rate Sonnet; parallelism 1 = shared-limit protection ---
 export RAG_INVESTIGATOR_BACKEND=claude-mcp
