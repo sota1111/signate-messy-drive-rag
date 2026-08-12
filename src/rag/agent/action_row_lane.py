@@ -159,7 +159,63 @@ def _norm_name(doc: dict[str, Any]) -> str:
     return _norm(doc.get("doc_name") or doc.get("doc_id"))
 
 
+# 質問中の全 YYYY-MM-DD（正規化前の生質問から拾う）。
+_YMD_ALL = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})")
+_COMPLETED_CUE = re.compile(r"完了")
+_ACTION_ITEM_CUE = re.compile(r"アクションアイテム|アクションアイテムのid|アクションのid|アクション")
+_ALL_CUE = re.compile(r"すべて|全て|全部|挙げて|列挙")
+
+
+def _id_num(action_id: str) -> "tuple[str, int]":
+    m = re.match(r"([A-Za-z]*)-?(\d+)", str(action_id or ""))
+    return (m.group(1).lower(), int(m.group(2))) if m else (str(action_id), 0)
+
+
+def _completed_between_meetings_lane(question: str, qn: str,
+                                     docs: list[dict[str, Any]]) -> "dict[str, Any] | None":
+    """2つの会議録の間で Open→完了 に転じたアクションIDを全て返す（idx45 型: M2→M3 完了集合）。
+
+    質問が名指す2つの会議録（日付 or 会議ID）の action_rows を突き合わせ、前会議で open・後会議で done の
+    ID 集合を昇順で列挙する。両会議が一意に取れないか集合が空なら None（曖昧回避）。"""
+    if not (_COMPLETED_CUE.search(qn) and _ACTION_ITEM_CUE.search(qn)):
+        return None
+    meetings = [d for d in docs if d.get("action_rows") and d.get("date")]
+    if len(meetings) < 2:
+        return None
+    # 1) 質問が名指す会議を日付で特定（生質問から YYYY-MM-DD を拾う）。
+    q_dates = {f"{y}-{int(mm):02d}-{int(dd):02d}" for (y, mm, dd) in _YMD_ALL.findall(question)}
+    picked = [d for d in meetings if d.get("date") in q_dates] if q_dates else []
+    # 2) 会議IDでの名指し（"M2 から M3"）も許容 — 日付で2件取れなければ会議IDで補完。先頭ゼロを
+    #    両辺で潰して "M02"="M2" を同一視する。
+    if len(picked) != 2:
+        def _mid_key(value: str) -> str:
+            return re.sub(r"0*(\d+)", r"\1", _norm(value))
+        mids = {_mid_key(x) for x in re.findall(r"[MmＭ]\s*0*\d{1,2}", question)}
+        if mids:
+            picked = [d for d in meetings if _mid_key(d.get("meeting_id") or "") in mids]
+    if len(picked) != 2:
+        return None
+    earlier, later = sorted(picked, key=lambda d: d.get("date"))
+    open_before = {a["id_key"]: a["id"] for a in earlier.get("action_rows", [])
+                   if a.get("status_kind") == "open"}
+    done_after = {a["id_key"] for a in later.get("action_rows", [])
+                  if a.get("status_kind") == "done"}
+    completed = [orig for k, orig in open_before.items() if k in done_after]
+    if not completed:
+        return None
+    completed.sort(key=_id_num)
+    value = "、".join(completed)
+    return _result(value, selection="completed_action_ids_between_meetings",
+                   evidence={"earlier": {"doc": earlier.get("doc_id"), "meeting_id": earlier.get("meeting_id"),
+                                         "date": earlier.get("date")},
+                             "later": {"doc": later.get("doc_id"), "meeting_id": later.get("meeting_id"),
+                                       "date": later.get("date")},
+                             "completed_ids": completed})
+
+
 _LANES = (_priority_task_owner_lane, _open_followup_not_completed_lane)
+# idx45 型は生質問（日付原文）が要るため resolve() から別引数で呼ぶ。
+_LANES2 = (_completed_between_meetings_lane,)
 
 
 def resolve(question: str) -> "dict[str, Any] | None":
@@ -176,6 +232,10 @@ def resolve(question: str) -> "dict[str, Any] | None":
             return None
         for lane in _LANES:
             res = lane(qn, docs)
+            if res is not None and _contract.is_contract(res) and res.get("value") is not None:
+                return _contract.ensure_contract(res)
+        for lane2 in _LANES2:  # 生質問（日付原文）を要するレーン（idx45 型）。
+            res = lane2(question, qn, docs)
             if res is not None and _contract.is_contract(res) and res.get("value") is not None:
                 return _contract.ensure_contract(res)
     except Exception:  # noqa: BLE001 — a broken lane must fall back, never break the answer path
@@ -199,9 +259,14 @@ def _action_row_lookup(project: str, action_id: str = "") -> dict[str, Any]:
         for r in rows:
             for a in r.get("action_rows") or []:
                 if a.get("id_key") == key:
-                    hits.append({"id": a.get("id"), "content": a.get("content"),
-                                 "owner": a.get("owner"), "due": a.get("due"),
-                                 "status": a.get("status"), "source": a.get("source")})
+                    hit = {"id": a.get("id"), "content": a.get("content"),
+                           "owner": a.get("owner"), "due": a.get("due"),
+                           "status": a.get("status"), "source": a.get("source")}
+                    # OCR 空白区切り表由来の行は content が列折返しで概算。原文リージョンを併せて返し、
+                    # 抜き出し系の問い（idx93: A10 の内容をそのまま）を原文から復元できるようにする。
+                    if a.get("region"):
+                        hit["region"] = a.get("region")
+                    hits.append(hit)
             for f in r.get("priority_follow") or []:
                 if f.get("id_key") == key:
                     hits.append({"id": f.get("id"), "priority_follow": True,

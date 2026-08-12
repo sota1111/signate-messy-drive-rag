@@ -71,6 +71,22 @@ _STATUS_OPEN = re.compile(r"open|未完了|未着手|進行中|フォロー", re
 _PRIORITY_FOLLOW_CUE = re.compile(r"優先フォロー")
 _OWNER_SPLIT = re.compile(r"[/／、,，・]")
 
+# --- OCR (space-separated, column-wrapped) action-item table (SOT-2667) --------------------------
+# 未収録案件（京橋信用ソリューションズ・蒼樹会 みなみ野 等）の会議録スキャンPDF は行動行を
+# ``ID | Action | Owner | Due | Status`` の *パイプ* ではなく、OCR が列を空白で吐いた表
+# （``A01 <内容片> <担当片> 2025-10-03 Open`` に内容が下行へ折り返す）で持つ。_PIPE_ROW では 0 行に
+# なり compute_doc が None → 案件ごと未収録になっていた（cycle5.md C4）。この段では ID / 状態 / 期日 を
+# 行頭行から質問非依存に確定し（内容は列折返しのため best-effort）、案件×全 ID 行を網羅収蔵する。
+_OCR_HEADER = re.compile(r"ID\s+Action\s+Owner\s+Due\s*Date\s+Status")
+_ACTION_ROW_ANCHOR = re.compile(r"^([A-Za-z]{1,3}-?\d{1,3})\b")
+_ACTION_TABLE_CUE = re.compile(r"アクションアイテム|アクション\s*アイテム|Action\s*Item")
+# 行頭行から状態語（Open/Closed/完了…）を末尾側から拾う。内容片に紛れた「完了」を誤検出しないよう
+# 末尾トークンから走査する。
+_STATUS_TOKEN = re.compile(r"(open|clos|close|done|resolved|完了|済|未完了|未着手|進行中|フォロー)",
+                           re.IGNORECASE)
+_MEETING_ID = re.compile(r"会議\s*ID\s*[:：]?\s*([A-Za-z]{1,3}-?\d{1,3})")
+_DATE_PART_MATCH = re.compile(r"^\d{4}-\d{2}-$")  # 折返しで日付が "2025-04-" と切れる OCR に対応
+
 
 def enabled() -> bool:
     """True when the serve path may consult the action-row store (default OFF — opt-in)."""
@@ -261,6 +277,102 @@ def _priority_follow(text: str, doc_rel: str) -> list[dict[str, Any]]:
     return out
 
 
+def _ocr_status_kind(line: str) -> str:
+    """行頭行の状態: 末尾トークンから最初に見つかった状態語で判定（内容片の誤検出を避ける）。"""
+    for tok in reversed(line.split()):
+        if _STATUS_TOKEN.search(tok):
+            return _status_kind(tok)
+    return "unknown"
+
+
+def _ocr_action_rows(text: str, doc_rel: str) -> list[dict[str, Any]]:
+    """OCR が空白区切り・列折返しで吐いた会議録アクション表を全行抽出（ID/状態/期日 確定, 内容 best-effort）。
+
+    行頭行（``A01 <内容片> <担当片> 2025-10-03 Open``）から ID・状態・期日を確定し、次の行頭行までの
+    折返し行を内容の raw リージョンとして保持する。パイプ表と異なり列が空白でにじむため内容は概算のみ
+    （決定論レーンは内容を回答に使わない — precision-first）。表領域は OCR ヘッダ／「アクションアイテム」
+    見出しから次の番号節見出しまで。"""
+    z = _z(text)
+    lines = z.splitlines()
+    n = len(lines)
+    in_table = False
+    starts: list[int] = []  # indices of row-start lines
+    table_ends: list[int] = []
+    stripped = [ln.strip() for ln in lines]
+    for i, raw in enumerate(stripped):
+        if _OCR_HEADER.search(raw) or _ACTION_TABLE_CUE.search(raw):
+            in_table = True
+            continue
+        if not in_table:
+            continue
+        # 番号節見出し（"7. リスクと懸念事項"）で表領域終了。ID 行や注記/ページマーカは終了扱いしない。
+        if _SECTION_HEAD.match(raw) and not _ACTION_ROW_ANCHOR.match(raw):
+            table_ends.append(i)
+            in_table = False
+            continue
+        m = _ACTION_ROW_ANCHOR.match(raw)
+        if m and _STATUS_TOKEN.search(raw):
+            starts.append(i)
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for k, si in enumerate(starts):
+        raw = stripped[si]
+        m = _ACTION_ROW_ANCHOR.match(raw)
+        aid = m.group(1)
+        key = norm_id(aid)
+        if key in seen:  # 同一IDが後ページで再掲される場合は初出（最初の会議録行）のみ
+            continue
+        seen.add(key)
+        end = starts[k + 1] if k + 1 < len(starts) else n
+        end = min([end, *(x for x in table_ends if x > si)])
+        region_lines = [stripped[j] for j in range(si, end)
+                        if stripped[j] and not _PAGE_MARK.search(stripped[j])
+                        and not _OCR_HEADER.search(stripped[j])]
+        due = None
+        dm = _DATE_IN_NAME.search(raw)
+        if dm:
+            due = f"{dm.group(1)}-{dm.group(2)}-{dm.group(3)}"
+        # 内容 best-effort: 行頭行は ID の次トークンのみ、折返し行は各行の左端トークンを連結。
+        content_parts: list[str] = []
+        head_tokens = raw.split()
+        if len(head_tokens) >= 2:
+            content_parts.append(head_tokens[1])
+        continuation = region_lines[1:]
+        # OCR は列を縦に折り返すため、担当欄 ``岡田佑樹/鈴木美咲`` が
+        # ``岡田佑`` / ``樹/鈴木`` / ``美咲`` と Action 欄の折返しに混在することがある。
+        # 2行目の担当片に ``/`` があり、その直後が Action 1行 + 単独の担当末尾、という形だけを
+        # 構造的に除外する（固有名や質問/gold 値には依存しない）。
+        owner_tail_index = None
+        if continuation:
+            second_tokens = continuation[0].split()
+            if len(second_tokens) >= 2 and "/" in second_tokens[1] and len(continuation) >= 3:
+                if len(continuation[1].split()) == 1 and len(continuation[2].split()) == 1:
+                    owner_tail_index = 2
+        for ci, ln in enumerate(continuation):
+            if ci == owner_tail_index:
+                continue
+            toks = ln.split()
+            if not toks:
+                continue
+            first = toks[0]
+            if _DATE_IN_NAME.match(first) or _DATE_PART_MATCH.match(first) or first.isdigit():
+                continue
+            content_parts.append(first)
+        content = "".join(content_parts)
+        rows.append({
+            "id": aid, "id_key": key, "content": content, "owner": "", "due": due,
+            "status": raw, "status_kind": _ocr_status_kind(raw), "ocr": True,
+            "region": "\n".join(region_lines),
+            "source": {"doc_id": doc_rel, "page": 0},
+        })
+    return rows
+
+
+def _meeting_id(text: str) -> str | None:
+    m = _MEETING_ID.search(_z(text))
+    return m.group(1) if m else None
+
+
 def compute_doc(ref: FileRef) -> dict[str, Any] | None:
     """1文書から action-row レコードを組む（何も抽出できなければ None — 欠測を偽装しない）。"""
     text = _doc_text(ref)
@@ -268,6 +380,8 @@ def compute_doc(ref: FileRef) -> dict[str, Any] | None:
         return None
     doc_rel = nfc(ref.rel)
     rows = _pipe_rows(text, doc_rel)
+    if not rows:  # SOT-2667: パイプ表が無い会議録は OCR 空白区切り表から行動行を回収（追加的・非破壊）。
+        rows = _ocr_action_rows(text, doc_rel)
     tasks = _priority_tasks(text, doc_rel)
     follow = _priority_follow(text, doc_rel)
     if not (rows or tasks or follow):
@@ -277,6 +391,9 @@ def compute_doc(ref: FileRef) -> dict[str, Any] | None:
         "category": ref.category, "date": _doc_date(ref),
         "doc_name": nfc(ref.name),
     }
+    meeting_id = _meeting_id(text)
+    if meeting_id:
+        rec["meeting_id"] = meeting_id
     if rows:
         rec["action_rows"] = rows
     if tasks:
