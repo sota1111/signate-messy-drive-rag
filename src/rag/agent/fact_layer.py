@@ -361,12 +361,21 @@ def _heading_page_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]]
         return None
 
 
+def _derived_coverage_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | None":
+    """SOT-2679 派生メトリクス網羅（相関最大特徴量 / 案件横断欠損行数）lookup tool (default OFF ⇒ None)."""
+    try:
+        from src.rag.agent import derived_coverage_lane
+        return derived_coverage_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return None
+
+
 def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     """The 4 fact-layer tools, or ``[]`` when the layer is OFF (⇒ tool set / MCP surface byte-identical)."""
     if not enabled():
         return []
     optional = [x for x in (_report_attr_tool(), _case_finance_tool(), _action_row_tool(),
-                            _visual_tool(), _heading_page_tool())
+                            _visual_tool(), _heading_page_tool(), _derived_coverage_tool())
                 if x is not None]
     return optional + [
         (CASE_FILTER,
@@ -730,6 +739,15 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
             try:
                 from src.rag.agent import heading_page_lane
                 result = heading_page_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
+        # SOT-2679 — 派生メトリクス網羅拡張（相関最大特徴量 idx4 / 案件横断欠損行数 argmax idx24）の決定論
+        # 直答レーン。上位レーンが束縛できない時のみ後置。RAG_DERIVED_COVERAGE OFF ⇒ resolve() は None ⇒
+        # byte-identical。idx24 は full-coverage かつ厳密単独最大の時だけ確定（SOT-2663 逆流ガード）。
+        if result is None:
+            try:
+                from src.rag.agent import derived_coverage_lane
+                result = derived_coverage_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path

@@ -229,7 +229,27 @@ def _correlations(np, numeric: dict[str, list[float]], target: str | None,
         with np.errstate(invalid="ignore", divide="ignore"):  # 定数列 → stddev0 → nan（検算側も nan）
             primary = float(np.corrcoef(np.asarray(xs), np.asarray(ys))[0, 1])
         with_target[col] = vf.commit(f"corr({target},{col})", primary, _pure_pearson(xs, ys))
-    return {"target": target, "with_target": with_target}
+    # idx4 型「目的変数と相関が最も高い数値特徴量」= |r| 最大の特徴量（id 的な列は特徴量から除外する標準規則）。
+    # 質問非依存の網羅計算。厳密な単独最大かどうかは serve レーン側で（with_target を再走査して）判定する。
+    top_feature = _top_correlated_feature(with_target, target)
+    return {"target": target, "with_target": with_target, "top_feature": top_feature}
+
+
+def _top_correlated_feature(with_target: dict[str, Any], target: str | None) -> dict[str, Any] | None:
+    """|corr| 最大の数値特徴量（id 的な列・目的変数を除外）。該当なしなら None（質問非依存の定型量）。"""
+    best: tuple[float, str, float] | None = None
+    for col, r in with_target.items():
+        if r is None or (isinstance(r, float) and math.isnan(r)):
+            continue
+        cl = str(col).strip().lower()
+        if cl in _ID_LIKE or col == target:
+            continue
+        ar = abs(float(r))
+        if best is None or ar > best[0]:
+            best = (ar, col, float(r))
+    if best is None:
+        return None
+    return {"feature": best[1], "r": _round(best[2]), "abs_r": _round(best[0])}
 
 
 # --------------------------------------------------------------------------- histograms
@@ -277,6 +297,37 @@ def _safe_div(a: float, b: float) -> float:
 
 def _pysub(a: float, b: float) -> float:
     return a - b
+
+
+# --------------------------------------------------------------------------- missing-row shape (dual-verified)
+def _missing_stats(df, vf: _Verifier) -> dict[str, Any]:
+    """canonical train 表の「1つでも欠損値を含む行数」を独立検算付きで計算する（質問非依存の定型量, idx24 型）。
+
+    「欠損値を1つでも含む行」は列型に依らないので **全列**（数値列だけでなく object 列も）を対象にする。
+    primary = pandas ``df.isna().any(axis=1).sum()``、check = pure-python 行走査（``pd.isna`` 判定を per-cell）。
+    2実装の欠損行数が一致した値のみ保存する（fail-closed）。二重 train.csv は :func:`_train_ref` が canonical
+    （03.データ／analysis_project 除外）を一意選択済みなので、本ストアの欠損行数は案件横断で決定論比較できる。
+    """
+    import pandas as pd
+    n = int(len(df))
+    if n == 0:
+        return {"row_count": 0, "missing_row_count": 0, "complete_row_count": 0,
+                "missing_cell_total": 0, "column_count": int(len(df.columns))}
+    isna = df.isna()
+    primary_missing_rows = int(isna.any(axis=1).sum())
+    primary_missing_cells = int(isna.to_numpy().sum())
+    # 独立検算: pandas の any(axis=1) に依存しない pure-python 行走査。
+    check_missing_rows = 0
+    for row in df.itertuples(index=False, name=None):
+        if any(pd.isna(v) for v in row):
+            check_missing_rows += 1
+    mrc = vf.commit("missing_row_count", float(primary_missing_rows), float(check_missing_rows))
+    if mrc is None:  # 2実装不一致 ⇒ 欠測を偽装せず None（案件横断 argmax は full-coverage を要求して defer する）
+        return {"row_count": n, "missing_row_count": None, "complete_row_count": None,
+                "missing_cell_total": primary_missing_cells, "column_count": int(len(df.columns))}
+    mrc_i = int(round(mrc))
+    return {"row_count": n, "missing_row_count": mrc_i, "complete_row_count": n - mrc_i,
+            "missing_cell_total": primary_missing_cells, "column_count": int(len(df.columns))}
 
 
 # --------------------------------------------------------------------------- model: OLS coefficients + sweep
@@ -484,6 +535,7 @@ class CaseMetrics:
     histograms: dict[str, Any]
     ratios: dict[str, Any]
     model: dict[str, Any]
+    missing: dict[str, Any]
     verification: dict[str, Any]
     sources: dict[str, Any]
 
@@ -492,7 +544,8 @@ class CaseMetrics:
             "case_id": self.case_id, "train_file": self.train_file, "row_count": self.row_count,
             "numeric_columns": self.numeric_columns, "column_stats": self.column_stats,
             "correlations": self.correlations, "histograms": self.histograms, "ratios": self.ratios,
-            "model": self.model, "verification": self.verification, "sources": self.sources,
+            "model": self.model, "missing": self.missing, "verification": self.verification,
+            "sources": self.sources,
         }
 
 
@@ -549,6 +602,8 @@ def compute_case(ref: FileRef, refs: Sequence[FileRef]) -> CaseMetrics | None:
             id_values = numeric[c]
             break
     model = _model_metrics(np, numeric, numeric_cols, id_values, ref.project, refs, frame_cols)
+    # 案件横断の欠損行数（全列走査・canonical train 表・独立検算）。idx24 の argmax lookup になる定型量。
+    missing = _missing_stats(df, vf)
 
     verification = {
         "metrics_computed": vf.computed,
@@ -559,13 +614,15 @@ def compute_case(ref: FileRef, refs: Sequence[FileRef]) -> CaseMetrics | None:
     sources = {
         "train_file": nfc(ref.rel),
         "coef_source": model.get("coef_source") if model.get("present") else None,
-        "formula_ids": ["column_stats", "percentiles", "pearson_correlation", "histogram",
-                        "ratio_diff", "ols_prediction", "f1_threshold_sweep"],
+        "formula_ids": ["column_stats", "percentiles", "pearson_correlation", "top_correlated_feature",
+                        "histogram", "ratio_diff", "ols_prediction", "f1_threshold_sweep",
+                        "missing_row_count"],
     }
     return CaseMetrics(
         case_id=nfc(ref.project), train_file=nfc(ref.rel), row_count=int(len(df)),
         numeric_columns=numeric_cols, column_stats=stats, correlations=correlations,
-        histograms=histograms, ratios=ratios, model=model, verification=verification, sources=sources,
+        histograms=histograms, ratios=ratios, model=model, missing=missing,
+        verification=verification, sources=sources,
     )
 
 
@@ -657,6 +714,10 @@ def build_report(records: Sequence[CaseMetrics], universe: Sequence[str], skippe
             "cases_with_ratios": sum(1 for r in records if r.ratios),
             "cases_with_model": with_model,
             "cases_with_threshold_sweep": with_sweep,
+            "cases_with_top_feature": sum(1 for r in records
+                                          if (r.correlations.get("top_feature"))),
+            "cases_with_missing_row_count": sum(1 for r in records
+                                                if (r.missing or {}).get("missing_row_count") is not None),
         },
         "verification_summary": {
             "metrics_computed": total_computed,
@@ -673,6 +734,21 @@ def build_report(records: Sequence[CaseMetrics], universe: Sequence[str], skippe
 # 本ストアの標準メトリクスがその設問を解ける形で充足するかを honest に報告する。一部は本ストアの領域外
 # （idx97=ハイライト交差=structure_store、idx40=案件横断の精算スケジュール集計）である事実も明示する。
 _DERIVED_HARD_CORE: dict[str, dict[str, Any]] = {
+    "idx4": {
+        "gist": "ひがし丘 train の 目的変数と相関が最も高い数値特徴量",
+        "doc_hint": "ひがし丘", "kind": "top_correlated_feature",
+        "note": ("correlations.top_feature がこの型の lookup（|corr| 最大の数値特徴量, id 的な列は除外）。"
+                 "目的変数は analysis metrics.json の target_column（無ければ二値数値列）を案件非依存に解決する。"),
+        "solvable_here": True, "needs": ["correlations.top_feature"],
+    },
+    "idx24": {
+        "gist": "分析データで 1つでも欠損値がある行数が最も多い案件（主略称）",
+        "doc_hint": "", "kind": "cross_case_missing_row_argmax",
+        "note": ("missing.missing_row_count を全案件で事前計算（canonical train 表・全列走査・独立検算）した"
+                 "うえでの argmax。案件横断のため単一レコードの needs 判定にはのらない（案件横断集計は serve"
+                 "レーンが全レコードの missing_row_count を読んで厳密単独最大のみ確定する）。"),
+        "solvable_here": False,
+    },
     "idx40": {
         "gist": "2026年7月1日時点で存在する案件の支払月ごと精算総額 上位3ヶ月と総額",
         "doc_hint": "", "kind": "cross_case_aggregate",
