@@ -1,50 +1,54 @@
-# Worker Report (solo) — SOT-2661
+# Worker Report (solo) — SOT-2651
 
 ## Summary
 
-Implemented the default-OFF `RAG_PLAN_FANOUT` Sonnet/claude-mcp flow: one planning/fan-out search,
-evidence-packet synthesis, at most two focused supplements, then grounded submit or abstention. The MCP
-budget is five non-terminal tool calls plus the uncapped submit (six total), and per-stage counts are
-recorded under `interventions.plan_fanout`.
+Completed Sonnet local gold100 improvement cycle 4 after all five child issues merged. The integrated
+focused gate passed with 20/24 target questions matching, four safe abstentions, and all 10 established
+Sonnet sentinels preserved. The one required resumed full dev gold100 then completed at 57 match,
+22 abstain, 21 wrong (net 36), versus the last measured cycle-2 result of 44/30/26 (net 18).
 
-The final required `--dev` Sonnet focused gate passed with all 10 existing-MATCH sentinels preserved,
-zero target wrong-answer increase, and 4.4 mean non-submit tool calls across the ten live LLM cases.
+The evaluation was strictly `official:false`, used `RAG_INVESTIGATOR_BACKEND=claude-mcp` with Sonnet
+and one worker, and recorded `$0.0000` Gemini cost. The official Flash champion and submission assets
+were not changed.
 
 ## Changed Files
 
-- `src/rag/agent/investigator.py` — default-OFF three-stage prompt, compact compute/output discipline,
-  and stage-shaped budget helper.
-- `src/rag/llm_providers/claude_mcp.py` — budget wiring and plan/fan-out/supplement telemetry.
-- `tests/test_claude_mcp.py` — OFF invariance, budget, prompt contract, cap wiring, and telemetry tests.
-- `scripts/sonnet_plan_fanout_focused.sh` — reproducible Sonnet focused gate.
-- `docs/ai/experiment_ledger.jsonl` — two rejected prompt variants and the promoted final gate result.
+- `scripts/sonnet_gold_cycle4.sh` — reproducible serial, resumable cycle-4 Sonnet gold100 runner with
+  all five child stores enabled and serve-time Gemini forbidden.
+- `scripts/sonnet_gold_cycle4_integrated_focused.sh` — integrated target-plus-sentinel focused gate.
+- `docs/ai/sonnet_cycle_analysis/cycle4.md` — exhaustive pre-decomposition abstain/wrong classification.
+- `docs/ai/sonnet_gold_history.jsonl` — measured cycle-4 history entry and next-cycle handoff.
+- `docs/ai/experiment_ledger.jsonl` — integrated focused and full gold100 evidence.
+- `artifacts/gold_100_review.{md,csv}`, `docs/gold_offline_history.jsonl`, `scoring/ledger.jsonl` —
+  generated non-official gold100 review and scoring history.
 
 ## Commands Run
 
-- `.venv/bin/python -m pytest -q tests/test_claude_mcp.py tests/test_investigator.py tests/test_unified_search.py` — 133 passed.
-- `.venv/bin/python scripts/check_flag_manifest.py scripts/sonnet_plan_fanout_focused.sh` — pass; zero unknown flags.
-- `.venv/bin/python -m pytest -q` — 1,816 passed; one unrelated dirty-artifact failure because the
-  focused review CSV contains 15 rows while the legacy test requires at least 30. The same test passed
-  from a clean detached `main` worktree (1 passed).
-- `bash scripts/sonnet_plan_fanout_focused.sh` — final PASS (`official:false`): sentinels 10/10,
-  regressions `[]`; targets idx34/76/98 all Missing (wrong count 0 vs baseline 1); mean live LLM tool
-  calls 4.4 (≤6). Two preceding variants failed 9/10 and were recorded/rejected before the precision
-  prompt was finalized.
+- `bash scripts/sonnet_gold_cycle4_integrated_focused.sh` — PASS; targets 20/24 MATCH, four Missing,
+  wrong 0 for the changed-path gate; sentinels 10/10 MATCH, regressions 0; `official:false`.
+- `bash scripts/sonnet_gold_cycle4.sh` — PASS; 100/100 completed using resume cache; 57 match,
+  22 abstain, 21 wrong, net 36; Gemini cost `$0.0000`; `official:false`.
+- `.venv/bin/python scripts/check_flag_manifest.py scripts/sonnet_gold_cycle4.sh` — PASS; no unknown flags.
+- `.venv/bin/python scripts/check_flag_manifest.py scripts/sonnet_gold_cycle4_integrated_focused.sh` — PASS; no unknown flags.
+- JSONL parse check for both experiment/history ledgers — PASS.
+- `.venv/bin/python -m pytest -q` — 1,836 passed, 17 warnings in 605.16s.
 
 ## Acceptance Criteria
 
-- [x] Three-stage flow is feature-gated and live telemetry shows mean 4.4 tool calls, down from the
-  stated 12–18 baseline and below the ≤6 KPI.
-- [x] Final focused gate preserved 10/10 MATCH sentinels; target wrong count decreased from one to zero.
-- [x] OFF path preserves the legacy prompt and budget; ON records budget, first tool, search calls,
-  supplements, extra searches, and tool turns under `interventions.plan_fanout`.
+- [x] Gemini cost is mechanically reported as `$0.0000`; answer execution used claude-mcp/Sonnet only
+  with `RAG_FORBID_GEMINI=1`.
+- [x] Integrated focused improvement passed for the child target set, with Sonnet sentinels 10/10 and
+  zero sentinel regressions.
+- [x] Cycle 4 is appended to both ledgers with measured full-run metrics and next-cycle handoff.
 
 ## Risks
 
-- The focused gate is intentionally `official:false`; the running Sonnet cycle owns full-gold integration.
-- All three BUDGET targets safely abstained; this flow controls turn cost and precision but did not recover
-  a new target answer in this focused sample.
-- Generated review/history/submission artifacts already dirty before this issue remain excluded from the commit.
+- This is a single resumed dev measurement, so the large net gain is promising but not an official
+  leaderboard claim; future cycles should retain deterministic focused evidence as the attribution unit.
+- Remaining 22 abstentions are still dominated by `BUDGET_EXHAUSTED` (16), while version-diff questions
+  remain the weakest class (1/6 MATCH, four wrong).
+- The full run remains below the historical manual 86.7% reference and does not alter the official lane.
 
+## Linear Report: POSTED
 ## Acceptance: PASS
 ## Next Action: READY_FOR_REVIEW
