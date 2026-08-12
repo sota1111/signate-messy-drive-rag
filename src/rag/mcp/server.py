@@ -36,7 +36,8 @@ import sys
 import time
 from typing import Any, Mapping, Sequence
 
-from src.rag.agent.investigator import SUBMIT_ANSWER, AgentTool, build_tools, dispatch
+from src.rag.agent.investigator import (
+    SUBMIT_ANSWER, AgentTool, build_tools, dispatch, is_raw_file_tool)
 from src.rag.tools.profile import CorpusProfile
 
 SERVER_NAME = "signate-investigator"
@@ -100,6 +101,10 @@ class ToolCallLogger:
             "args": _safe_args(args),
             "elapsed_ms": round(elapsed_ms, 3),
             "ok": ok,
+            # SOT-2660 — mark 生ファイル系 calls so the details-reconstruction can compute this session's
+            # raw_file_access (a raw-file tool with ok=True means the answer touched a raw corpus file; a
+            # RAG_DB_ONLY refusal lands here with ok=False).
+            "raw_file": is_raw_file_tool(tool),
         }
         if error:
             rec["error"] = error
