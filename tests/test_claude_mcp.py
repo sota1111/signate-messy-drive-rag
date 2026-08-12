@@ -374,3 +374,27 @@ def test_none_bare_contract_appended_when_flag_on(monkeypatch):
     monkeypatch.setenv("RAG_BARE_ANSWER", "1")
     both = claude_mcp._harness_system_suffix()
     assert "回答書式契約" in both and "該当なし契約" in both
+
+
+# ------------------------------------------------------------------ SOT-2666 完全ラベル写経・回答範囲限定契約
+def test_exact_label_contract_absent_by_default(monkeypatch):
+    # Default OFF ⇒ the system suffix carries no 完全ラベル contract (serve byte-identical).
+    monkeypatch.delenv("RAG_EXACT_LABEL", raising=False)
+    assert "完全ラベル契約" not in claude_mcp._harness_system_suffix()
+
+
+def test_exact_label_contract_appended_when_flag_on(monkeypatch):
+    # SOT-2666 (idx21/62/78): flag ON ⇒ the suffix binds full-label transcription + scope limits.
+    monkeypatch.delenv("RAG_BARE_ANSWER", raising=False)
+    monkeypatch.setenv("RAG_EXACT_LABEL", "1")
+    suffix = claude_mcp._harness_system_suffix()
+    assert "完全ラベル契約" in suffix
+    # the three levers, one per target idx (no gold-specific string is hardcoded — these are the
+    # instruction examples, not answers)
+    assert "切り詰めない" in suffix          # idx21 肩書の切り詰め禁止
+    assert "ラベル付き形式" in suffix         # idx62 複数値の対応ラベル
+    assert "追加の主張を answer に足さない" in suffix  # idx78 回答範囲限定
+    # composes with the base bare-answer contract when both are on (base config keeps RAG_BARE_ANSWER=1)
+    monkeypatch.setenv("RAG_BARE_ANSWER", "1")
+    both = claude_mcp._harness_system_suffix()
+    assert "回答書式契約" in both and "完全ラベル契約" in both

@@ -271,6 +271,28 @@ _TWO_TIER_ANSWER_CONTRACT = (
 )
 
 
+def _exact_label_enabled() -> bool:
+    """SOT-2666 (cycle5 C3) — 完全ラベル写経・回答範囲限定契約。
+
+    cycle5 の wrong のうち idx21/62/78 は値そのものは正しいのに、肩書を切り詰めたり(idx21=「部長」/
+    gold「人材戦略部長」)、複数値をラベルなしで並べたり(idx62=「500 vs 300」/ gold「1位=500、2位=300」)、
+    問われていない追加主張を付けたり(idx78=「上限は設けられていない」)して judge 落ちした。値保存の裸回答
+    契約(RAG_BARE_ANSWER)を補完し、substance を成す語(肩書・順位ラベル・対応関係)は削らず、逆に
+    問われた範囲を越える主張は足さないよう縛る。プロンプトのみ(値の後処理なし)・既定 OFF。
+    """
+    return os.getenv("RAG_EXACT_LABEL", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+_EXACT_LABEL_CONTRACT = (
+    "\n\n【完全ラベル契約】answer に載せる値は、それを構成する肩書・役職・部署・順位ラベル・単位を"
+    "原文どおり完全に写経する — 一部だけを切り詰めない(『人材戦略部長』を『部長』にしない)。"
+    "質問が複数の値を区別して問う場合(順位別・年度別・モデル別など)は、どの値がどれに対応するかが"
+    "分かるラベル付き形式で全て併記する(『500 vs 300』ではなく『1位=500、2位=300』)。この対応ラベルは"
+    "値の一部であり注記ではないので省かない。同時に、問われた範囲のみを答え、問われていない事実・"
+    "上限有無・背景・評価といった追加の主張を answer に足さない(補足は evidence へ書く)。"
+)
+
+
 def _harness_system_suffix() -> str:
     base = (
         "\n\n【実行環境(dev)】ツールは MCP 経由で `mcp__investigator__<ツール名>` として提供される"
@@ -284,6 +306,8 @@ def _harness_system_suffix() -> str:
         base += _NONE_BARE_CONTRACT
     if _two_tier_answer_enabled():
         base += _TWO_TIER_ANSWER_CONTRACT
+    if _exact_label_enabled():
+        base += _EXACT_LABEL_CONTRACT
     return base
 
 
