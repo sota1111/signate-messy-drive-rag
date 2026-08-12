@@ -57,6 +57,16 @@ def _subject_prefix_enabled() -> bool:
     return os.getenv("RAG_VDIFF_SUBJECT", "0").strip().lower() in _SUBJECT_ON
 
 
+def _normalize_enabled() -> bool:
+    """SOT-2681 (cycle6 K5) — version_diff semantic normalization of the committed rendering.
+
+    When on, a committed lone-substantive *modify* whose value is a list-append (old ⊊ new, e.g. a 担当者
+    cell 「渡辺 遥」→「渡辺 遥 / 小林 直樹」) renders as 「…に<追加項目>を追加」 instead of 「…を…に変更」
+    (idx95 class). Default OFF ⇒ the modify path is byte-identical (the append branch is never taken; a
+    genuine replacement such as idx74 is unaffected because it is not a list-append)."""
+    return os.getenv("RAG_VDIFF_NORMALIZE", "0").strip().lower() in _SUBJECT_ON
+
+
 def _doc_subject(pair) -> str:
     """The logical document name for the answer prefix — the latest file's stem, version-token stripped.
 
@@ -189,6 +199,35 @@ def pipeline(question: str, *, profile: Any = None) -> "dict[str, Any] | None":
         return {"value": rendered, "evidence": evidence, "method": method}
 
     label = _context_label(pair, change)
+    # SOT-2681 (K5): a list-append modify (old ⊊ new by membership, e.g. 担当者「渡辺 遥」→「渡辺 遥 / 小林 直樹」)
+    # is semantically an *addition*, not a 変更 — gold書式 wants 「…に<追加項目>を追加」 (idx95). Flag-gated so
+    # OFF keeps the 変更 rendering byte-identical; a genuine replacement (idx74) is not a list-append so it is
+    # never rerouted here. Every token stays corpus/diff-derived (the appended items are read verbatim from ``after``).
+    from src.rag import diffpair as _dp
+
+    if _normalize_enabled() and _dp.is_list_append(change.before, change.after):
+        added = "、".join(_dp.appended_items(change.before, change.after))
+        rendered = f"{label}に{added}を追加" if label else f"{added}を追加"
+        evidence = {
+            "file": pair.new.rel,
+            "old_file": pair.old.rel,
+            "version_basis": pair.basis,
+            "structural_location": label,
+            "before": change.before,
+            "after": change.after,
+            "change_kind": change.kind,
+            "normalized_as": "list_append",
+        }
+        method = {
+            "engine": "diffpair",
+            "contract": CONTRACT_TYPE,
+            "selection": "single_substantive_modify",
+            "naturalize": False,
+            "confidence": 1.0,
+            "normalization": "list_append_to_add",
+        }
+        return {"value": rendered, "evidence": evidence, "method": method}
+
     # Gold 書式 for a version-diff answer is a flowing prose sentence (「<行ラベル>が<旧>から<新>に変更」),
     # not the raw 「行ラベル：旧 → 新」 arrow. Render that prose **deterministically** here (idx74 focused
     # trace, SOT-2619). Previously this handed a raw arrow to the Stage3 LLM one-shot naturalizer, which

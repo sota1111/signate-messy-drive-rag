@@ -293,6 +293,32 @@ _EXACT_LABEL_CONTRACT = (
 )
 
 
+def _vdiff_normalize_enabled() -> bool:
+    """SOT-2681 (cycle6 K5) — 版差分の意味正規化契約(prompt-only)。
+
+    cycle5 の version_diff wrong (idx1/95) は値・セルは正しく特定できているのに、変更の *型* を取り違えて
+    judge 落ちしていた: リスト追記(担当者「渡辺 遥」→「渡辺 遥 / 小林 直樹」)を「変更」と書く(idx95, gold
+    「小林 直樹を追加」)、同域の削除＋挿入を「削除」とだけ書いて置換側を落とす(idx1, gold「…を削除し1行要約
+    に置換」)。加えて離れた版(v1→v3)を中間版の逐次読み直しで予算切れ棄権(idx14)。値後処理はせず、Sonnet
+    backend の system suffix に型正規化の言い回し契約を足すだけ(RAG_EXACT_LABEL と同型)・既定 OFF。
+    """
+    return os.getenv("RAG_VDIFF_NORMALIZE", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+_VDIFF_NORMALIZE_CONTRACT = (
+    "\n\n【版差分の意味正規化契約】旧版→新版の実質的変更を述べるときは、変更の型を意味に沿って正規化する。"
+    "(1)リスト追記: 旧値が新値の部分集合で、新値＝旧値＋追加項目になっている場合(例: 担当者『渡辺 遥』→"
+    "『渡辺 遥 / 小林 直樹』)は『変更』と書かず、追加された項目だけを主語にして『(対象/行)に<追加項目>を追加』"
+    "と表現する(旧項目は温存されているので消えていない)。"
+    "(2)同域の置換: 同一の箇所・表・節で、あるブロックの削除と別ブロックの挿入が対になっている場合(例: "
+    "性能比較表を削除して1行要約を挿入)は、削除だけで止めず『<削除対象>を削除し、<挿入内容>に置換』と"
+    "両側を1文で述べる。"
+    "(3)離れた版: 旧版と新版が隣接しない(例 v1→v3)場合も、事前確定済みの版ペア差分(diff_lookup)を優先して"
+    "1回で取得し、中間版を逐次読み直して予算を使い切らない。"
+    "いずれも値・ラベルは原文どおり写経し、問われた範囲を越える主張は足さない(補足は evidence へ)。"
+)
+
+
 def _harness_system_suffix() -> str:
     base = (
         "\n\n【実行環境(dev)】ツールは MCP 経由で `mcp__investigator__<ツール名>` として提供される"
@@ -308,6 +334,8 @@ def _harness_system_suffix() -> str:
         base += _TWO_TIER_ANSWER_CONTRACT
     if _exact_label_enabled():
         base += _EXACT_LABEL_CONTRACT
+    if _vdiff_normalize_enabled():
+        base += _VDIFF_NORMALIZE_CONTRACT
     return base
 
 
