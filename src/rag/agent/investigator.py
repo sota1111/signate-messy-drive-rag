@@ -82,6 +82,31 @@ _COMMIT_GATE_RETRY_DIRECTIVE = (
     "根拠を実際に取得できない場合のみ棄権してください。")
 
 
+def _two_tier_answer_enabled() -> bool:
+    """SOT-2670 — structurally enforce a two-tier answer schema on ``submit_answer`` (``RAG_TWO_TIER_ANSWER``,
+    default OFF). When ON, the terminal tool advertises ``full_answer`` (the reasoning-bearing complete
+    sentence, incl. 根拠・限定条件) + ``bare_answer`` (the value/phrase the question asks for, copied
+    verbatim), and the **scored** answer is ``bare_answer`` — separating "where to think" from "what to
+    submit" so a prompt-contract deviation (idx21 役職切り詰め / idx62 ラベル欠落 / idx78 冗長) is prevented
+    mechanically, not just by prompt. OFF ⇒ the legacy single-``answer`` schema (byte-identical)."""
+    return os.getenv("RAG_TWO_TIER_ANSWER", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def scored_answer_text(args: Mapping[str, Any] | None) -> str:
+    """The answer text that is SCORED / gate-validated for one ``submit_answer`` call (SOT-2670).
+
+    Single source of truth shared by both backends (the Gemini native loop via :func:`_answer_from_args`
+    and the claude-mcp server-side commit gate). With ``RAG_TWO_TIER_ANSWER`` ON, the scored value is
+    ``bare_answer`` (falling back to ``answer`` only when ``bare_answer`` is empty, for robustness); OFF ⇒
+    the legacy ``answer`` field verbatim (byte-identical)."""
+    a = dict(args or {})
+    if _two_tier_answer_enabled():
+        bare = str(a.get("bare_answer", "") or "").strip()
+        if bare:
+            return bare
+    return str(a.get("answer", "") or "").strip()
+
+
 def _commit_gate_enforce() -> bool:
     """Whether the commit gate's verdict is ENFORCED on the answer — ``RAG_COMMIT_GATE_ENFORCE`` (default
     OFF). Delegates to :func:`commit_gate.enforce` (SOT-2640, single source of truth for the flag shared
@@ -623,14 +648,23 @@ def _coerce_confidence(value: Any) -> float:
 
 
 def _answer_from_args(args: Mapping[str, Any] | None) -> Answer:
-    """Build an :class:`Answer` from the model's ``submit_answer`` arguments (robust to omissions)."""
+    """Build an :class:`Answer` from the model's ``submit_answer`` arguments (robust to omissions).
+
+    SOT-2670: with ``RAG_TWO_TIER_ANSWER`` ON the scored answer is ``bare_answer`` (via
+    :func:`scored_answer_text`) and the reasoning-bearing ``full_answer`` is preserved on the evidence side
+    for traceability. OFF ⇒ the legacy single-``answer`` behavior (byte-identical)."""
     a = dict(args or {})
-    text = str(a.get("answer", "") or "").strip() or ABSTAIN
+    text = scored_answer_text(a) or ABSTAIN
     conf = _coerce_confidence(a.get("confidence"))
     if is_abstain(text):
         conf = 0.0
+    evidence = str(a.get("evidence", "") or "")
+    if _two_tier_answer_enabled():
+        full = str(a.get("full_answer", "") or "").strip()
+        if full:
+            evidence = f"[full_answer] {full}" + (f"\n{evidence}" if evidence else "")
     return Answer(answer=text, confidence=conf,
-                  evidence=str(a.get("evidence", "") or ""),
+                  evidence=evidence,
                   method=str(a.get("method", "") or ""))
 
 
@@ -891,6 +925,44 @@ SUBMIT_ANSWER_TOOL = AgentTool(
 )
 
 
+# SOT-2670 — two-tier answer schema (RAG_TWO_TIER_ANSWER). Structurally separates "where to think"
+# (full_answer) from "what to submit" (bare_answer, the scored value). The field descriptions carry the
+# no-deviation contract mechanically: bare_answer copies labels/titles/units verbatim (idx21/62), and a
+# confirmed-nonexistence answer is「該当なし」only (idx9/85).
+_FULL_ANSWER_DESC = {
+    "type": "string",
+    "description": (
+        "根拠・限定条件を含む完全な文でまず考える場所。ここに理由・出典・計算過程・補足を書く。"
+        "採点対象ではない(トレース用に evidence 側へ保存される)。"),
+}
+_BARE_ANSWER_DESC = {
+    "type": "string",
+    "description": (
+        "採点対象。質問が要求する値・語句そのものだけを書く(裸の値)。"
+        "ラベル・肩書・単位・記法は原文どおり完全に写す(切り詰め・言い換え・付加をしない: 例『部長』ではなく"
+        "原文の役職名を完全に、ラベルが要る一覧はラベルごと)。理由・出典・注記・括弧書きは書かない。"
+        "存在しないことが確定した場合は『該当なし』のみを書く(内容の併記はしない)。"),
+}
+SUBMIT_ANSWER_TOOL_TWO_TIER = AgentTool(
+    SUBMIT_ANSWER,
+    "十分な根拠が得られたら最終回答を確定する。まず full_answer(根拠・限定条件を含む完全な文)を書き、"
+    "次に bare_answer(質問が要求する値・語句そのもの。ラベル・肩書・単位・記法は原文どおり完全に写す。"
+    "該当が確定して存在しない場合は『該当なし』のみ)を書く。採点対象は bare_answer。"
+    "confidence(0.0〜1.0)・evidence(根拠)・method(導出手順)も渡す。これを呼ぶと調査は終了する。",
+    _obj({"full_answer": _FULL_ANSWER_DESC, "bare_answer": _BARE_ANSWER_DESC,
+          "confidence": _NUM, "evidence": _STR, "method": _STR}, ["bare_answer"]),
+    lambda full_answer=None, bare_answer=None, answer=None, confidence=None,
+    evidence=None, method=None: {"submitted": True},
+)
+
+
+def submit_answer_tool() -> AgentTool:
+    """The terminal ``submit_answer`` tool for the current config (SOT-2670). Returns the two-tier schema
+    when ``RAG_TWO_TIER_ANSWER`` is ON, else the legacy single-``answer`` tool (the exact same object ⇒
+    OFF byte-identical)."""
+    return SUBMIT_ANSWER_TOOL_TWO_TIER if _two_tier_answer_enabled() else SUBMIT_ANSWER_TOOL
+
+
 def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
     """Wire the deterministic :mod:`src.rag.tools` into agent-callable tools bound to ``profile``.
 
@@ -1143,7 +1215,7 @@ def build_generic_tools(profile: CorpusProfile) -> list[AgentTool]:
 
 def build_tools(profile: CorpusProfile) -> list[AgentTool]:
     """The full tool set exposed to the investigator: generic Step1 tools + the terminal answer tool."""
-    return [*build_generic_tools(profile), SUBMIT_ANSWER_TOOL]
+    return [*build_generic_tools(profile), submit_answer_tool()]
 
 
 def _jsonable(obj: Any, *, max_str: int = 8000, max_items: int = 60, _depth: int = 0) -> Any:

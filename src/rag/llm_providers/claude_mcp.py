@@ -228,6 +228,22 @@ _BARE_ANSWER_CONTRACT = (
 )
 
 
+def _two_tier_answer_enabled() -> bool:
+    """SOT-2670 — two-tier submit_answer schema (full_answer + bare_answer). Prompt-side mirror of the
+    structural flag defined in ``investigator`` so the tool description AND the system prompt both steer
+    the model toward bare_answer as the scored value. Default OFF."""
+    return os.getenv("RAG_TWO_TIER_ANSWER", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+_TWO_TIER_ANSWER_CONTRACT = (
+    "\n\n【二段回答契約】submit_answer には full_answer と bare_answer を必ず両方渡す。"
+    "full_answer には根拠・限定条件を含む完全な文を書いて『考える場所』とし、bare_answer には"
+    "質問が要求する値・語句そのものだけを書く(採点対象は bare_answer)。bare_answer では"
+    "ラベル・肩書・単位・記法を原文どおり完全に写し、切り詰め・言い換え・注記の付加をしない。"
+    "存在しないことが確定した場合の bare_answer は『該当なし』のみとする。"
+)
+
+
 def _harness_system_suffix() -> str:
     base = (
         "\n\n【実行環境(dev)】ツールは MCP 経由で `mcp__investigator__<ツール名>` として提供される"
@@ -237,6 +253,8 @@ def _harness_system_suffix() -> str:
     )
     if _bare_answer_enabled():
         base += _BARE_ANSWER_CONTRACT
+    if _two_tier_answer_enabled():
+        base += _TWO_TIER_ANSWER_CONTRACT
     return base
 
 
