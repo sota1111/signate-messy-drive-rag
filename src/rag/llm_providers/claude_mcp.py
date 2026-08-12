@@ -228,6 +228,24 @@ _BARE_ANSWER_CONTRACT = (
 )
 
 
+def _none_bare_enabled() -> bool:
+    """SOT-2665 (cycle5 C2) — 「該当なし」裸形式契約。
+
+    cycle5 の wrong のうち idx9/85 は gold=「該当なし」なのに、変更点を列挙(idx9)したり
+    「なし(全6項目達成)」と達成状況を注記(idx85)して judge 落ちした。存在しないことが確定した回答は
+    装飾なしの「該当なし」のみに縛る。プロンプトのみ(値の後処理なし)・既定 OFF。
+    """
+    return os.getenv("RAG_NONE_BARE", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+_NONE_BARE_CONTRACT = (
+    "\n\n【該当なし契約】質問が要求する項目・変更・値が確定的に存在しない/見つからない場合、"
+    "answer は装飾なしで『該当なし』のみとする(『なし』『特になし』ではなく『該当なし』)。"
+    "『なし(全6項目達成)』のような理由・達成状況・件数の注記や、"
+    "存在した別項目の列挙・言い換えを answer に一切付けない(補足は evidence へ書く)。"
+)
+
+
 def _two_tier_answer_enabled() -> bool:
     """SOT-2670 — two-tier submit_answer schema (full_answer + bare_answer). Prompt-side mirror of the
     structural flag defined in ``investigator`` so the tool description AND the system prompt both steer
@@ -253,6 +271,8 @@ def _harness_system_suffix() -> str:
     )
     if _bare_answer_enabled():
         base += _BARE_ANSWER_CONTRACT
+    if _none_bare_enabled():
+        base += _NONE_BARE_CONTRACT
     if _two_tier_answer_enabled():
         base += _TWO_TIER_ANSWER_CONTRACT
     return base
