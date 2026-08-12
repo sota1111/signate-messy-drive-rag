@@ -112,6 +112,50 @@ def test_lone_non_modify_change_falls_back(monkeypatch):
     assert vd.pipeline("q") is None
 
 
+def test_lone_add_still_falls_back_when_subject_flag_off(monkeypatch):
+    # SOT-2665: with RAG_VDIFF_SUBJECT off, a lone substantive add is still LLM-fallback (byte-identical).
+    monkeypatch.delenv("RAG_VDIFF_SUBJECT", raising=False)
+    change = diffpair.Change(label="スライド6『4. 分析アプローチ 全体像』", before="",
+                             after="4.1〜4.5の各フェーズの作業内容", kind="add")
+    _wire(monkeypatch, pair=_pair(), ranked=[_ranked(change, score=0.72)])
+    assert vd.pipeline("q") is None
+
+
+def test_lone_add_grounds_with_document_subject_prefix_when_flag_on(monkeypatch):
+    # SOT-2665 (idx0-shaped): a single substantive block insert commits as「<文書名><locator>に、…が追記された」.
+    monkeypatch.setenv("RAG_VDIFF_SUBJECT", "1")
+    change = diffpair.Change(label="スライド6『4. 分析アプローチ 全体像』", before="",
+                             after="4.1〜4.5の各フェーズの作業内容", kind="add")
+    _wire(monkeypatch, pair=_pair(), ranked=[_ranked(change, score=0.72)])
+    out = vd.pipeline("q")
+    assert out is not None
+    # new.stem "提案書_v2" → version-stripped subject "提案書"; diffpair's locator+heading are verbatim.
+    assert out["value"] == "提案書スライド6『4. 分析アプローチ 全体像』に、4.1〜4.5の各フェーズの作業内容が追記された"
+    assert out["evidence"]["document_subject"] == "提案書"
+    assert out["evidence"]["change_kind"] == "add"
+    assert out["method"]["selection"] == "single_substantive_add"
+    assert out["method"]["naturalize"] is False
+
+
+def test_lone_add_without_locator_renders_subject_only(monkeypatch):
+    # No slide/heading label ⇒ just「<文書名>に、…が追記された」 (no invented locator).
+    monkeypatch.setenv("RAG_VDIFF_SUBJECT", "1")
+    change = diffpair.Change(label="", before="", after="新セクション", kind="add")
+    _wire(monkeypatch, pair=_pair(), ranked=[_ranked(change, score=0.72)])
+    out = vd.pipeline("q")
+    assert out["value"] == "提案書に、新セクションが追記された"
+
+
+def test_subject_flag_on_does_not_change_modify_path(monkeypatch):
+    # The existing single-modify answer stays byte-identical with the flag on (idx74 unaffected).
+    monkeypatch.setenv("RAG_VDIFF_SUBJECT", "1")
+    change = diffpair.Change(label="担当者", before="A", after="B", kind="modify")
+    _wire(monkeypatch, pair=_pair(), ranked=[_ranked(change)])
+    out = vd.pipeline("q")
+    assert out["value"] == "担当者がAからBに変更"
+    assert out["method"]["selection"] == "single_substantive_modify"
+
+
 def test_non_substantive_singleton_falls_back(monkeypatch):
     change = diffpair.Change(label="footer", before="v1", after="v2", kind="modify")
     _wire(monkeypatch, pair=_pair(), ranked=[_ranked(change, intent=diffpair.BOILERPLATE, score=0.10)])

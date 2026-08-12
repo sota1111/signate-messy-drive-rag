@@ -302,3 +302,22 @@ def test_observational_gate_records_telemetry_without_changing_submit(monkeypatc
         "合計は何件ですか?", tools=build_tools(CorpusProfile()), contract="numeric")
     assert out.answer.answer == "42件"
     assert out.interventions["commit_gate"]["verdict"] == "REJECT"
+
+
+# --------------------------------------------------------------------------- SOT-2665 「該当なし」裸形式契約
+def test_none_bare_contract_absent_by_default(monkeypatch):
+    # Default OFF ⇒ the system suffix carries no 該当なし contract (serve byte-identical).
+    monkeypatch.delenv("RAG_NONE_BARE", raising=False)
+    assert "該当なし契約" not in claude_mcp._harness_system_suffix()
+
+
+def test_none_bare_contract_appended_when_flag_on(monkeypatch):
+    # SOT-2665 (idx9/85): flag ON ⇒ the suffix binds a bare「該当なし」none-answer form.
+    monkeypatch.setenv("RAG_NONE_BARE", "1")
+    suffix = claude_mcp._harness_system_suffix()
+    assert "該当なし契約" in suffix
+    assert "『該当なし』のみ" in suffix
+    # composes with the base bare-answer contract when both are on (base config keeps RAG_BARE_ANSWER=1)
+    monkeypatch.setenv("RAG_BARE_ANSWER", "1")
+    both = claude_mcp._harness_system_suffix()
+    assert "回答書式契約" in both and "該当なし契約" in both
