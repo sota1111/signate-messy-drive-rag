@@ -160,8 +160,20 @@ def test_plan_fanout_telemetry_counts_search_and_supplements(monkeypatch):
         "tool_turns": 3,
         "finisher_enabled": False,
         "finisher_max": 0,
-        "finisher_calls": 0,
+        "over_budget_calls": 0,
     }
+
+
+def test_plan_fanout_telemetry_counts_over_budget_calls(monkeypatch):
+    monkeypatch.setenv("RAG_FANOUT_FINISHER", "1")
+    monkeypatch.setenv("RAG_FANOUT_FINISHER_MAX", "3")
+    # 7 non-submit tool uses against a budget of 5 ⇒ 2 over-budget attempts (granted + refused).
+    tel = claude_mcp._plan_fanout_telemetry(
+        ["search"] + ["read_office"] * 6 + ["submit_answer"], 5)
+    assert tel["finisher_enabled"] is True
+    assert tel["finisher_max"] == 3
+    assert tel["tool_turns"] == 7
+    assert tel["over_budget_calls"] == 2
 
 
 # -- bounded plan-fanout finisher (SOT-2664) -------------------------------------------------------
@@ -183,11 +195,15 @@ def test_fanout_finisher_budget_reads_env(monkeypatch):
 
 
 def test_fanout_finisher_eligible_only_targeted_reads():
-    # targeted raw-evidence readers with a resolved file target qualify
+    # single-document raw-evidence extractors with a resolved file target qualify
     assert inv.fanout_finisher_eligible("read_office", {"file": "b.pptx"}) is True
     assert inv.fanout_finisher_eligible("format_events", {"file": "m.xlsx", "fill": "黄"}) is True
-    assert inv.fanout_finisher_eligible("compute", {"file": "t.csv", "expr": "df.x.sum()"}) is True
-    # exploratory/search/resolve tools never qualify (the abstain→wrong guard)
+    assert inv.fanout_finisher_eligible("highlight_extract", {"file": "h.xlsx", "color": "黄"}) is True
+    # compute is the derived/aggregation churn driver (idx24 cross-project 列挙) ⇒ excluded to prevent
+    # the abstain→wrong reflow the finisher would otherwise cause (SOT-2664)
+    assert inv.fanout_finisher_eligible("compute", {"file": "t.csv", "expr": "df.x.sum()"}) is False
+    # exploratory/search/resolve/aggregate tools never qualify (the abstain→wrong guard)
+    assert inv.fanout_finisher_eligible("corpus_aggregate", {"metric": "staff"}) is False
     assert inv.fanout_finisher_eligible("file_grep", {"file": "x", "query": "q"}) is False
     assert inv.fanout_finisher_eligible("find_files", {"query": "q"}) is False
     assert inv.fanout_finisher_eligible("version_diff", {"question": "q"}) is False

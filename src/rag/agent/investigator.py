@@ -594,10 +594,16 @@ def plan_fanout_budget(default_budget: int) -> int:
 # 探索/解決系ツールは予算切れのまま (budget_exhausted) なので、abstain→wrong を生む放浪探索を再開できない
 # (=明示的な wrong 化防止ゲート)。既定 OFF ⇒ SYSTEM_PROMPT もサーバ挙動も byte-identical。
 #
-# 対象ツール: 対象文書を 1 個 read するだけで確定する狙い撃ちリーダー (find_files/file_grep/canonical_route/
-# version_diff/corpus_aggregate/enum_scan/seating_lookup 等の探索・横断・解決系は除外)。
+# 対象ツール: 特定済みの《1 文書》から証拠を抽出するだけで確定する狙い撃ちリーダーに限る。
+# 除外する系統と理由:
+#   - 探索・横断・解決系 (find_files/file_grep/canonical_route/version_diff/corpus_aggregate/enum_scan/
+#     seating_lookup): 予算切れのまま = 放浪探索を再開させない。
+#   - compute: 派生計算・横断集計の churn ドライバ。各 compute(file=X) は「対象特定済み」に見えるが、「欠損値
+#     行数最多の案件」(idx24) のような《全案件を1件ずつ回す列挙》では file が回転するだけで実質は探索であり、
+#     有界継続を与えると abstain→wrong に逆流する (SOT-2664 focused: idx24 が 予算切れ棄権 → 白峰 で Incorrect
+#     化を実測)。数値確定は budget 内の 1 式でまとめる既存規律 (プロンプト③) に委ねる。
 FANOUT_FINISHER_TOOLS: frozenset[str] = frozenset({
-    "read_office", "decrypt", "compute", "read_chart_values", "caption_image",
+    "read_office", "decrypt", "read_chart_values", "caption_image",
     "pdf_emphasis", "pptx_pivot", "highlight_extract", "font_emphasis", "format_events",
 })
 # The argument keys that name a concretely-resolved document target. A finisher-eligible call must carry a

@@ -448,11 +448,15 @@ def _plan_fanout_telemetry(tool_calls: Sequence[str], budget: int) -> dict[str, 
     # supplement = narrowing tool calls that are NOT the unified search (stage ③); when search never
     # fired, every non-submit call counts as a supplement probe (the flow degraded to individual tools).
     supplement = (len(non_submit) - search_calls) if search_calls else len(non_submit)
-    # SOT-2664 — non-terminal tool turns executed beyond the plan-fanout budget. When the bounded finisher
-    # is ON these are the extra targeted raw-evidence reads it granted; when OFF this is always 0 (the
-    # server refuses every over-budget call), so the field doubles as a finisher-fired indicator.
+    # SOT-2664 — non-terminal tool USES the model emitted beyond the plan-fanout budget. This counts both
+    # the reads the bounded finisher actually GRANTED (≤ finisher_max, targeted+resolved only) AND any
+    # over-budget calls the server REFUSED with budget_exhausted (they still appear as tool_use blocks in
+    # the stream), so it is an over-budget *attempt* count, not the granted count — the true granted count
+    # is server-side (≤ finisher_max). When the finisher is OFF the server refuses every over-budget call,
+    # but the model may still emit (and get refused on) such attempts, so read this together with
+    # ``finisher_enabled``.
     finisher_max = fanout_finisher_budget()
-    finisher_calls = max(0, len(non_submit) - int(budget)) if budget and budget > 0 else 0
+    over_budget_calls = max(0, len(non_submit) - int(budget)) if budget and budget > 0 else 0
     return {
         "enabled": True,
         "budget": int(budget),
@@ -464,7 +468,7 @@ def _plan_fanout_telemetry(tool_calls: Sequence[str], budget: int) -> dict[str, 
         "tool_turns": int(len(non_submit)),
         "finisher_enabled": bool(finisher_max > 0),
         "finisher_max": int(finisher_max),
-        "finisher_calls": int(finisher_calls),
+        "over_budget_calls": int(over_budget_calls),
     }
 
 
