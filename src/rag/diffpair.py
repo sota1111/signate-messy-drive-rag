@@ -78,6 +78,40 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", "", s).lower()
 
 
+# SOT-2681 (cycle6 K5) — list-valued cell separators. A 担当者/レビュー cell joins members with these
+# (「渡辺 遥 / 小林 直樹」, 「A、B」, 「X・Y」); a single space inside one name (姓 名) is NOT a separator, so
+# only 2+ spaces split. Used to tell an *append* (old ⊊ new membership) from a *replacement*.
+_LIST_SEP_RE = re.compile(r"\s*[/／、,，;；・]\s*|\s{2,}")
+
+
+def _list_items(text: str) -> list[str]:
+    """Split a list-valued cell into its member items (separator-insensitive, order-preserving)."""
+    return [p.strip() for p in _LIST_SEP_RE.split(nfc(text or "")) if p and p.strip()]
+
+
+def is_list_append(before: str, after: str) -> bool:
+    """True when ``after`` is ``before`` plus one or more appended list items (old ⊊ new by membership).
+
+    A 担当者 cell 「渡辺 遥」→「渡辺 遥 / 小林 直樹」 is an *addition*, not a replacement, so gold書式 wants
+    「…を追加」 (idx95). Requires: ≥1 old item, more new items than old, EVERY old item survives in new
+    (normalized equality), and ≥1 genuinely new item. A pure replacement (idx74: old fully swapped out)
+    fails the "all old survive" test, so it is never treated as an append."""
+    ob, oa = _list_items(before), _list_items(after)
+    if not ob or len(oa) <= len(ob):
+        return False
+    on = [_norm(x) for x in ob]
+    an = [_norm(x) for x in oa]
+    if any(x not in an for x in on):  # an old item vanished ⇒ replacement, not append
+        return False
+    return any(x not in on for x in an)  # at least one genuinely new member
+
+
+def appended_items(before: str, after: str) -> list[str]:
+    """The list items present in ``after`` but not ``before`` (verbatim from ``after``, order preserved)."""
+    on = {_norm(x) for x in _list_items(before)}
+    return [x for x in _list_items(after) if _norm(x) not in on]
+
+
 def is_diff_question(question: str) -> bool:
     q = nfc(question)
     if not _COMPARE_RE.search(q):
