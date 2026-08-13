@@ -678,6 +678,69 @@ def _annotate_notebook_stats(record: dict[str, Any], pair: "diffpair.VersionPair
     return record
 
 
+def _direct_commit_build_enabled() -> bool:
+    """SOT-2706 — bake the deleted-comparison-table semantic-frame ``summary`` into office pair records so
+    the version_diff direct-commit lane can answer it verbatim. Same flag as the serve lane
+    (``RAG_VDIFF_DIRECT_COMMIT``); default OFF ⇒ office records carry no such ``summary`` (store
+    byte-identical to the struct-only build)."""
+    return os.getenv("RAG_VDIFF_DIRECT_COMMIT", "0").strip().lower() in _ON
+
+
+def _annotate_office_table_summary(record: dict[str, Any],
+                                   pair: "diffpair.VersionPair") -> dict[str, Any]:
+    """Attach a semantic-frame ``summary`` to a wholly-deleted pptx/docx 比較表 change (SOT-2706, idx1).
+
+    OFF (``RAG_VDIFF_DIRECT_COMMIT`` unset, or struct off) ⇒ record untouched (store byte-identical).
+    Question-independent, all-pairs (matches by slide locator, no per-file branch); the frame — deleted
+    table's slide heading + 何と何を比べる列見出し + 行(指標)見出し — is read from the OLD file via
+    :func:`diffpair.collapsed_table_frames` (no gold value). The direct-commit lane commits this verbatim so
+    the plan_fanout LLM never paraphrases the comparison frame away (SOT-2700 実証の実行フェーズ)."""
+    if not (_direct_commit_build_enabled() and diffpair.struct_enabled()):
+        return record
+    if record.get("ext") not in ("pptx", "docx"):
+        return record
+    try:
+        frames = diffpair.collapsed_table_frames(pair)
+    except Exception:  # noqa: BLE001 — annotation is best-effort; the record survives without it
+        return record
+    if not frames:
+        return record
+    for ch in record.get("changes", []) or []:
+        if ch.get("summary") or ch.get("kind") not in ("modify", "remove"):
+            continue
+        # Only the table-collapse change (its ``old`` names a 比較表 desc) is annotated; a normal per-cell
+        # modify is left alone.
+        if "比較表" not in (ch.get("old") or ""):
+            continue
+        loc = (ch.get("structural_location") or "").strip()
+        fr = frames.get(loc)
+        if fr is None:
+            for key, val in frames.items():
+                if key and loc.startswith(key):
+                    fr = val
+                    break
+        if fr is None:
+            continue
+        title = fr.get("title") or ""
+        cols = fr.get("columns") or []
+        metrics = fr.get("metrics") or []
+        core = f"「{title}」の比較表" if title else "比較表"
+        if metrics and cols:
+            detail = f"（{'・'.join(metrics)}を{'・'.join(cols)}で比較）"
+        elif metrics:
+            detail = f"（{'・'.join(metrics)}）"
+        else:
+            detail = ""
+        head = f"{loc}にあった" if loc else ""
+        after = (ch.get("new") or "").strip()
+        ch["summary"] = (f"{head}{core}{detail}が削除され、{after}" if after
+                         else f"{head}{core}{detail}が削除された")
+        attrs = ch.setdefault("attributes", [])
+        if "table_frame_summary" not in attrs:
+            attrs.append("table_frame_summary")
+    return record
+
+
 def _notebook_records(out: Path | None) -> list[dict[str, Any]]:
     """Notebook pair records, reusing prior vision-derived records for unchanged files.
 
@@ -736,7 +799,10 @@ def build(refs: list[FileRef] | None = None, *, out: Path | None = None,
     retrieval index (the caller in :mod:`src.rag.index` swallows exceptions).
     """
     pairs = enumerate_pairs()
-    records = [pair_record(pair, sources) for pair, sources in pairs]
+    # SOT-2706: office records get a deleted-comparison-table semantic-frame summary (flag-gated;
+    # byte-identical when RAG_VDIFF_DIRECT_COMMIT is off) so the direct-commit lane can answer idx1 verbatim.
+    records = [_annotate_office_table_summary(pair_record(pair, sources), pair)
+               for pair, sources in pairs]
     # SOT-2650: notebook (.ipynb) pairs — build-time cell-level diff lane (office enumerators can never
     # produce these, so the append is disjoint / additive).
     try:

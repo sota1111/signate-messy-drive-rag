@@ -508,6 +508,34 @@ _DOCX_TABLE_KEY = re.compile(r"^(t\d+):")
 _TABLE_SUMMARY_RE = re.compile(r"(改善|向上|ポイント|改善幅|要約|サマリ|まとめ|のみ)")
 
 
+def _vanished_tables(so: "_Struct", sn: "_Struct") -> list[tuple[str, list[tuple[str, str, str]]]]:
+    """pptx/docx tables (≥4 old cells) whose content wholly vanished in NEW — the shared detection used by
+    both the serve-path collapse (:func:`_collapse_deleted_tables`) and the build-time semantic-frame
+    annotation (:func:`collapsed_table_frames`, SOT-2706). Deterministic; returns each qualifying table's
+    ``(prefix, cells)`` in old-struct insertion order.
+
+    A table whose cell values REAPPEAR verbatim as new cells / flow lines was reorganized / moved, not
+    deleted (idx9: a リスク表 folded into bullet cells — every value survives, so the moved-block detector
+    must still see its removes). Only a table whose content genuinely vanished is a deletion (idx1: the
+    中間/最終 実測値 are gone, replaced by a prose 改善幅 summary that restates none of them verbatim)."""
+    tables: dict[str, list[tuple[str, str, str]]] = {}
+    for key, (label, val) in so.cells.items():
+        m = _PPTX_TABLE_KEY.match(key) or _DOCX_TABLE_KEY.match(key)
+        if m:
+            tables.setdefault(m.group(1), []).append((key, label, val))
+    new_moved = {_norm(v) for _lab, v in sn.cells.values()} | {_norm(x) for x in sn.flow}
+    new_moved.discard("")
+    out: list[tuple[str, list[tuple[str, str, str]]]] = []
+    for prefix, cells in tables.items():
+        if len(cells) < 4 or any(k in sn.cells for k, _, _ in cells):
+            continue
+        vanished = sum(1 for _k, _lab, v in cells if _norm(v) and _norm(v) not in new_moved)
+        if vanished < 0.6 * len(cells):
+            continue
+        out.append((prefix, cells))
+    return out
+
+
 def _collapse_deleted_tables(so: "_Struct", sn: "_Struct") -> tuple[list[Change], set[str], set[str]]:
     """Detect pptx/docx tables that are wholly gone in NEW and collapse each into ONE summarising change.
 
@@ -516,27 +544,11 @@ def _collapse_deleted_tables(so: "_Struct", sn: "_Struct") -> tuple[list[Change]
     normalised text of any NEW summary line consumed into a table→summary MODIFY (so the flow diff does not
     also report it as a bare addition). A table qualifies only when *every* one of its ≥4 old cells is
     absent from NEW — a partial edit is left to the normal per-cell diff. Deterministic; no gold value."""
-    tables: dict[str, list[tuple[str, str, str]]] = {}
-    for key, (label, val) in so.cells.items():
-        m = _PPTX_TABLE_KEY.match(key) or _DOCX_TABLE_KEY.match(key)
-        if m:
-            tables.setdefault(m.group(1), []).append((key, label, val))
     summaries: list[Change] = []
     skip_keys: set[str] = set()
     skip_flow: set[str] = set()
     old_flow_norm = {_norm(x) for x in so.flow}
-    # A table whose cell values REAPPEAR verbatim as new cells / flow lines was reorganized / moved, not
-    # deleted (idx9: a リスク表 folded into bullet cells — every value survives, so the moved-block detector
-    # must still see its removes). Only a table whose content genuinely vanished is a deletion (idx1: the
-    # 中間/最終 実測値 are gone, replaced by a prose 改善幅 summary that restates none of them verbatim).
-    new_moved = {_norm(v) for _lab, v in sn.cells.values()} | {_norm(x) for x in sn.flow}
-    new_moved.discard("")
-    for prefix, cells in tables.items():
-        if len(cells) < 4 or any(k in sn.cells for k, _, _ in cells):
-            continue
-        vanished = sum(1 for _k, _lab, v in cells if _norm(v) and _norm(v) not in new_moved)
-        if vanished < 0.6 * len(cells):
-            continue
+    for prefix, cells in _vanished_tables(so, sn):
         sm = re.match(r"s(\d+):", prefix)
         si = sm.group(1) if sm else ""
         loc = f"スライド{si}" if si else ""
@@ -565,6 +577,61 @@ def _collapse_deleted_tables(so: "_Struct", sn: "_Struct") -> tuple[list[Change]
         else:
             summaries.append(Change(f"{loc} 削除".strip(), desc, "", "remove"))
     return summaries, skip_keys, skip_flow
+
+
+# SOT-2706 (idx1) — leading section number ("6. " / "3.2 ") stripped from a slide heading; a parenthetical
+# model annotation ("(T04 linear)") stripped from a column header, so the comparison frame stays 中間/最終/改善幅.
+_LEADING_ENUM_RE = re.compile(r"^\s*\d+(?:[.．]\d+)*[.．、)）]?\s*")
+_PAREN_TAIL_RE = re.compile(r"\s*[（(][^（）()]*[）)]\s*$")
+
+
+def collapsed_table_frames(pair: "VersionPair") -> dict[str, dict]:
+    """SOT-2706 (idx1) — the question-independent semantic frame of every wholly-deleted pptx/docx
+    comparison table in a version pair, keyed by structural location (``"スライドN"``).
+
+    Each frame carries the table's slide heading (``title``), its header-row values (``columns`` — 何と何を
+    比べる表か, e.g. 中間/最終/改善幅), its metric row labels (``metrics``) and the header cell label — all
+    read verbatim from the OLD file so a deleted 性能比較表 can be described with its comparison frame, not
+    just its metric names. Deterministic, all-pairs, no gold value, no per-file branch. Reuses the exact
+    :func:`_vanished_tables` detection the serve-path collapse uses (lockstep). ``{}`` when nothing
+    qualifies / unreadable."""
+    try:
+        so, sn = _struct(pair.old), _struct(pair.new)
+    except Exception:  # noqa: BLE001 — best-effort; a broken read yields no frames, never raises
+        return {}
+    if so is None or sn is None:
+        return {}
+    frames: dict[str, dict] = {}
+    for prefix, cells in _vanished_tables(so, sn):
+        sm = re.match(r"s(\d+):", prefix)
+        si = sm.group(1) if sm else ""
+        loc = f"スライド{si}" if si else ""
+        labels = list(dict.fromkeys(lab for _, lab, _ in cells))
+        header_label = labels[0] if labels else ""
+        metrics = [l for l in labels if l != header_label]
+        # Column headers = the header-row cell values (label == header_label); drop the model annotation so
+        # the comparison axis reads 中間・最終・改善幅 (idx1: gold の「中間実測値と最終値」相当の語彙).
+        columns: list[str] = []
+        for _k, lab, v in cells:
+            if lab == header_label and v.strip():
+                col = _PAREN_TAIL_RE.sub("", v).strip()
+                if col and col not in columns:
+                    columns.append(col)
+        # Table title = the slide's heading in OLD — a numbered heading or a 比較 subtitle (leading number
+        # stripped). Read verbatim from the corpus, never invented; ``""`` when the slide carries none.
+        title = ""
+        for txt, flab in zip(so.flow, so.flow_labels):
+            if loc and loc not in (flab or ""):
+                continue
+            t = txt.strip()
+            if not t:
+                continue
+            if _LEADING_ENUM_RE.match(t) or "比較" in t or "vs" in t.lower():
+                title = _LEADING_ENUM_RE.sub("", t).strip()
+                break
+        frames[loc] = {"title": title, "columns": columns, "metrics": metrics,
+                       "header_label": header_label}
+    return frames
 
 
 def _structural_diff_live(pair: VersionPair) -> list[Change] | None:

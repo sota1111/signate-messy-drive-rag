@@ -982,6 +982,16 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
                 result = contact_master_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
+        # SOT-2706 — 版ペア差分 record summary の direct-commit レーン（idx1 かえで表削除意味枠 / idx22 白峰
+        # 記述統計逐語）。version_diff 型で diff store のペアが一意解決し rank0 が summary 付き SUBSTANTIVE の
+        # とき、その summary を逐語コミット（plan_fanout の言い換えを経由しない）。上位レーンが束縛できない時
+        # のみ後置。RAG_VDIFF_DIRECT_COMMIT OFF ⇒ vdiff_direct_lane.resolve() は None ⇒ byte-identical。
+        if result is None:
+            try:
+                from src.rag.agent import vdiff_direct_lane
+                result = vdiff_direct_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path
         return None
     if result is None or not _contract.is_contract(result):
