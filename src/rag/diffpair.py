@@ -575,6 +575,77 @@ def align_enabled() -> bool:
     return os.getenv("RAG_DIFF_ALIGN", "0").strip().lower() in _DIFF_ALIGN_ON
 
 
+def classify_enabled() -> bool:
+    """SOT-2695 (cycle8 C6) — two extra deterministic edit-intent rules for the diff store (default OFF).
+
+    OFF ⇒ ``rank_changes`` / ``classify_change`` are byte-identical to the champion. ON adds, purely
+    additively:
+      * **heading-label / slide-split = cosmetic (idx9).** A numbered section heading decorated with a
+        phase / quick-win sub-label 「5. 業務提言 ― クイックウィン（短期）」 (or a section split into such
+        phase-labelled slides) is demoted to ``LAYOUT_METADATA`` — a reorganization, not a
+        case-execution change. gold「該当なし」.
+      * **column-name underscore-ification = substantive (idx14).** A `a b` token present in the OLD
+        text that becomes `a_b` and no longer appears with the space form in the NEW text is surfaced as
+        a top-ranked ``SUBSTANTIVE`` schema edit, even when the struct diff buried the rename inside a
+        reorganized block (gold = loan_status / employment_length / application_type / interest_rate).
+    Every token stays corpus/diff-derived — no gold value is embedded."""
+    return os.getenv("RAG_VDIFF_CLASSIFY", "0").strip().lower() in _DIFF_ALIGN_ON
+
+
+# A numbered section heading decorated with a phase / quick-win sub-label — 「5. 業務提言 ― クイックウィン
+# （短期）」/「… ― モデル運用・ガバナンス（中期）」. Adding such a label, or splitting a section into
+# phase-labelled slides, is a cosmetic reorganization, not a case-execution change (idx9). All three
+# markers are required (numbered heading + heading-bar separator + phase word) so ordinary content
+# never matches.
+_HEADING_NUM = re.compile(r"^\s*\d+\s*[.．、]\s*\S")
+_HEADING_SEP = re.compile(r"[―—‐–−]")  # horizontal-bar / dash heading-label separators
+_PHASE_LABEL = re.compile(r"(短期|中期|長期|即時|直ちに|クイック\s*・?\s*ウィン|quick\s*win)", re.I)
+# A snake_case identifier token (column / schema name) — 「loan_status」.
+_SNAKE_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+")
+
+
+def _is_heading_label_change(c: "Change") -> bool:
+    """True when a change only decorates a numbered section heading with a phase/quick-win sub-label,
+    or splits it into a phase-labelled slide — cosmetic reorganization (idx9). A modify matches only
+    when the label was *appended* to the pre-existing heading (after ⊇ before)."""
+    if c.kind not in ("add", "modify"):
+        return False
+    after = nfc(c.after or "")
+    if not (_HEADING_NUM.match(after) and _HEADING_SEP.search(after) and _PHASE_LABEL.search(after)):
+        return False
+    if c.kind == "modify":
+        before = nfc(c.before or "").strip()
+        return bool(before) and _norm(after).startswith(_norm(before))
+    return True
+
+
+def _fulltext(st: "_Struct") -> str:
+    """All readable text of a parsed document (flowing paragraphs + table cell values), newline-joined."""
+    return "\n".join(list(st.flow) + [raw for _label, raw in st.cells.values()])
+
+
+def _schema_underscore_renames(pair: VersionPair) -> list["Change"]:
+    """Column-name / schema-vocabulary edits that turned a spaced token into snake_case between versions.
+
+    Deterministic and question-independent: for every snake_case token `a_b` in the NEW document, if the
+    spaced form `a b` appears in the OLD text but NOT in the NEW text, that column was renamed to
+    underscore notation (idx14). Returns one modify ``Change`` per renamed column (verbatim tokens read
+    from the corpus — no gold string). Empty when either side is unreadable."""
+    try:
+        so, sn = _struct(pair.old), _struct(pair.new)
+    except Exception:  # noqa: BLE001 — a broken read must degrade to no synthetic change
+        return []
+    if so is None or sn is None:
+        return []
+    old_text, new_text = _fulltext(so), _fulltext(sn)
+    renamed: list[str] = []
+    for tok in dict.fromkeys(_SNAKE_TOKEN.findall(new_text)):  # dedup, keep first-seen order
+        spaced = tok.replace("_", " ")
+        if spaced in old_text and spaced not in new_text and tok in new_text:
+            renamed.append(tok)
+    return [Change("データ列名", tok.replace("_", " "), tok, "modify") for tok in renamed]
+
+
 @dataclass
 class RankedChange:
     change: Change
@@ -675,6 +746,11 @@ def classify_change(c: Change, moved: set[str] | None = None) -> RankedChange:
     # rank it as layout re-presentation regardless of the figures it restates.
     if c.kind == "add" and _SUMMARY_HEADING.search(nfc(location + " " + text)):
         return RankedChange(c, LAYOUT_METADATA, 0.30, location, subst + ["summary_representation"])
+
+    # A numbered heading decorated with a phase / quick-win sub-label (or a section split into such
+    # phase-labelled slides) is a cosmetic reorganization, not a case-execution change (idx9, flag-gated).
+    if classify_enabled() and _is_heading_label_change(c):
+        return RankedChange(c, LAYOUT_METADATA, 0.28, location, subst + ["heading_label"])
 
     if subst:
         tie = 0.02 * min(len(subst), 3)
@@ -819,6 +895,15 @@ def rank_changes(pair: VersionPair) -> list[RankedChange] | None:
     changes = _atomic_changes(pair)
     if changes is None:
         return None
+    # SOT-2695 (idx14, flag-gated): the struct diff aligns at the block level, so a column-name
+    # underscore-ification can be buried inside a reorganized STEP block and never surface as a cell
+    # modify. Recover it deterministically from the full-text token sets and prepend it as an explicit
+    # schema edit (classify_change then marks it SUBSTANTIVE via its snake_case identifier feature).
+    if classify_enabled():
+        existing = {(_norm(c.before), _norm(c.after), c.kind) for c in changes}
+        for rc in _schema_underscore_renames(pair):
+            if (_norm(rc.before), _norm(rc.after), rc.kind) not in existing:
+                changes.append(rc)
     add_norms = {_norm(_changed_text(c)) for c in changes if c.kind == "add"}
     rem_norms = {_norm(_changed_text(c)) for c in changes if c.kind == "remove"}
     moved = {k for k in (add_norms & rem_norms) if k}

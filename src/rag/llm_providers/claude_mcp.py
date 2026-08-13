@@ -345,6 +345,57 @@ _SPECIAL_PROVISION_CONTRACT = (
 )
 
 
+def _vdiff_classify_enabled() -> bool:
+    """SOT-2695 (cycle8 C6) — 版差分の実質変更分類契約 (prompt-only, 既定 OFF)。
+
+    diff_store 側の分類補正(`RAG_VDIFF_CLASSIFY`, diffpair)と対で使う言い回し契約。cycle7 wrong:
+    idx9 は見出しラベル追加・スライド分割(体裁再編)を実質変更として挙げた(gold「該当なし」)、idx14 は
+    データ列名のアンダースコア表記化(loan_status 等)を surface に落とし STEP 再編を実質変更として答えた
+    (gold は列名変更のみ)。値後処理はせず、SUBSTANTIVE が無い体裁差は「該当なし」、列名/スキーマ語彙の
+    変更は最優先の実質変更、と Sonnet backend に縛る。既定 OFF ⇒ 影響なし。"""
+    return os.getenv("RAG_VDIFF_CLASSIFY", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+_VDIFF_CLASSIFY_CONTRACT = (
+    "\n\n【版差分の実質変更分類契約】旧版→新版で『案件遂行に関連する実質的変更』を問われたときは、"
+    "事前確定済みの版ペア差分(diff_lookup)の intent を基準に分類する。"
+    "(1)実質変更なしの即断: diff_lookup の evidence が substantive_change=false(または verdict_hint に"
+    "『該当なし』)を返したら、変更が見出しラベル追加・スライド分割・体裁再構成だけで実質的変更が無い"
+    "ということなので、それ以上ファイルを探索せず直ちに answer=『該当なし』で submit する。見出しへの"
+    "ラベル付加(『5. 業務提言』→『5. 業務提言 ― クイックウィン（短期）』)やフェーズ別スライドへの分割は"
+    "実質変更として挙げない。"
+    "(2)列名・スキーマ語彙の変更を最優先: データ列名やスキーマ語彙の変更(スペース→アンダースコア表記化、"
+    "identifier 特徴の SUBSTANTIVE で intent が最上位)が挙がっている場合は、それが案件遂行に関わる実質"
+    "変更であり、STEP・節の統合/再構成(LAYOUT)より優先して回答の主題にする。回答は『データ列名を"
+    "アンダースコア表記に修正：<変更後の列名(アンダースコア形)を全て読点区切りで列挙>』の形にし、変更後の"
+    "列名を主語にする(『A → B』の羅列や STEP 再構成の説明を主にしない)。列名は diff_lookup の値を原文"
+    "どおり写経し、問われた範囲を越える主張は足さない(補足は evidence へ)。"
+)
+
+
+def _report_series_enabled() -> bool:
+    """SOT-2695 (cycle8 C6, idx16) — 報告資料の系列スコープ＋最小集合契約 (prompt-only, 既定 OFF)。
+
+    cycle7 wrong idx16「中間報告資料の黄×赤」は、同じ 05.会議/報告資料 フォルダにある M01 キックオフ
+    (2025-04-09, 4,620,000) と M02 中間レビュー(2025-04-29, 0.589) の両方を列挙した(gold は中間＝M02 の
+    0.589 のみ)。各報告資料は自己申告のチェックポイント名(M01=キックオフ／M02=中間レビュー／『中間分析
+    報告』『最終報告』)を本文冒頭に持つので、質問が指す系列を質問非依存に判定して系列外文書を除ける。
+    値後処理はせず、Sonnet backend に系列スコープと最小集合を縛るだけ・既定 OFF ⇒ 影響なし。"""
+    return os.getenv("RAG_REPORT_SERIES", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+_REPORT_SERIES_CONTRACT = (
+    "\n\n【報告資料の系列スコープ契約】『中間報告』『最終報告』『キックオフ』『定例』など特定の報告系列を"
+    "指定して値を抽出する問いでは、対象を系列で先に絞る。各報告資料は本文冒頭に自己申告のチェックポイント/"
+    "表題(例『チェックポイント: M01（キックオフ・前提確認会）』『対象チェックポイント: M02（中間レビュー会）』"
+    "『…中間分析報告です』『最終報告』)を持つので、これを質問非依存の系列ラベルとして読む: キックオフ/M01 は"
+    "中間ではない、中間レビュー/中間(分析)報告/M02 は中間、最終報告は最終。質問が『中間報告資料』を指すなら"
+    "中間に該当する文書のみから抽出し、キックオフや定例など系列外の文書の値は含めない。該当文書が一意に"
+    "定まるときは、その文書から抽出した最小集合だけを答える(別系列の文書や余分な値を足さない)。系列判定の"
+    "根拠が本文から得られないときのみ従来どおり全該当を挙げる(値の捏造・gold への当て推量はしない)。"
+)
+
+
 def _harness_system_suffix() -> str:
     base = (
         "\n\n【実行環境(dev)】ツールは MCP 経由で `mcp__investigator__<ツール名>` として提供される"
@@ -364,6 +415,10 @@ def _harness_system_suffix() -> str:
         base += _VDIFF_NORMALIZE_CONTRACT
     if _special_provision_enabled():
         base += _SPECIAL_PROVISION_CONTRACT
+    if _vdiff_classify_enabled():
+        base += _VDIFF_CLASSIFY_CONTRACT
+    if _report_series_enabled():
+        base += _REPORT_SERIES_CONTRACT
     return base
 
 
