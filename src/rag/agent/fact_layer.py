@@ -459,6 +459,15 @@ def _derived_ranking_tool() -> "tuple[str, str, dict[str, Any], Callable[..., An
         return None
 
 
+def _analysis_metrics_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | None":
+    """SOT-2698 分析出力メタデータ (metrics enum / 適用ハイパラ) lookup tool (default OFF ⇒ None)。"""
+    try:
+        from src.rag.agent import analysis_metrics_lane
+        return analysis_metrics_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return None
+
+
 def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     """The 4 fact-layer tools, or ``[]`` when the layer is OFF (⇒ tool set / MCP surface byte-identical)."""
     if not enabled():
@@ -470,7 +479,7 @@ def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     optional += _doc_reach_tools()
     optional += _raw_artifact_tools()
     optional += [x for x in (_xref_coverage_tool(), _nb_chart_tool(), _analysis_xref_tool(),
-                            _staged_metrics_tool(), _derived_ranking_tool())
+                            _staged_metrics_tool(), _derived_ranking_tool(), _analysis_metrics_tool())
                  if x is not None]
     return optional + [
         (CASE_FILTER,
@@ -942,6 +951,16 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
             try:
                 from src.rag.agent import derived_ranking_lane
                 result = derived_ranking_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
+        # SOT-2698 — 分析出力メタデータ レーン（metrics.json feature_selection の数値交互作用特徴量列名
+        # idx32 / 実際に適用される勾配ブースティングのハイパラ idx61）。上位レーンが束縛できない時のみ後置。
+        # RAG_ANALYSIS_METRICS_ENUM / RAG_ANALYSIS_CONFIG_HYPERPARAM 既定 OFF ⇒ resolve() は None ⇒
+        # byte-identical。証拠は analysis_metrics_enum_store / raw_artifact_store(applied_hyperparams)由来。
+        if result is None:
+            try:
+                from src.rag.agent import analysis_metrics_lane
+                result = analysis_metrics_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path
