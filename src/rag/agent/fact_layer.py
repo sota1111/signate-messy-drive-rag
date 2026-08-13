@@ -241,12 +241,20 @@ def _diff_lookup(question: str = "", old: str = "", new: str = "", project: str 
             if c.get(k) not in (None, []):
                 item[k] = c[k]
         value.append(item)
-    return _contract.make(
-        value, engine="diff_store",
-        evidence={"applicable": True, "resolved": True, "old_file": rec.get("old_rel"),
-                  "new_file": rec.get("new_rel"), "version_basis": rec.get("basis"),
-                  "total_changes": len(rec.get("changes") or []), "after_filter": len(changes)},
-        scheme="version-pair-diff")
+    evidence = {"applicable": True, "resolved": True, "old_file": rec.get("old_rel"),
+                "new_file": rec.get("new_rel"), "version_basis": rec.get("basis"),
+                "total_changes": len(rec.get("changes") or []), "after_filter": len(changes)}
+    # SOT-2695 (idx9, flag-gated): give the model a decisive stop signal. When the resolved pair carries
+    # NO substantive change after filtering (every diff is a heading-label / slide-split / layout
+    # reorganization), surface that verdict explicitly so the answer is 「該当なし」 instead of an open
+    # search that times out. Only when RAG_VDIFF_CLASSIFY is on (the classification that demotes those
+    # cosmetic edits is baked into the store under the same flag) — OFF ⇒ this key is absent.
+    if os.getenv("RAG_VDIFF_CLASSIFY", "0").strip().lower() in ("1", "true", "yes", "on"):
+        substantive = sum(1 for c in changes if c.get("intent") == "SUBSTANTIVE")
+        evidence["substantive_change"] = substantive > 0
+        if substantive == 0:
+            evidence["verdict_hint"] = "実質的変更なし（見出しラベル追加・スライド分割・体裁再構成のみ）→ 該当なし"
+    return _contract.make(value, engine="diff_store", evidence=evidence, scheme="version-pair-diff")
 
 
 def _resolve_pair_from_question(diff_store, question: str) -> list[dict[str, Any]]:
