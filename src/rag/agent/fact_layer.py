@@ -432,6 +432,15 @@ def _nb_chart_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | N
         return None
 
 
+def _analysis_xref_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | None":
+    """SOT-2691 分析成果物クロス参照 lookup tool (default OFF ⇒ None ⇒ surface byte-identical)。"""
+    try:
+        from src.rag.agent import analysis_xref_lane
+        return analysis_xref_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return None
+
+
 def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     """The 4 fact-layer tools, or ``[]`` when the layer is OFF (⇒ tool set / MCP surface byte-identical)."""
     if not enabled():
@@ -442,7 +451,8 @@ def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
                 if x is not None]
     optional += _doc_reach_tools()
     optional += _raw_artifact_tools()
-    optional += [x for x in (_xref_coverage_tool(), _nb_chart_tool()) if x is not None]
+    optional += [x for x in (_xref_coverage_tool(), _nb_chart_tool(), _analysis_xref_tool())
+                 if x is not None]
     return optional + [
         (CASE_FILTER,
          "案件マスタ(全案件×標準属性, 各セル出典付き)を属性一致でフィルタし、該当案件を出典付きで返す。"
@@ -877,6 +887,16 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
             try:
                 from src.rag.agent import rate_table_lane
                 result = rate_table_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
+        # SOT-2691 — 分析成果物クロス参照レーン（最終報告の未完事項ID列挙 idx60 / One-Hot 閾値による対象
+        # カテゴリ列 idx73 / 選択特徴量のうち ENG-FT 数 idx53）。上位レーンが束縛できない時のみ後置。
+        # RAG_ANALYSIS_XREF OFF ⇒ analysis_xref_lane.resolve() は None ⇒ byte-identical。idx36 は中間段階の
+        # フル精度が成果物に無いため未配線（honest abstain, SOT-2687）。
+        if result is None:
+            try:
+                from src.rag.agent import analysis_xref_lane
+                result = analysis_xref_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path
