@@ -100,6 +100,82 @@ def test_negative_controls_do_not_fire(monkeypatch, synth_store):
     assert L.resolve("白峰の欠損値がある行数は何行ですか") is None
 
 
+# --------------------------------------------------------- SOT-2688 (cycle7 K5, idx91) 相関の符号対応
+_Q91 = "京橋信用ソリューションズの顧客データにおいて、目的変数と最も強い負の相関を持つカラムは何ですか。"
+_Q91_POS = "京橋信用ソリューションズの顧客データにおいて、目的変数と最も強い正の相関を持つカラムは何ですか。"
+
+
+@pytest.fixture()
+def kyobashi_store(monkeypatch):
+    # 京橋 の実ストア形状を縮約: campaign(最も負), duration(|r|最大・正), id は _ID_LIKE で除外。
+    rows = [_row("京橋信用ソリューションズ株式会社",
+                 with_target={"campaign": -0.0761178358, "day": -0.0310576382,
+                              "duration": 0.4013904294, "pdays": 0.1009298906, "id": -0.0035554832},
+                 top_feature={"feature": "duration", "r": 0.4013904294, "abs_r": 0.4013904294})]
+    # 京橋 の target は y（ヘルパの既定 charges を上書き）。
+    rows[0]["correlations"]["target"] = "y"
+    monkeypatch.setattr(L._dm, "load", lambda path=None: rows)
+    return rows
+
+
+def test_corr_sign_off_keeps_abs_max(monkeypatch, kyobashi_store):
+    # RAG_CORR_SIGN OFF ⇒ 符号修飾を見ず |r| 最大 = duration（idx91 は現行どおり wrong=byte-identical）。
+    monkeypatch.setenv("RAG_DERIVED_COVERAGE", "1")
+    monkeypatch.delenv("RAG_CORR_SIGN", raising=False)
+    assert L.corr_sign_enabled() is False
+    r = L.resolve(_Q91)
+    assert r is not None and r["value"] == "duration"
+
+
+def test_corr_sign_on_negative_picks_most_negative(monkeypatch, kyobashi_store):
+    # RAG_CORR_SIGN ON + 負修飾 ⇒ r<0 の厳密単独最小 = campaign（gold）。
+    monkeypatch.setenv("RAG_DERIVED_COVERAGE", "1")
+    monkeypatch.setenv("RAG_CORR_SIGN", "1")
+    r = L.resolve(_Q91)
+    assert r is not None and r["value"] == "campaign"
+    assert r["evidence"]["sign"] == "neg" and r["evidence"]["pearson_r"] < 0
+
+
+def test_corr_sign_on_positive_picks_most_positive(monkeypatch, kyobashi_store):
+    # 正修飾 ⇒ r>0 の厳密単独最大 = duration。
+    monkeypatch.setenv("RAG_DERIVED_COVERAGE", "1")
+    monkeypatch.setenv("RAG_CORR_SIGN", "1")
+    r = L.resolve(_Q91_POS)
+    assert r is not None and r["value"] == "duration"
+    assert r["evidence"]["sign"] == "pos" and r["evidence"]["pearson_r"] > 0
+
+
+def test_corr_sign_on_no_modifier_keeps_abs_max(monkeypatch, synth_store):
+    # 符号修飾のない idx4 は RAG_CORR_SIGN ON でも従来どおり |r| 最大 = bmi（回帰ゼロ）。
+    monkeypatch.setenv("RAG_DERIVED_COVERAGE", "1")
+    monkeypatch.setenv("RAG_CORR_SIGN", "1")
+    r = L.resolve(_Q4)
+    assert r is not None and r["value"] == "bmi"
+    assert r["evidence"]["sign"] == "abs"
+
+
+def test_corr_sign_negative_none_when_all_positive(monkeypatch):
+    # 負修飾だが負の相関が無い ⇒ None（precision-first — 誤って正の値を返さない）。
+    rows = [_row("京橋信用ソリューションズ株式会社",
+                 with_target={"duration": 0.40, "pdays": 0.10})]
+    rows[0]["correlations"]["target"] = "y"
+    monkeypatch.setattr(L._dm, "load", lambda path=None: rows)
+    monkeypatch.setenv("RAG_DERIVED_COVERAGE", "1")
+    monkeypatch.setenv("RAG_CORR_SIGN", "1")
+    assert L.resolve(_Q91) is None
+
+
+def test_corr_sign_negative_defers_on_tie(monkeypatch):
+    # 最小 r が拮抗 ⇒ 単独でないので None。
+    rows = [_row("京橋信用ソリューションズ株式会社",
+                 with_target={"campaign": -0.20, "day": -0.20, "duration": 0.40})]
+    rows[0]["correlations"]["target"] = "y"
+    monkeypatch.setattr(L._dm, "load", lambda path=None: rows)
+    monkeypatch.setenv("RAG_DERIVED_COVERAGE", "1")
+    monkeypatch.setenv("RAG_CORR_SIGN", "1")
+    assert L.resolve(_Q91) is None
+
+
 def test_tool_missing_ranking_and_off(monkeypatch, synth_store):
     monkeypatch.delenv("RAG_DERIVED_COVERAGE", raising=False)
     assert L.tool() is None                                  # OFF ⇒ surface byte-identical

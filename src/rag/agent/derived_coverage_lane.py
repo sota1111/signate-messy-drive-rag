@@ -41,6 +41,10 @@ _CORP_PREFIX = re.compile(r"^(株式会社|医療法人社団|医療法人|有�
 _CORR_CUE = re.compile(r"相関|corr(?:elation)?")
 _HIGHEST_CUE = re.compile(r"最も高い|一番高い|最大|最も強い|最も相関|highest|最も大きい")
 _FEATURE_CUE = re.compile(r"特徴量|説明変数|変数|カラム|feature")
+# SOT-2688 (cycle7 K5, idx91) — 相関の符号修飾。負→ r<0 の厳密単独最小、正→ r>0 の厳密単独最大。
+# 修飾なしは従来どおり |r| 最大（idx4 を保存）。RAG_CORR_SIGN OFF ⇒ 常に修飾なし＝byte-identical。
+_NEG_CORR_CUE = re.compile(r"負の相関|負相関|マイナスの相関|マイナス相関|逆相関|negative")
+_POS_CORR_CUE = re.compile(r"正の相関|正相関|プラスの相関|プラス相関|positive")
 
 # --- idx24「1つでも欠損値がある行数が最も多い案件」cues -------------------------------------------
 _MISSING_CUE = re.compile(r"欠損|欠測|missing|na値|null")
@@ -52,6 +56,15 @@ _CASE_CUE = re.compile(r"案件|企業|会社|プロジェクト")
 def enabled() -> bool:
     """serve レーン／ツールを有効にするか。既定 OFF（``RAG_DERIVED_COVERAGE``）⇒ byte-identical。"""
     return os.getenv("RAG_DERIVED_COVERAGE", "0").strip().lower() in _ON
+
+
+def corr_sign_enabled() -> bool:
+    """SOT-2688 (cycle7 K5, idx91) — 相関レーンの符号対応を有効にするか。既定 OFF（``RAG_CORR_SIGN``）。
+
+    OFF ⇒ :func:`_top_corr_lane` は符号修飾を一切見ず従来どおり |r| 最大のみ ⇒ idx4 も idx91 も
+    現行と byte-identical（idx91 は wrong のまま）。ON かつ質問に負/正修飾がある時だけ符号対応が発火する。
+    """
+    return os.getenv("RAG_CORR_SIGN", "0").strip().lower() in _ON
 
 
 def _norm(text: Any) -> str:
@@ -86,15 +99,19 @@ def _bind_unique_case(rows: list[dict[str, Any]], q: str) -> dict[str, Any] | No
 
 
 # --------------------------------------------------------------------------- idx4 lane
-def _top_corr_feature(rec: dict[str, Any]) -> "tuple[str, float, float] | None":
-    """レコードの with_target を再走査し、id 的な列を除いた |r| の **厳密単独最大** 特徴量を返す。
+def _top_corr_feature(rec: dict[str, Any], *, sign: "str | None" = None) -> "tuple[str, float, float] | None":
+    """レコードの with_target を再走査し、id 的な列を除いた相関特徴量を **厳密単独** で返す。
 
-    top と 2 位の |r| が同値（拮抗）なら None（precision-first — 単独最大でなければ確定しない）。
+    ``sign`` (SOT-2688):
+    * ``None`` — 従来どおり |r| の **厳密単独最大**（top と 2 位の |r| が同値なら None）。
+    * ``"neg"`` — r<0 に限定した **厳密単独最小 r**（最も強い負の相関）。負の相関が無ければ None。
+    * ``"pos"`` — r>0 に限定した **厳密単独最大 r**（最も強い正の相関）。正の相関が無ければ None。
+    いずれも拮抗（1・2 位が同値）なら None（precision-first — 単独でなければ確定しない）。
     """
     corr = rec.get("correlations") or {}
     with_target = corr.get("with_target") or {}
     target = corr.get("target")
-    ranked: list[tuple[float, str, float]] = []
+    signed: list[tuple[float, str]] = []  # (r, col) — id 的な列/target を除いた符号付き相関
     for col, r in with_target.items():
         if r is None:
             continue
@@ -107,13 +124,42 @@ def _top_corr_feature(rec: dict[str, Any]) -> "tuple[str, float, float] | None":
         cl = str(col).strip().lower()
         if cl in _dm._ID_LIKE or col == target:
             continue
-        ranked.append((abs(rv), col, rv))
-    if not ranked:
+        signed.append((rv, col))
+    if not signed:
         return None
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    if len(ranked) >= 2 and ranked[0][0] == ranked[1][0]:  # 拮抗 ⇒ 単独最大でない
+    if sign == "neg":
+        cand = [(rv, col) for rv, col in signed if rv < 0]
+        if not cand:
+            return None
+        cand.sort(key=lambda x: x[0])                       # 最も負（昇順）が先頭
+        if len(cand) >= 2 and cand[0][0] == cand[1][0]:      # 拮抗 ⇒ 単独最小でない
+            return None
+        rv, col = cand[0]
+        return (abs(rv), col, rv)
+    if sign == "pos":
+        cand = [(rv, col) for rv, col in signed if rv > 0]
+        if not cand:
+            return None
+        cand.sort(key=lambda x: x[0], reverse=True)          # 最も正（降順）が先頭
+        if len(cand) >= 2 and cand[0][0] == cand[1][0]:      # 拮抗 ⇒ 単独最大でない
+            return None
+        rv, col = cand[0]
+        return (abs(rv), col, rv)
+    ranked = sorted(((abs(rv), col, rv) for rv, col in signed), key=lambda x: x[0], reverse=True)
+    if len(ranked) >= 2 and ranked[0][0] == ranked[1][0]:    # |r| 拮抗 ⇒ 単独最大でない
         return None
     return ranked[0]
+
+
+def _corr_sign(q: str) -> "str | None":
+    """質問文（正規化済み）から相関の符号修飾を判定。RAG_CORR_SIGN OFF なら常に None（byte-identical）。"""
+    if not corr_sign_enabled():
+        return None
+    if _NEG_CORR_CUE.search(q):
+        return "neg"
+    if _POS_CORR_CUE.search(q):
+        return "pos"
+    return None
 
 
 def _top_corr_lane(question_raw: str, rows: list[dict[str, Any]]):
@@ -123,15 +169,21 @@ def _top_corr_lane(question_raw: str, rows: list[dict[str, Any]]):
     rec = _bind_unique_case(rows, q)
     if rec is None:
         return None
-    top = _top_corr_feature(rec)
+    sign = _corr_sign(q)
+    top = _top_corr_feature(rec, sign=sign)
     if top is None:
         return None
     _abs_r, feature, r = top
     corr = rec.get("correlations") or {}
+    basis = {
+        None: "correlations.with_target |r| 単独最大（id 的な列は特徴量から除外）",
+        "neg": "correlations.with_target r<0 の厳密単独最小（最も強い負の相関・id 的な列は除外）",
+        "pos": "correlations.with_target r>0 の厳密単独最大（最も強い正の相関・id 的な列は除外）",
+    }[sign]
     evidence = {
         "case": rec.get("case_id"), "train_file": (rec.get("sources") or {}).get("train_file"),
-        "target": corr.get("target"), "feature": feature, "pearson_r": r,
-        "basis": "correlations.with_target |r| 単独最大（id 的な列は特徴量から除外）",
+        "target": corr.get("target"), "feature": feature, "pearson_r": r, "sign": sign or "abs",
+        "basis": basis,
     }
     return _result(feature, selection="top_correlated_feature", evidence=evidence)
 

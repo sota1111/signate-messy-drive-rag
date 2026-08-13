@@ -456,3 +456,38 @@ def test_decimal_unit_strip_flag_default_off():
         os.environ.pop("RAG_DECIMAL_UNIT_STRIP", None)
         if prev is not None:
             os.environ["RAG_DECIMAL_UNIT_STRIP"] = prev
+
+
+# ------------------------------------------------ SOT-2688 (cycle7 K5, idx29) ビン範囲の区間記法→チルダ書式
+_BIN_Q = ("恒一会 かえで総合病院のtrain.xlsx内のTPのヒストグラムで、3番目にカウント数が多いビンの"
+          "範囲を小数第6位までで答えてください。")
+
+
+def test_bin_range_tilde_idx29_case():
+    out, fired = fmt.naturalize_bin_range(_BIN_Q, "(6.088138, 6.288138]")
+    assert out == "6.088138 ~ 6.288138"
+    assert fired == ["bin_range_tilde"]
+
+
+def test_bin_range_all_bracket_variants():
+    for raw in ["(6.088138, 6.288138]", "[6.088138, 6.288138)", "(6.088138,6.288138)",
+                "[6.088138, 6.288138]", "(6.088138、6.288138]"]:
+        out, fired = fmt.naturalize_bin_range(_BIN_Q, raw)
+        assert out == "6.088138 ~ 6.288138" and fired == ["bin_range_tilde"]
+
+
+def test_bin_range_preserves_numeric_tokens():
+    out, _ = fmt.naturalize_bin_range(_BIN_Q, "(-1.5, 2.0]")
+    assert out == "-1.5 ~ 2.0"
+
+
+def test_bin_range_requires_range_question():
+    # 範囲/ビンを問わない問いは触らない（座標等の巻き添え防止）。
+    out, fired = fmt.naturalize_bin_range("値を答えてください", "(6.088138, 6.288138]")
+    assert out == "(6.088138, 6.288138]" and fired == []
+
+
+def test_bin_range_noop_on_non_interval_answer():
+    for v in ["6.088138 ~ 6.288138", "6.288138", "範囲は (6.0, 6.2] です", ""]:
+        out, fired = fmt.naturalize_bin_range(_BIN_Q, v)
+        assert out == v and fired == []
