@@ -61,6 +61,45 @@ def test_deterministic_lanes(monkeypatch):
     ]
 
 
+def _sohk_row(provisions=()):
+    return {"case_id": "医療法人社団 蒼泉会 ひがし丘総合病院", "abbrev": "SOHK", "operands": {
+        "contract_type": _cell("time_and_materials"), "settlement_type": _cell("月次精算"),
+        "estimated_effort_hours": _cell(170.0), "actual_effort_hours": _cell(170.0),
+        "time_rate_excl_tax": _cell(25000.0), "tax_rate": _cell(0.1),
+        "rounding_unit_hours": _cell(0.5), "estimate_amount_incl_tax": _cell(4_675_000),
+        "confirmed_amount_incl_tax": _cell(4_675_000),
+        "special_settlement_provisions": _cell(list(provisions)),
+    }}
+
+
+def test_billing_reduction_scenario(monkeypatch):
+    # idx23: ACTH 155h10m → 30分切上 155.5h → 税込請求 4,276,250 → 見込 4,675,000 との差額 398,750。
+    monkeypatch.setenv("RAG_CASE_FINANCE_STORE", "1")
+    monkeypatch.setattr(store, "load", lambda path=None: [_sohk_row()])
+    q = ("ひがし丘の案件において、案件終了後のACTHが155時間10分だった場合の税込請求額は"
+         "提案書内で記載の見込税込金額と比べて何円の減額になりますか。")
+    assert lane.resolve(q)["value"] == "398,750円"
+
+
+def test_special_provision_synthesis(monkeypatch):
+    # idx78: >200時間 の特別条項が契約に無い → 一般規定要点を gold と同形で合成（付加情報なし）。
+    monkeypatch.setenv("RAG_CASE_FINANCE_STORE", "1")
+    monkeypatch.setattr(store, "load", lambda path=None: [_sohk_row()])
+    q = ("ひがし丘の契約条件において、ACTHが200時間を超えた場合の精算方法に関する規定内容を答えてください。")
+    assert lane.resolve(q)["value"] == (
+        "ACTHが200時間を超えた場合の特別な精算規定はなく、実績工数に時間単価25,000円(税別)を乗じ"
+        "消費税を加算して月次で精算する(30分単位・切上げ、上限なし)。")
+
+
+def test_special_provision_defers_when_threshold_clause_exists(monkeypatch):
+    # 質問の閾値に該当する時間閾値条項が契約にあれば「特別規定なし」と決めつけない（fail-closed）。
+    monkeypatch.setenv("RAG_CASE_FINANCE_STORE", "1")
+    monkeypatch.setattr(store, "load",
+                        lambda path=None: [_sohk_row(provisions=[{"threshold_hours": 200.0}])])
+    q = ("ひがし丘の契約条件において、ACTHが200時間を超えた場合の精算方法に関する規定内容を答えてください。")
+    assert lane.resolve(q) is None
+
+
 def test_non_matching_questions_defer(monkeypatch):
     monkeypatch.setenv("RAG_CASE_FINANCE_STORE", "1")
     monkeypatch.setattr(store, "load", lambda path=None: _rows())
