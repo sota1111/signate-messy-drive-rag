@@ -49,6 +49,8 @@ def extract(ref: FileRef, *, caption_images: bool = False) -> ExtractedDoc:
                 text = office.extract_xlsx(ref, data)
             else:
                 text = office.extract_pptx(ref, data)
+            # NB: the SOT-2684 image-OCR prepend lives INSIDE the format extractors (office/plain), so the
+            # read_office / read_pdf tools — which call those extractors directly — also carry it.
             return ExtractedDoc(ref, text, ext, encrypted=encrypted)
 
         if ext == "pdf":
