@@ -62,18 +62,25 @@ def extract_pdf(ref: FileRef) -> str:
     text = "\n".join(out)
     from src.rag.index import ocr_store
 
+    result: str | None = None
     if ocr_store.enabled() and ocr_store.is_effectively_image_only(text):
         stored = ocr_store.lookup(ref)
         if stored and stored.strip():
-            return stored
-    if not _text_layer_body(text).strip():
+            result = stored
+    if result is None and not _text_layer_body(text).strip():
         from src.rag.extract import vision
 
         if vision.pdf_ocr_enabled():
             ocr = vision.ocr_image_pdf(ref.path)
             if ocr and ocr.strip():
-                return ocr
-    return text
+                result = ocr
+    if result is None:
+        result = text
+    # SOT-2684: prepend the build-time image-OCR store (per-page OCR of text-poor pages) so read_pdf /
+    # file_grep / FTS reach it (OFF ⇒ unchanged ⇒ byte-identical). Leads the text ⇒ survives the 8000-char
+    # read_pdf truncation.
+    from src.rag.index import image_ocr_store
+    return image_ocr_store.prepend(ref, result)
 
 
 def extract_csv(ref: FileRef) -> str:

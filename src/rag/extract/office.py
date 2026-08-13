@@ -142,7 +142,8 @@ def extract_docx(ref: FileRef, data: bytes | None) -> str:
         lines.insert(0, "【太字箇所】" + " / ".join(terms))
     lines.extend(_font_emphasis_lines(ref))
     lines.extend(_format_event_lines(ref))
-    return "\n".join(lines)
+    from src.rag.index import image_ocr_store  # SOT-2684 — prepend EMF/画像 OCR (OFF ⇒ byte-identical)
+    return image_ocr_store.prepend(ref, "\n".join(lines))
 
 
 # ---------------- XLSX ----------------
@@ -596,4 +597,5 @@ def extract_pptx(ref: FileRef, data: bytes | None) -> str:
                 for r in shape.table.rows:
                     out.append(" | ".join(c.text for c in r.cells))
     out.extend(_font_emphasis_lines(ref))
-    return "\n".join(out)
+    from src.rag.index import image_ocr_store  # SOT-2684 — prepend embedded-media OCR (OFF ⇒ byte-identical)
+    return image_ocr_store.prepend(ref, "\n".join(out))

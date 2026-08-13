@@ -384,6 +384,28 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  nb chart store skipped: {type(e).__name__}: {e}")
 
+    # Image-OCR evidence store (SOT-2684 / cycle7 K1): recover evidence locked in images that text
+    # extraction can't reach — docx/pptx embedded EMF/WMF metafiles (text records read deterministically,
+    # no vision) and image/text-poor PDF pages (rasterised + Gemini vision OCR). The serve path merges the
+    # baked chunks into the doc-reach lookup tools with no genai call. Like ocr_store this MAY spend vision
+    # (PDF pages / raster media), so it gates the build behind RAG_IMAGE_OCR_STORE_BUILD (default OFF ⇒
+    # skipped, prior artifact kept); runtime consultation is opt-in (RAG_IMAGE_OCR_STORE) so the champion
+    # serve path is byte-identical by default.
+    try:
+        from src.rag.index import image_ocr_store
+        if image_ocr_store.build_enabled():
+            ios = image_ocr_store.build(refs)
+            if verbose:
+                rep = ios["report"]
+                print(f"  image ocr store: {ios['records']} records over {rep['docs']} docs "
+                      f"(metafile_text={rep['metafile_text']}, media_ocr={rep['media_ocr']}, "
+                      f"pdf_page_ocr={rep['pdf_page_ocr']}) -> {image_ocr_store.default_out_path()}")
+        elif verbose:
+            print("  image ocr store: build skipped (RAG_IMAGE_OCR_STORE_BUILD off; existing artifact kept)")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  image ocr store skipped: {type(e).__name__}: {e}")
+
     # Document distillation store (SOT-2658 / Cerebras 型検索基盤 2/5): distil every document (xlsx per-
     # sheet) once at build time via Gemini (前処理限定の使用) into a normalized "この文書は何に答えられるか"
     # record (answerable_questions / summary / key_facts / mentioned_*), with an anti-hallucination guard
