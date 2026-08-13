@@ -319,6 +319,30 @@ _VDIFF_NORMALIZE_CONTRACT = (
 )
 
 
+def _special_provision_enabled() -> bool:
+    """SOT-2688 (cycle7 K5, idx78) — 「特別規定なし＋一般規定内容」合成回答契約 (prompt-only)。
+
+    cycle6 の simple_lookup wrong idx78 は evidence に「ACTH/200時間超の特別な精算規定なし＋適用される
+    一般規定 6.1〜6.3 条(25,000円/時・税別・月次精算…)」を完全に取得済みなのに answer を「該当なし」だけで
+    終え、gold「特別規定なし＋一般規定の内容」と judge 不一致になった。『規定内容を答えよ』型で特定条件の
+    専用規定が不在かつ一般規定を取得済みのとき、不在＋一般規定内容を1回答に合成させる。値後処理はせず、
+    Sonnet backend の system suffix に契約を足すだけ(RAG_NONE_BARE と同型)・既定 OFF。RAG_NONE_BARE(該当なし
+    裸形式)とは対象が異なる(あちらは要求物そのものが不在の問い)ため衝突しない。
+    """
+    return os.getenv("RAG_SPECIAL_PROVISION", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+_SPECIAL_PROVISION_CONTRACT = (
+    "\n\n【特別規定不在＋一般規定合成契約】ある特定条件(特定の項目・数値しきい値を超えた場合など)についての"
+    "『規定内容を答えよ』型の問いで、(1)その条件に対する専用(特別)規定が確定的に存在せず、かつ(2)その場合に"
+    "適用される一般規定・原則を証拠として取得済みのときは、answer を単なる『該当なし』で終えない。"
+    "『(当該条件に対する)特別な規定はなく、適用される一般規定は〈取得済みの一般規定の内容を原文どおり写経〉』"
+    "の形で、特別規定の不在と一般規定の内容を1つの回答に合成する。一般規定を取得できていない場合に限り従来"
+    "どおり『該当なし』/棄権とする(内容を捏造しない)。要求物そのものが存在しない問い(該当なし契約の対象)は"
+    "この契約の対象外。"
+)
+
+
 def _harness_system_suffix() -> str:
     base = (
         "\n\n【実行環境(dev)】ツールは MCP 経由で `mcp__investigator__<ツール名>` として提供される"
@@ -336,6 +360,8 @@ def _harness_system_suffix() -> str:
         base += _EXACT_LABEL_CONTRACT
     if _vdiff_normalize_enabled():
         base += _VDIFF_NORMALIZE_CONTRACT
+    if _special_provision_enabled():
+        base += _SPECIAL_PROVISION_CONTRACT
     return base
 
 
@@ -688,6 +714,15 @@ def investigate_question(question: str, *, tools: Sequence[AgentTool],
                                  "rules": list((strip_tel or {}).get("rules", [])) + dfired}
                     answer = Answer(answer=dstripped, confidence=answer.confidence,
                                     evidence=answer.evidence, method=answer.method + " +decimal_unit_strip")
+            # SOT-2688 — ビン範囲の区間記法→チルダ書式 (RAG_BIN_RANGE_FORMAT, default OFF). 値保存(書式のみ):
+            # ビン/範囲を問う問いへの区間式回答 (6.088138, 6.288138] を gold の「6.088138 ~ 6.288138」へ整形 (idx29)。
+            if _fmt.bin_range_format_enabled():
+                branged, bfired = _fmt.naturalize_bin_range(question, answer.answer)
+                if bfired:
+                    strip_tel = {"applied": True,
+                                 "rules": list((strip_tel or {}).get("rules", [])) + bfired}
+                    answer = Answer(answer=branged, confidence=answer.confidence,
+                                    evidence=answer.evidence, method=answer.method + " +bin_range")
         inv = Investigation(
             question=question, answer=answer, iterations=iterations, tool_calls=tool_calls,
             usage=usage, model=model_label, elapsed_s=elapsed, stop_reason=stop_reason,

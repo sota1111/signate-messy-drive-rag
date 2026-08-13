@@ -386,6 +386,45 @@ def strip_decimal_spec_unit(question: str, value: str) -> "tuple[str, list[str]]
     return new, rules
 
 
+# --- SOT-2688 (cycle7 K5, idx29) — ビン範囲の区間記法 → チルダ形式 naturalization ----------------
+# cycle6 の chart_read wrong idx29 は値・ビン位置とも正しい ((6.088138, 6.288138]) のに、区間記法のまま
+# 回答して gold の「6.088138 ~ 6.288138」(チルダ形式) と judge 不一致になった。値保存(両端の数値トークンを
+# そのまま温存)で区間記法をチルダ形式へ書式変換するだけの層。
+#   * 質問がビン/範囲を問うている時だけ発火(範囲を要求しない問いの座標等は触らない);
+#   * 回答が丸ごと 1 個の区間式 (a, b] / [a, b) / (a,b) / [a,b] の時だけ変換(余分な散文があれば no-op);
+#   * ``RAG_BIN_RANGE_FORMAT`` (default OFF ⇒ serve byte-identical)。
+_BIN_RANGE_Q_RE = re.compile(r"範囲|ビン|レンジ|区間|ヒストグラム|bin|range")
+_BIN_RANGE_FULL_RE = re.compile(
+    r"^\s*[\(\[]\s*(?P<lo>-?\d[\d,]*(?:\.\d+)?)\s*[,，、]\s*(?P<hi>-?\d[\d,]*(?:\.\d+)?)\s*[\)\]]\s*$")
+
+
+def bin_range_format_enabled() -> bool:
+    """SOT-2688 — ビン範囲の区間記法→チルダ書式 naturalization が発火するか (``RAG_BIN_RANGE_FORMAT``, default OFF)。"""
+    return _env_flag("RAG_BIN_RANGE_FORMAT", False)
+
+
+def naturalize_bin_range(question: str, value: str) -> "tuple[str, list[str]]":
+    """区間記法のビン範囲回答を gold のチルダ形式『A ~ B』へ書式変換する、値保存の naturalization (SOT-2688)。
+
+    Returns ``(new_value, fired_rules)`` — 変化なしなら ``fired_rules`` は空。質問がビン/範囲を問い、かつ
+    回答が丸ごと単一の区間式のときだけ発火して両端 (lo, hi) をそのまま『lo ~ hi』へ整形する(数値トークンは
+    改変しない)。区間式でない回答・範囲を問わない問い・複数値混在はいずれも no-op。
+    """
+    rules: list[str] = []
+    if not value:
+        return value, rules
+    if not _BIN_RANGE_Q_RE.search(question or ""):
+        return value, rules
+    m = _BIN_RANGE_FULL_RE.match(str(value))
+    if not m:
+        return value, rules
+    new = f"{m.group('lo')} ~ {m.group('hi')}"
+    if new == str(value):
+        return value, rules
+    rules.append("bin_range_tilde")
+    return new, rules
+
+
 def _parse_small_int(raw: str) -> "int | None":
     """Parse a small positive integer written in ASCII/fullwidth digits or 一〜十 kanji (precision桁 use)."""
     s = raw.translate(_FULLWIDTH_DIGITS).strip()
