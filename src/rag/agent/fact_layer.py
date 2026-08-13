@@ -397,6 +397,15 @@ def _raw_artifact_tools() -> "list[tuple[str, str, dict[str, Any], Callable[...,
         return []
 
 
+def _xref_coverage_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | None":
+    """SOT-2687 クロス参照カバレッジ lookup tool (default OFF ⇒ None ⇒ surface byte-identical)。"""
+    try:
+        from src.rag.agent import xref_coverage_lane
+        return xref_coverage_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return None
+
+
 def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     """The 4 fact-layer tools, or ``[]`` when the layer is OFF (⇒ tool set / MCP surface byte-identical)."""
     if not enabled():
@@ -407,6 +416,7 @@ def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
                 if x is not None]
     optional += _doc_reach_tools()
     optional += _raw_artifact_tools()
+    optional += [x for x in (_xref_coverage_tool(),) if x is not None]
     return optional + [
         (CASE_FILTER,
          "案件マスタ(全案件×標準属性, 各セル出典付き)を属性一致でフィルタし、該当案件を出典付きで返す。"
@@ -787,6 +797,15 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
             try:
                 from src.rag.agent import schedule_lane
                 result = schedule_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
+        # SOT-2687 — クロス参照カバレッジ拡張（leaderboard 上位2件設定差分 idx62 / 段階メトリクスF1差 idx36 /
+        # 案件ローマ字別名×アクション遷移 idx34）の決定論直答レーン。上位レーンが束縛できない時のみ後置。
+        # RAG_XREF_COVERAGE OFF ⇒ xref_coverage_lane.resolve() は None ⇒ byte-identical。
+        if result is None:
+            try:
+                from src.rag.agent import xref_coverage_lane
+                result = xref_coverage_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path
