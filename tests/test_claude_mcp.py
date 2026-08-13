@@ -441,7 +441,8 @@ def test_special_provision_contract_appended_when_flag_on(monkeypatch):
     suffix = claude_mcp._harness_system_suffix()
     assert "特別規定不在＋一般規定合成契約" in suffix
     assert "『該当なし』で終えない" in suffix           # do not stop at bare「該当なし」
-    assert "原文どおり写経" in suffix                    # transcribe the general provision verbatim
+    assert "数値・単位・条件は原文どおり" in suffix       # keep the general provision's numbers/terms exact
+    assert "簡潔に述べ" in suffix                        # but state it concisely (idx78 verbosity fix)
     assert "内容を捏造しない" in suffix                  # abstain if general provision not retrieved
     # composes with — and stays distinct from — the RAG_NONE_BARE bare-none contract (no conflict).
     monkeypatch.setenv("RAG_NONE_BARE", "1")
