@@ -387,6 +387,15 @@ def _schedule_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | N
         return None
 
 
+def _plan_coverage_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | None":
+    """SOT-2692 計画・スケジュール表カバレッジ lookup tool (default OFF ⇒ None ⇒ surface byte-identical)."""
+    try:
+        from src.rag.agent import plan_coverage_lane
+        return plan_coverage_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return None
+
+
 def _doc_reach_tools() -> "list[tuple[str, str, dict[str, Any], Callable[..., Any]]]":
     """SOT-2677 文書テーブル/全文チャンク lookup ツール群 (default OFF ⇒ [] ⇒ surface byte-identical)。"""
     try:
@@ -429,7 +438,7 @@ def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
         return []
     optional = [x for x in (_report_attr_tool(), _case_finance_tool(), _action_row_tool(),
                             _visual_tool(), _heading_page_tool(), _derived_coverage_tool(),
-                            _schedule_tool())
+                            _schedule_tool(), _plan_coverage_tool())
                 if x is not None]
     optional += _doc_reach_tools()
     optional += _raw_artifact_tools()
@@ -814,6 +823,15 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
             try:
                 from src.rag.agent import schedule_lane
                 result = schedule_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
+        # SOT-2692 — 計画・スケジュール表カバレッジの決定論直答レーン（担当者別 想定工数÷担当タスク数 の
+        # 最大 idx79 / 提案書 第N週の実施項目 idx88）。上位レーンが束縛できない時のみ後置。
+        # RAG_PLAN_COVERAGE OFF ⇒ plan_coverage_lane.resolve() は None ⇒ byte-identical。
+        if result is None:
+            try:
+                from src.rag.agent import plan_coverage_lane
+                result = plan_coverage_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
         # SOT-2687 — クロス参照カバレッジ拡張（leaderboard 上位2件設定差分 idx62 / 段階メトリクスF1差 idx36 /
