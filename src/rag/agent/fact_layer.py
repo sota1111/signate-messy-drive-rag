@@ -406,6 +406,15 @@ def _xref_coverage_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]
         return None
 
 
+def _nb_chart_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | None":
+    """SOT-2685 ノートブック描画チャート lookup tool (default OFF ⇒ None ⇒ surface byte-identical)。"""
+    try:
+        from src.rag.agent import nb_chart_lane
+        return nb_chart_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return None
+
+
 def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     """The 4 fact-layer tools, or ``[]`` when the layer is OFF (⇒ tool set / MCP surface byte-identical)."""
     if not enabled():
@@ -416,7 +425,7 @@ def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
                 if x is not None]
     optional += _doc_reach_tools()
     optional += _raw_artifact_tools()
-    optional += [x for x in (_xref_coverage_tool(),) if x is not None]
+    optional += [x for x in (_xref_coverage_tool(), _nb_chart_tool()) if x is not None]
     return optional + [
         (CASE_FILTER,
          "案件マスタ(全案件×標準属性, 各セル出典付き)を属性一致でフィルタし、該当案件を出典付きで返す。"
@@ -806,6 +815,15 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
             try:
                 from src.rag.agent import xref_coverage_lane
                 result = xref_coverage_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
+        # SOT-2685 — ノートブック描画チャートストアの決定論直答レーン（目的変数分析 y軸目盛り最大値 idx56 /
+        # 日付分析 件数最多日 idx66）。上位レーンが束縛できない時のみ後置。RAG_NB_CHART_STORE OFF ⇒
+        # nb_chart_lane.resolve() は None ⇒ byte-identical。
+        if result is None:
+            try:
+                from src.rag.agent import nb_chart_lane
+                result = nb_chart_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path

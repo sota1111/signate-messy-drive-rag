@@ -361,6 +361,29 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  visual store skipped: {type(e).__name__}: {e}")
 
+    # Notebook chart-image store (SOT-2685 / cycle7 K2): read every 01_eda notebook's drawn chart images
+    # once at build time (Gemini vision — 前処理限定の使用) into structured drawing attributes (y-axis tick
+    # values / max tick, series category→value, peak category) with an independent data-side cross-check
+    # (date-analysis day-count argmax / target value_counts argmax), so the serve path can answer
+    # drawing-attribute questions (idx56 y-axis max tick / idx66 peak day) under RAG_NB_CHART_STORE with no
+    # genai call. Like ocr_store this SPENDS vision, so it gates the build behind RAG_NB_CHART_STORE_BUILD
+    # (default OFF ⇒ skipped, prior artifact kept); runtime consultation is opt-in (RAG_NB_CHART_STORE) so
+    # the champion serve path is byte-identical by default.
+    try:
+        from src.rag.index import nb_chart_store
+        if nb_chart_store.build_enabled():
+            ncs = nb_chart_store.build(refs)
+            if verbose:
+                rep = ncs["report"]
+                print(f"  nb chart store: {ncs['records']} records over {rep['notebooks']} notebooks "
+                      f"(verified={rep['verified']}, figure={rep['figure_sourced']}, "
+                      f"embedded={rep['embedded_sourced']}) -> {nb_chart_store.default_out_path()}")
+        elif verbose:
+            print("  nb chart store: build skipped (RAG_NB_CHART_STORE_BUILD off; existing artifact kept)")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  nb chart store skipped: {type(e).__name__}: {e}")
+
     # Document distillation store (SOT-2658 / Cerebras 型検索基盤 2/5): distil every document (xlsx per-
     # sheet) once at build time via Gemini (前処理限定の使用) into a normalized "この文書は何に答えられるか"
     # record (answerable_questions / summary / key_facts / mentioned_*), with an anti-hallucination guard
