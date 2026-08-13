@@ -406,6 +406,26 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  image ocr store skipped: {type(e).__name__}: {e}")
 
+    # xlsx formula-trace store (SOT-2686 / cycle7 K3): read every xlsx once at build time and bake (a) each
+    # yellow-highlighted formula cell's referenced data row with its full attribute map (id + every
+    # column→value), so the serve path can trace an error-formula to the property it targets and read that
+    # property's attribute (idx47 建設年→YEAR BUILT), and (b) every documented regression coefficient table
+    # (intercept + column coefficients) applied per index value over the matching data sheet, so the serve
+    # path can return the predicted value for a given index=N (idx83) — both with no genai call. LLM-free
+    # (openpyxl reads formulas/cell values only); runtime consultation is opt-in (RAG_XLSX_FORMULA_TRACE) so
+    # the champion serve path is byte-identical by default.
+    try:
+        from src.rag.index import xlsx_formula_trace
+        xft = xlsx_formula_trace.build(refs)
+        if verbose:
+            rep = xft["report"]
+            print(f"  xlsx formula trace: {xft['records']} records "
+                  f"(highlight_formulas={rep['highlight_formulas']}, regressions={rep['regressions']}) "
+                  f"-> {xlsx_formula_trace.default_out_path()}")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  xlsx formula trace skipped: {type(e).__name__}: {e}")
+
     # Document distillation store (SOT-2658 / Cerebras 型検索基盤 2/5): distil every document (xlsx per-
     # sheet) once at build time via Gemini (前処理限定の使用) into a normalized "この文書は何に答えられるか"
     # record (answerable_questions / summary / key_facts / mentioned_*), with an anti-hallucination guard
