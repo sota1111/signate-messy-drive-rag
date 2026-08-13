@@ -441,6 +441,24 @@ def _analysis_xref_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]
         return None
 
 
+def _staged_metrics_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | None":
+    """SOT-2699 段階メトリクス フル精度 F1 差 lookup tool (default OFF ⇒ None ⇒ surface byte-identical)。"""
+    try:
+        from src.rag.agent import staged_metrics_lane
+        return staged_metrics_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return None
+
+
+def _derived_ranking_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | None":
+    """SOT-2699 統計表 rank/ratio lookup tool (default OFF ⇒ None ⇒ surface byte-identical)。"""
+    try:
+        from src.rag.agent import derived_ranking_lane
+        return derived_ranking_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return None
+
+
 def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     """The 4 fact-layer tools, or ``[]`` when the layer is OFF (⇒ tool set / MCP surface byte-identical)."""
     if not enabled():
@@ -451,7 +469,8 @@ def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
                 if x is not None]
     optional += _doc_reach_tools()
     optional += _raw_artifact_tools()
-    optional += [x for x in (_xref_coverage_tool(), _nb_chart_tool(), _analysis_xref_tool())
+    optional += [x for x in (_xref_coverage_tool(), _nb_chart_tool(), _analysis_xref_tool(),
+                            _staged_metrics_tool(), _derived_ranking_tool())
                  if x is not None]
     return optional + [
         (CASE_FILTER,
@@ -906,6 +925,23 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
             try:
                 from src.rag.agent import formula_apply_lane
                 result = formula_apply_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
+        # SOT-2699 — 段階メトリクス フル精度 F1 差レーン（中間報告 vs 最終報告の F1 全精度差 idx36）。
+        # 上位レーンが束縛できない時のみ後置。RAG_STAGED_METRICS OFF ⇒ staged_metrics_lane.resolve() は
+        # None ⇒ byte-identical。フル精度が焼けた案件だけ発火（analysis_xref_lane は idx36 を未配線のまま）。
+        if result is None:
+            try:
+                from src.rag.agent import staged_metrics_lane
+                result = staged_metrics_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
+        # SOT-2699 — 統計表 rank/ratio レーン（統計表の序数値の比/差 idx99）。上位レーンが束縛できない時のみ
+        # 後置。RAG_DERIVED_RANKING OFF ⇒ derived_ranking_lane.resolve() は None ⇒ byte-identical。
+        if result is None:
+            try:
+                from src.rag.agent import derived_ranking_lane
+                result = derived_ranking_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path

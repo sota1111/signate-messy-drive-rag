@@ -68,6 +68,50 @@ def test_extract_selected_features_eng_ft_classification():
     assert got["eng_ft_count"] == 6
 
 
+# --------------------------------------------------------------------------- SOT-2699 staged metrics
+_INTERIM_REPORT = "\n".join([
+    "分析進捗報告書",
+    "本報告の分析段階: interim（中間）",
+    "モデル評価は f1_macro を主指標とし、T04 の f1_macro = 0.7329671168078127、"
+    "accuracy = 0.7357142857142858 を記録しています。",
+    "ベスト（可視範囲）: trial_index = 4",
+    "f1_macro (primary): 0.7329671168078127",
+    "他の可視試行の f1_macro:",
+    "T01: 0.6854980146919636",
+    "T02: 0.7126899909960438",
+    "auc_roc: 0.8250532501536466",
+])
+
+
+def test_extract_report_metrics_assigns_nearest_metric():
+    got = S.extract_report_metrics(_INTERIM_REPORT)
+    # f1_macro の全出現が f1_macro へ、accuracy/auc_roc は別メトリクスへ振り分けられる。
+    f1 = [h["value"] for h in got["f1_macro"]]
+    assert 0.7329671168078127 in f1 and 0.6854980146919636 in f1
+    assert 0.7357142857142858 not in f1  # accuracy は f1_macro に混ざらない
+    assert got["accuracy"][0]["value"] == 0.7357142857142858
+    assert got["auc_roc"][0]["value"] == 0.8250532501536466
+    # ベスト（max）はフル精度（16 桁）。
+    best = max(got["f1_macro"], key=lambda h: h["value"])
+    assert best["raw"] == "0.7329671168078127"
+    assert best["decimals"] >= S.FULL_PRECISION_MIN_DECIMALS
+
+
+def test_report_stage_and_date():
+    assert S._report_stage(_INTERIM_REPORT) == "interim"
+    assert S._report_stage("本報告の分析段階: final（最終）") == "final"
+    assert S._report_stage("段階の記載なし") is None
+    assert S._report_date("報告資料_2025-09-16.docx") == "2025-09-16"
+    assert S._report_date("no date here") is None
+
+
+def test_full_precision_min_decimals_rejects_rounded():
+    # 8 桁丸め leaderboard 値は full precision と認めない（SOT-2687 の 1e-9 差 Incorrect 回避）。
+    rounded = S.extract_report_metrics("f1_macro = 0.73296712")
+    best = max(rounded["f1_macro"], key=lambda h: h["value"])
+    assert best["decimals"] < S.FULL_PRECISION_MIN_DECIMALS
+
+
 def test_load_missing_is_empty(tmp_path):
     assert S.load(tmp_path / "nope.jsonl") == []
 
