@@ -38,13 +38,16 @@ def load_ledger(path: Path = LEDGER_PATH, scored_only: bool = True) -> list[dict
             if not scored_only:
                 rows.append(row)
             continue
+        # An operational submission may be recorded before the leaderboard score and
+        # calibration fields are available.  Scored-only callers must ignore that
+        # pending row before enforcing the schema for calibratable observations.
+        if scored_only and row.get("real_public_score") in (None, "pending (check web)"):
+            continue
         for key in ("submission", "local_score", "real_public_score", "archetype_committed"):
             if key not in row:
                 raise ValueError(f"{path}:{line_no}: missing {key}")
         if not isinstance(row["archetype_committed"], dict):
             raise ValueError(f"{path}:{line_no}: archetype_committed must be an object")
-        if scored_only and row["real_public_score"] is None:
-            continue  # prediction recorded but SIGNATE score not yet returned
         rows.append(row)
     if len(rows) < 2:
         raise ValueError("at least two scored submissions are required")
