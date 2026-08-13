@@ -1021,6 +1021,16 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
                 result = pptx_money_page_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
+        # SOT-2702 — 「別契約」と明記された役割の決定論抽出レーン（idx52 型）。既存 text_fts を質問非依存で
+        # 引き、``X（別契約）`` 形の役割ラベルが project 名指しで一意に解決した時だけ X を逐語直答する（新 store
+        # なし）。project フィルタ緩和は retrieval 到達を回復したが LLM 経路が 2 回とも棄権したため決定論昇格。
+        # 上位レーンが束縛できない時のみ後置。RAG_SEP_CONTRACT_ROLE OFF ⇒ resolve() は None ⇒ byte-identical。
+        if result is None:
+            try:
+                from src.rag.agent import sep_contract_lane
+                result = sep_contract_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path
         return None
     if result is None or not _contract.is_contract(result):
