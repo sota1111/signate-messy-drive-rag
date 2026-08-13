@@ -1,6 +1,7 @@
 """Deterministic answer lane for the question-independent case-finance store (SOT-2654)."""
 from __future__ import annotations
 
+import os
 import re
 import unicodedata
 from typing import Any, Callable
@@ -10,9 +11,16 @@ from src.rag.tools import contract as _contract
 
 CASE_FINANCE_LOOKUP = "case_finance_lookup"
 
+_ON = {"1", "true", "yes", "on"}
+
 
 def _norm(value: Any) -> str:
     return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or ""))).casefold()
+
+
+def _diff_enabled() -> bool:
+    """Opt-in gate for the generic 見込 vs 確定/最終請求 amount-difference lane (default OFF)."""
+    return os.getenv("RAG_CASE_FINANCE_DIFF", "0").strip().lower() in _ON
 
 
 def _cell(row: dict[str, Any], key: str) -> dict[str, Any]:
@@ -192,7 +200,70 @@ def _special_provision_synthesis(q: str, rows: list[dict[str, Any]]) -> dict[str
                    contract="simple_lookup")
 
 
-_LANES = (_aobm_reduction, _monthly_top3, _max_effort_variance, _counterfactual,
+# idx6: 「提案時の税込み見込み金額と最終請求金額の差額はいくらですか」型の単純差額。案件バインドは質問中の
+# トークン白書きではなく store 全レコードの case_id / 略称マッチで行う（質問非依存・全案件対象）。fail-closed:
+# 見込税込金額と確定税込金額の双方が store に整数円で存在するときのみ回答し、差額>0 は「N,NNN円」・0 は「0円」。
+# gold ハードコードなし（差額は store 既存オペランドの決定論算術）。新フラグ RAG_CASE_FINANCE_DIFF でゲート。
+_EST_TOKENS = ("見込金額", "見込み金額", "見込税込金額", "見積金額", "提案金額")
+_CONF_TOKENS = ("最終請求金額", "確定金額", "請求金額", "最終金額")
+# per-hour / 除算を含む設問は _aobm_reduction 等の専用レーンの領分なので単純差額では扱わない。
+_DIFF_EXCLUDE = ("割", "除", "あたり", "1時間", "毎", "単価")
+
+
+def _bind_case(q: str, rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """質問非依存の案件バインド: store 全レコードの case_id/略称が質問に現れる行を一意に選ぶ。
+
+    最長一致（正規化した case_id 全体・空白分割トークン・略称）でスコアし、最長が複数行で並ぶ（曖昧）ときは
+    None（fail-closed）。短すぎるトークン（<4）は誤爆源なので採用しない。"""
+    best: dict[str, Any] | None = None
+    best_len = 0
+    tie = False
+    for r in rows:
+        score = 0
+        cid = _norm(r.get("case_id"))
+        if len(cid) >= 4 and cid in q:
+            score = len(cid)
+        else:
+            for tok in re.split(r"\s+", str(r.get("case_id") or "")):
+                tn = _norm(tok)
+                if len(tn) >= 4 and tn in q:
+                    score = max(score, len(tn))
+        ab = _norm(r.get("abbrev"))
+        if len(ab) >= 4 and ab in q:
+            score = max(score, len(ab))
+        if score > best_len:
+            best, best_len, tie = r, score, False
+        elif score == best_len and score > 0:
+            tie = True
+    return None if best is None or tie else best
+
+
+def _amount_difference(q: str, rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not _diff_enabled():
+        return None
+    if "差額" not in q or any(t in q for t in _DIFF_EXCLUDE):
+        return None
+    if not (any(t in q for t in _EST_TOKENS) and any(t in q for t in _CONF_TOKENS)):
+        return None
+    rec = _bind_case(q, rows)
+    if rec is None:
+        return None
+    est = _cell(rec, "estimate_amount_incl_tax").get("value")
+    conf = _cell(rec, "confirmed_amount_incl_tax").get("value")
+    if est is None or conf is None:
+        return None
+    if abs(est - round(est)) > 1e-9 or abs(conf - round(conf)) > 1e-9:  # 整数円のみ（fail-closed）
+        return None
+    diff = abs(int(round(est)) - int(round(conf)))
+    return _result(f"{diff:,}円", "estimate_vs_confirmed_amount_difference",
+                   {"case": rec.get("case_id"),
+                    "estimate_incl_tax": int(round(est)), "confirmed_incl_tax": int(round(conf)),
+                    "operands": {k: _cell(rec, k) for k in
+                                 ("estimate_amount_incl_tax", "confirmed_amount_incl_tax")},
+                    "formula": "|見込金額(税込) − 確定/最終請求金額(税込)|"})
+
+
+_LANES = (_aobm_reduction, _amount_difference, _monthly_top3, _max_effort_variance, _counterfactual,
           _billing_reduction_scenario, _special_provision_synthesis)
 
 

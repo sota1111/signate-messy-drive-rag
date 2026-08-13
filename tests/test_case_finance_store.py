@@ -105,3 +105,62 @@ def test_non_matching_questions_defer(monkeypatch):
     monkeypatch.setattr(store, "load", lambda path=None: _rows())
     assert lane.resolve("AOMINEの実績工数を教えて") is None
     assert lane.resolve("RATEの変更日はいつですか") is None
+
+
+_IDX6_Q = "蒼泉会 ひがし丘総合病院案件において、提案時の税込み見込み金額と最終請求金額の差額はいくらですか。"
+
+
+def test_amount_difference_idx6_zero(monkeypatch):
+    # idx6: 見込税込 4,675,000 と確定税込 4,675,000 の差額 → gold「0円」。案件バインドは case_id 名一致。
+    monkeypatch.setenv("RAG_CASE_FINANCE_STORE", "1")
+    monkeypatch.setenv("RAG_CASE_FINANCE_DIFF", "1")
+    monkeypatch.setattr(store, "load", lambda path=None: [_sohk_row()])
+    res = lane.resolve(_IDX6_Q)
+    assert res["value"] == "0円"
+    assert res["method"]["selection"] == "estimate_vs_confirmed_amount_difference"
+    assert res["evidence"]["case"] == "医療法人社団 蒼泉会 ひがし丘総合病院"
+
+
+def test_amount_difference_nonzero_thousands_format(monkeypatch):
+    # 差額>0 は「N,NNN円」の桁区切り。gold ハードコードなし（store オペランドの決定論算術）。
+    monkeypatch.setenv("RAG_CASE_FINANCE_STORE", "1")
+    monkeypatch.setenv("RAG_CASE_FINANCE_DIFF", "1")
+    row = _sohk_row()
+    row["operands"]["confirmed_amount_incl_tax"] = _cell(3_443_000)  # 見込 4,675,000 − 確定 3,443,000
+    monkeypatch.setattr(store, "load", lambda path=None: [row])
+    q = "ひがし丘総合病院案件の、提案時の見込金額と最終請求金額の差額はいくらですか。"
+    assert lane.resolve(q)["value"] == "1,232,000円"
+
+
+def test_amount_difference_default_off_byte_identical(monkeypatch):
+    # RAG_CASE_FINANCE_DIFF 未設定 → レーンは不活性（既存挙動と byte-identical）。
+    monkeypatch.setenv("RAG_CASE_FINANCE_STORE", "1")
+    monkeypatch.delenv("RAG_CASE_FINANCE_DIFF", raising=False)
+    monkeypatch.setattr(store, "load", lambda path=None: [_sohk_row()])
+    assert lane.resolve(_IDX6_Q) is None
+
+
+def test_amount_difference_defers_on_per_hour_and_missing_operand(monkeypatch):
+    monkeypatch.setenv("RAG_CASE_FINANCE_DIFF", "1")
+    rows = _rows()
+    q37 = ("aobmにおいて、見込金額（税込）と確定金額（税込）の差を、esthとacthの差で割った"
+           "1時間あたりの減少金額を計算してください。")
+    # per-hour 除算設問（idx37 型）は単純差額レーンの領分外 → 新レーンは defer（_aobm_reduction が処理）。
+    assert lane._amount_difference(lane._norm(q37), rows) is None
+    # idx37 は既存 _aobm_reduction が引き続き回答する（レーン衝突なし）。
+    monkeypatch.setenv("RAG_CASE_FINANCE_STORE", "1")
+    monkeypatch.setattr(store, "load", lambda path=None: rows)
+    assert lane.resolve(
+        "AOBMにおいて、見込金額（税込）と確定金額（税込）の差を、ESTHとACTHの差で割った"
+        "1時間あたりの減少金額を計算してください。")["value"] == "22,000円"
+    # 案件名が質問に無い → バインド不能 → defer（fail-closed）。
+    assert lane.resolve("提案時の見込金額と最終請求金額の差額はいくらですか。") is None
+
+
+def test_amount_difference_defers_when_operand_missing(monkeypatch):
+    monkeypatch.setenv("RAG_CASE_FINANCE_STORE", "1")
+    monkeypatch.setenv("RAG_CASE_FINANCE_DIFF", "1")
+    row = _sohk_row()
+    row["operands"]["confirmed_amount_incl_tax"] = {"value": None, "source": None}
+    monkeypatch.setattr(store, "load", lambda path=None: [row])
+    assert lane.resolve(_IDX6_Q) is None
