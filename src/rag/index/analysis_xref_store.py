@@ -40,7 +40,7 @@ from src.rag.corpus import FileRef, nfc
 from src.rag.extract import office, passwords, plain
 
 SCHEMA = "analysis_xref_store"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # SOT-2699: staged_metrics に 05.会議/報告資料 のフル精度段階メトリクスを追加
 _ON = {"1", "true", "yes", "on"}
 
 _LOAD_CACHE: dict[str, list[dict[str, Any]]] = {}
@@ -56,6 +56,91 @@ _SHAPE_FILL_RE = re.compile(r"【図形塗り:[^】]*】")
 _SLIDE_MARK_RE = re.compile(r"^\[スライド")
 # 実装ソースの One-Hot 閾値定数。
 _MAX_CAT_UNIQUE_RE = re.compile(r"MAX_CATEGORICAL_UNIQUE\s*=\s*(\d+)")
+
+# --- SOT-2699 段階メトリクス（05.会議/報告資料）フル精度抽出 -----------------------------------------
+# メトリクス名（longest-first alternation で非重複マッチ。各出現を canonical 名へ写像）。
+_METRIC_KW_RE = re.compile(
+    r"(f1[_\s]?macro|マクロf1|f1マクロ|auc[_\s]?roc|accuracy|正解率|precision|recall|再現率|"
+    r"適合率|brier|f1)",
+    re.IGNORECASE)
+# フル精度浮動小数（小数 6 桁以上＝「実測値」— 8 桁丸め leaderboard 値も一旦拾い、下流で桁数判定する）。
+_FULLNUM_RE = re.compile(r"\d\.\d{6,}")
+# メトリクスと値の許容距離（"f1_macro (primary): 0.73…" の間隔でも拾える窓）。
+_METRIC_VALUE_MAX_GAP = 48
+# 「フル精度」と認める最小の小数桁数（8桁丸め leaderboard 値を弾き、SOT-2687 の 1e-9 差 Incorrect を防ぐ）。
+FULL_PRECISION_MIN_DECIMALS = 10
+# 報告の分析段階宣言（interim/中間 か final/最終）。
+_STAGE_RE = re.compile(r"(?:分析段階|報告段階|stage)[：:\s]*?(interim|final|中間|最終)", re.IGNORECASE)
+_DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+
+
+def _canon_metric(token: str) -> str:
+    t = unicodedata.normalize("NFKC", token).replace(" ", "").replace("_", "").lower()
+    if t in ("f1macro", "マクロf1", "f1マクロ"):
+        return "f1_macro"
+    if t == "aucroc":
+        return "auc_roc"
+    if t in ("accuracy", "正解率"):
+        return "accuracy"
+    if t in ("precision", "適合率"):
+        return "precision"
+    if t in ("recall", "再現率"):
+        return "recall"
+    if t == "brier":
+        return "brier"
+    if t == "f1":
+        return "f1"
+    return t
+
+
+def extract_report_metrics(text: str) -> dict[str, list[dict[str, Any]]]:
+    """報告テキストから (メトリクス名 → [{"raw","value","decimals"}...]) をフル精度で抽出する（決定論）。
+
+    各フル精度値に、**直前で最も近い** メトリクス語（``_METRIC_VALUE_MAX_GAP`` 以内）を割り当てる。
+    ``f1_macro = 0.7329…`` / ``f1_macro (primary): 0.7329…`` / ``他の可視試行の f1_macro: T01: 0.68…`` を
+    すべて f1_macro に、``accuracy = 0.7357…`` を accuracy に正しく振り分ける（近接語優先）。丸め値も拾うが
+    ``decimals`` を同梱し、レーン側でフル精度判定できる。
+    """
+    kws = [(m.end(), _canon_metric(m.group(1))) for m in _METRIC_KW_RE.finditer(text)]
+    out: dict[str, list[dict[str, Any]]] = {}
+    for fm in _FULLNUM_RE.finditer(text):
+        pos = fm.start()
+        best: tuple[int, str] | None = None
+        for end, name in kws:
+            if end <= pos and (pos - end) <= _METRIC_VALUE_MAX_GAP:
+                if best is None or end > best[0]:
+                    best = (end, name)
+        if best is None:
+            continue
+        raw = fm.group()
+        decimals = len(raw.split(".", 1)[1]) if "." in raw else 0
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        out.setdefault(best[1], []).append({"raw": raw, "value": value, "decimals": decimals})
+    return out
+
+
+def _report_stage(text: str) -> str | None:
+    """報告の分析段階（``interim`` / ``final``）を段階宣言行から判定。無ければ None。"""
+    m = _STAGE_RE.search(text)
+    if not m:
+        return None
+    tok = m.group(1).lower()
+    if tok in ("interim", "中間"):
+        return "interim"
+    if tok in ("final", "最終"):
+        return "final"
+    return None
+
+
+def _report_date(*candidates: str) -> str | None:
+    for c in candidates:
+        m = _DATE_RE.search(str(c or ""))
+        if m:
+            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return None
 
 
 def enabled() -> bool:
@@ -310,12 +395,31 @@ def extract_selected_features(text: str, original_columns: Sequence[str]) -> dic
             "original_columns": list(original_columns)}
 
 
-# --------------------------------------------------------------------------- idx36 staged metrics (infra)
-def _build_staged_metrics(project: str, refs: Sequence[FileRef]) -> dict[str, Any] | None:
-    """metrics.json の最終 F1（フル精度）と leaderboard の段階別ベスト（8桁丸め）を honest に併記。
+# --------------------------------------------------------------------------- idx36 staged metrics
+def _staged_report_refs(project: str, refs: Sequence[FileRef]) -> list[FileRef]:
+    """案件の 05.会議/報告資料 配下の報告文書（docx/pptx/pdf, ``~$`` 一時ファイル除外）。"""
+    out = []
+    for r in refs:
+        if r.project != project or r.ext not in ("docx", "pptx", "pdf"):
+            continue
+        rel = nfc(r.rel)
+        if "報告資料" not in rel:
+            continue
+        if nfc(r.name).startswith("~$"):
+            continue
+        out.append(r)
+    return out
 
-    中間段階のフル精度値は成果物に丸めしか無い（leaderboard = 8桁）。serve レーンは idx36 を発火しない
-    （precision-first, SOT-2687）。ここでは透明性のため段階値を焼くのみ。
+
+def _build_staged_metrics(project: str, refs: Sequence[FileRef]) -> dict[str, Any] | None:
+    """段階メトリクス store（SOT-2699）: 05.会議/報告資料 のフル精度メトリクスを網羅抽出し、metrics.json の
+    最終 F1 とペア化して **中間 vs 最終 F1 の全精度差**（idx36）を焼く。
+
+    * ``final_f1_macro`` — metrics.json の f1_macro（最終・フル精度）。
+    * ``reports`` — 05.会議/報告資料 の各文書 × 全メトリクス名 × 全フル精度数値（日付・分析段階つき）。
+    * ``interim_f1`` — 分析段階 = interim の報告のうち **フル精度** f1_macro を持つ最新のベスト値。
+    * ``f1_stage_abs_diff`` — ``abs(final_f1 - interim_f1)`` を **フル精度が両側で揃った時だけ** 焼く
+      （二重検算）。フル精度が見つからない案件/段階は焼かない（丸めで近似回答しない, SOT-2687 の教訓）。
     """
     metrics = _load_json_ref(project, refs, "metrics.json")
     final_f1 = None
@@ -325,11 +429,62 @@ def _build_staged_metrics(project: str, refs: Sequence[FileRef]) -> dict[str, An
             final_f1 = float(v)
     if final_f1 is None:
         return None
-    return {"final_f1_macro": final_f1, "final_f1_source": "metrics.json:f1_macro",
-            "full_precision": True,
-            "intermediate_full_precision_available": False,
-            "note": "中間段階(線形系 T04 等)のフル精度 F1 は成果物に丸め(leaderboard 8桁)しか無いため "
-                    "idx36 の全精度差は serve で発火しない(honest abstain, SOT-2687)。"}
+
+    reports: list[dict[str, Any]] = []
+    for ref in _staged_report_refs(project, refs):
+        text = _report_text(ref)
+        if not text.strip():
+            continue
+        metric_hits = extract_report_metrics(text)
+        if not metric_hits:
+            continue
+        stage = _report_stage(text)
+        date = _report_date(ref.rel, ref.name, text)
+        per_metric: dict[str, Any] = {}
+        for name, hits in metric_hits.items():
+            best = max(hits, key=lambda h: h["value"])
+            per_metric[name] = {
+                "best": best["value"], "best_raw": best["raw"], "best_decimals": best["decimals"],
+                "best_full_precision": best["decimals"] >= FULL_PRECISION_MIN_DECIMALS,
+                "values": [h["value"] for h in hits],
+            }
+        reports.append({"rel": ref.rel, "date": date, "stage": stage, "metrics": per_metric})
+
+    # 中間 F1: 分析段階 = interim の報告のうち、フル精度 f1_macro を持つ最新日付のベスト。
+    interim: dict[str, Any] | None = None
+    interim_reports = [
+        r for r in reports
+        if r.get("stage") == "interim"
+        and isinstance(r.get("metrics", {}).get("f1_macro"), dict)
+        and r["metrics"]["f1_macro"].get("best_full_precision")
+    ]
+    interim_reports.sort(key=lambda r: (r.get("date") or ""))
+    if interim_reports:
+        chosen = interim_reports[-1]
+        fm = chosen["metrics"]["f1_macro"]
+        interim = {"value": fm["best"], "raw": fm["best_raw"], "decimals": fm["best_decimals"],
+                   "source_rel": chosen["rel"], "date": chosen.get("date"),
+                   "full_precision": True}
+
+    rec: dict[str, Any] = {
+        "final_f1_macro": final_f1, "final_f1_source": "metrics.json:f1_macro",
+        "full_precision": True,
+        "reports": reports,
+        "intermediate_full_precision_available": interim is not None,
+    }
+    if interim is not None:
+        diff = abs(final_f1 - interim["value"])
+        diff_check = abs(interim["value"] - final_f1)  # 二重検算（順序反転で一致）
+        if diff == diff_check:
+            rec["interim_f1"] = interim
+            rec["f1_stage_abs_diff"] = diff
+            rec["f1_stage_diff_verified"] = True
+            rec["note"] = ("中間 F1 = 05.会議/報告資料(interim 段階)のフル精度 f1_macro、最終 F1 = "
+                           "metrics.json:f1_macro。abs(final - interim) を全精度で焼く（SOT-2699）。")
+    else:
+        rec["note"] = ("interim 段階のフル精度 f1_macro が 05.会議/報告資料 に見つからないため idx36 は "
+                       "焼かない（honest abstain, SOT-2687）。")
+    return rec
 
 
 # --------------------------------------------------------------------------- per-case
