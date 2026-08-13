@@ -899,6 +899,15 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
                 result = analysis_xref_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
+        # SOT-2694 — 文書内数値の式適用レーン（記載式への同ページ数値代入 idx68 / docx 入れ子統計量表の
+        # 行キー×2 統計量列の差分 idx50）。上位レーンが束縛できない時のみ後置。RAG_FORMULA_APPLY OFF ⇒
+        # formula_apply_lane.resolve() は None ⇒ byte-identical。証拠は既存ストア(image_ocr/docx 入れ子表)由来。
+        if result is None:
+            try:
+                from src.rag.agent import formula_apply_lane
+                result = formula_apply_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path
         return None
     if result is None or not _contract.is_contract(result):
