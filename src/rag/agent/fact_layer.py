@@ -477,6 +477,15 @@ def _contact_master_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any
         return None
 
 
+def _pptx_money_page_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | None":
+    """SOT-2705 pptx 金額提示ページ lookup tool (default OFF ⇒ None ⇒ surface byte-identical)。"""
+    try:
+        from src.rag.agent import pptx_money_page_lane
+        return pptx_money_page_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return None
+
+
 def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     """The 4 fact-layer tools, or ``[]`` when the layer is OFF (⇒ tool set / MCP surface byte-identical)."""
     if not enabled():
@@ -489,7 +498,7 @@ def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     optional += _raw_artifact_tools()
     optional += [x for x in (_xref_coverage_tool(), _nb_chart_tool(), _analysis_xref_tool(),
                             _staged_metrics_tool(), _derived_ranking_tool(), _analysis_metrics_tool(),
-                            _contact_master_tool())
+                            _contact_master_tool(), _pptx_money_page_tool())
                  if x is not None]
     return optional + [
         (CASE_FILTER,
@@ -1000,6 +1009,16 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
             try:
                 from src.rag.agent import format_facts_lane
                 result = format_facts_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
+        # SOT-2705 — pptx 金額提示ページストアの決定論直答レーン(京ソ 提案書_final.pptx『費用見積』→頁 idx59)。
+        # 対象 pptx を一意束縛でき、金額提示スライドが価格タイトル or 金額トークン密度で 1 枚に確定した時だけ
+        # 可視頁番号(無ければ物理)を裸形式で直答。上位レーンが束縛できない時のみ後置。RAG_PPTX_MONEY_PAGE OFF ⇒
+        # pptx_money_page_lane.resolve() は None ⇒ byte-identical。
+        if result is None:
+            try:
+                from src.rag.agent import pptx_money_page_lane
+                result = pptx_money_page_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path
