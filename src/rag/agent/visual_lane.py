@@ -17,7 +17,9 @@ answer path の **決定論直答レーン**として接続する。fact_layer /
 * idx82 — 「WBSでオレンジ行のタスクIDをすべて」→ 行全体ハイライトの ID 列値を列挙。
 * idx97 — 「黄色ハイライトが交差する2セルの値の差の絶対値」→ 列全体×行全体ハイライトの交差セル差。
 
-idx42/77（黄セルの pivot 抽出条件）は束縛が曖昧なため決定論化せず、ツール/Evidence として材料提供に留める。
+idx42（黄セルの pivot 抽出条件・集計内容）は SOT-2704 で決定論化: build 時に焼いた ``pivot_context``
+（親グループ列の上方スキャン値 + 集計列ヘッダ）から、名指しシート上に当色ハイライトが一意な時だけ
+「sex=female、…で抽出されたデータに対する平均 / bmi」を返す（``RAG_HIGHLIGHT_PIVOT_CONTEXT`` 既定 OFF）。
 """
 from __future__ import annotations
 
@@ -310,8 +312,74 @@ def _fmt_num(x: float) -> Any:
     return int(x) if float(x).is_integer() else round(x, 6)
 
 
+# --------------------------------------------------------------------------- (idx42) pivot condition
+_EXTRACT_COND_CUE = re.compile(r"抽出条件|抽出|集計内容|集計")
+
+
+def _named_sheet_excl_file(qn: str, doc: dict[str, Any]) -> "str | None":
+    """A sheet the question literally names, excluding a sheet whose name merely coincides with the
+    file stem (a ``train`` sheet inside ``train.xlsx`` must not shadow the explicitly-named Sheet1)."""
+    stem = _norm(doc.get("doc_name")).rsplit(".", 1)[0]
+    hits = [name for name in doc.get("sheets", {})
+            if _norm(name) and _norm(name) in qn and _norm(name) != stem]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _pivot_condition_lane(qn: str, question_raw: str, docs: list[dict[str, Any]]) -> "dict[str, Any] | None":
+    """The extraction conditions + aggregation of a highlighted pivot cell (idx42).
+
+    Uses the build-time ``pivot_context`` baked on each highlighted cell (parent group keys + the
+    aggregation column header). Binds ONLY when exactly one highlighted cell of the wanted colour on
+    the named sheet carries a pivot context — otherwise defers to the LLM loop (precision-first)."""
+    if not _store.pivot_context_enabled():
+        return None
+    if not (("はいらいと" in qn or "ハイライト" in qn or "塗" in qn or "色" in qn)
+            and _EXTRACT_COND_CUE.search(qn)):
+        return None
+    color = _wanted_color(question_raw)
+    cands: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
+    for d in docs:
+        sheets = d.get("sheets", {})
+        sname = _named_sheet_excl_file(qn, d)
+        target = [sname] if sname else list(sheets)
+        for sn in target:
+            s = sheets.get(sn) or {}
+            for cell in s.get("static", []):
+                pc = cell.get("pivot_context")
+                if not pc:
+                    continue
+                if color is not None and cell.get("color") != color:
+                    continue
+                cands.append((d, sn, cell))
+    if len(cands) != 1:
+        return None
+    doc, sname, cell = cands[0]
+    pc = cell.get("pivot_context") or {}
+    answer = _format_pivot_answer(pc)
+    if not answer:
+        return None
+    return _result(answer, selection="highlight_pivot_condition",
+                   evidence={"doc_id": doc.get("doc_id"), "sheet": sname, "cell": cell.get("cell"),
+                             "color": cell.get("color"), "column_header": pc.get("column_header"),
+                             "row_context": pc.get("row_context")})
+
+
+def _format_pivot_answer(pc: dict[str, Any]) -> "str | None":
+    """``sex=female、smoker=yes、…で抽出されたデータに対する<column_header>`` from the baked context."""
+    rc = pc.get("row_context") or []
+    col = pc.get("column_header")
+    if not rc or not col:
+        return None
+    conds = "、".join(f"{it.get('name')}={it.get('value')}" for it in rc
+                     if it.get("name") and it.get("value") not in (None, ""))
+    if not conds:
+        return None
+    return f"{conds}で抽出されたデータに対する{col}"
+
+
 # --------------------------------------------------------------------------- dispatch
-_LANES = (_chart_column_lane, _correlation_condition_lane, _highlight_row_ids_lane, _intersect_diff_lane)
+_LANES = (_chart_column_lane, _correlation_condition_lane, _highlight_row_ids_lane, _intersect_diff_lane,
+          _pivot_condition_lane)
 
 
 def resolve(question: str) -> "dict[str, Any] | None":

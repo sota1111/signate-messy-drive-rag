@@ -242,6 +242,102 @@ def test_tool_unknown_project(store):
     assert out["value"] is None
 
 
+# =========================================================================== (idx42) pivot context
+def _pivot_workbook():
+    """A pandas-style hierarchical pivot: header at row 3, dimension columns sex/smoker/region/charges,
+    aggregate columns 平均 / age, 平均 / bmi, with parent labels sparse (only on their first row)."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    for c, h in enumerate(["sex", "smoker", "region", "charges", "平均 / age", "平均 / bmi"], start=1):
+        ws.cell(3, c, h)
+    # sparse hierarchy — a parent label appears once then blanks below (like a pivot index)
+    ws["A4"] = "female"
+    ws["B4"] = "no"
+    ws["B14"] = "yes"
+    ws["C4"] = "northeast"
+    ws["C20"] = "southeast"
+    for r in range(4, 23):
+        ws.cell(r, 4, r % 3)             # charges cycles 0/1/2 down the block
+    ws["D22"] = 2
+    ws.cell(22, 6, 35.95092784352941)    # F22 the highlighted average / bmi
+    ws.cell(22, 6).fill = _fill("FFFFFF00")
+    return wb
+
+
+def test_extract_pivot_context_on(monkeypatch):
+    monkeypatch.setenv("RAG_HIGHLIGHT_PIVOT_CONTEXT", "1")
+    rec = vs._extract_sheet(_pivot_workbook().active)
+    f22 = next(s for s in rec["static"] if s["cell"] == "F22")
+    pc = f22["pivot_context"]
+    assert pc["column_header"] == "平均 / bmi"
+    assert pc["agg_hint"] == "平均"
+    # each parent column resolved by upward scan; aggregate column 平均 / age excluded
+    assert pc["row_context"] == [
+        {"name": "sex", "value": "female"}, {"name": "smoker", "value": "yes"},
+        {"name": "region", "value": "southeast"}, {"name": "charges", "value": "2"}]
+
+
+def test_extract_pivot_context_off_is_absent(monkeypatch):
+    monkeypatch.delenv("RAG_HIGHLIGHT_PIVOT_CONTEXT", raising=False)
+    rec = vs._extract_sheet(_pivot_workbook().active)
+    f22 = next(s for s in rec["static"] if s["cell"] == "F22")
+    assert "pivot_context" not in f22           # OFF ⇒ store byte-identical
+
+
+def _pivot_records():
+    higashi = "プロジェクト/医療法人社団 蒼泉会 ひがし丘総合病院/03.データ/train.xlsx"
+    pctx = {"header_row": 3, "column_header": "平均 / bmi", "agg_hint": "平均",
+            "row_context": [{"name": "sex", "value": "female"}, {"name": "smoker", "value": "yes"},
+                            {"name": "region", "value": "southeast"}, {"name": "charges", "value": "2"}]}
+    return [{"doc_id": higashi, "project": "医療法人社団 蒼泉会 ひがし丘総合病院", "doc_name": "train.xlsx",
+             "charts": [], "sheets": {
+                 "Sheet1": {"state": "visible", "is_correlation": False, "cf": [], "col_highlights": [],
+                            "row_highlights": [], "color_summary": {},
+                            "static": [{"cell": "F22", "row": 22, "column": 6, "col_letter": "F",
+                                        "value": "35.95092784352941", "color": "黄",
+                                        "col_header": None, "pivot_context": pctx}]},
+                 # a decoy: a 'train' sheet (name collides with train.xlsx) with its own yellow pivot
+                 # cell — the named Sheet1 must win, never this one.
+                 "train": {"state": "visible", "is_correlation": False, "cf": [], "col_highlights": [],
+                           "row_highlights": [], "color_summary": {},
+                           "static": [{"cell": "Z9", "row": 9, "column": 26, "color": "黄",
+                                       "pivot_context": {"header_row": 1, "column_header": "X",
+                                                         "row_context": [{"name": "a", "value": "b"}]}}]}}}]
+
+
+@pytest.fixture
+def pivot_store(monkeypatch):
+    monkeypatch.setattr(vs, "load", lambda path=None: _pivot_records())
+    monkeypatch.setenv("RAG_VISUAL_STORE", "1")
+    monkeypatch.setenv("RAG_HIGHLIGHT_PIVOT_CONTEXT", "1")
+    monkeypatch.setenv("RAG_FACT_LAYER", "1")
+    return None
+
+
+def test_pivot_condition_lane(pivot_store):
+    r = vl.resolve("蒼泉会 ひがし丘総合病院のtrain.xlsxのSheet1において、"
+                   "黄色ハイライトされている数値に対応するデータの抽出条件と集計内容を答えてください。")
+    assert r is not None
+    assert r["value"] == "sex=female、smoker=yes、region=southeast、charges=2で抽出されたデータに対する平均 / bmi"
+    assert r["method"]["selection"] == "highlight_pivot_condition"
+    assert r["evidence"]["sheet"] == "Sheet1"        # decoy 'train' sheet excluded by file-stem guard
+
+
+def test_pivot_condition_off_defers(monkeypatch):
+    monkeypatch.setattr(vs, "load", lambda path=None: _pivot_records())
+    monkeypatch.setenv("RAG_VISUAL_STORE", "1")
+    monkeypatch.delenv("RAG_HIGHLIGHT_PIVOT_CONTEXT", raising=False)   # flag OFF ⇒ lane inert
+    assert vl.resolve("蒼泉会 ひがし丘総合病院のtrain.xlsxのSheet1において、"
+                      "黄色ハイライトされている数値の抽出条件と集計内容は？") is None
+
+
+def test_pivot_condition_defers_wrong_color(pivot_store):
+    # オレンジを尋ねても黄の pivot セルしか無い ⇒ 一意束縛できず defer（wrong を増やさない）。
+    assert vl.resolve("蒼泉会 ひがし丘総合病院のtrain.xlsxのSheet1で、"
+                      "オレンジ色ハイライトの数値の抽出条件と集計内容は？") is None
+
+
 # --------------------------------------------------------------------------- store schema roundtrip
 def test_store_load_schema_roundtrip(tmp_path):
     p = tmp_path / "visual_store.jsonl"

@@ -72,6 +72,16 @@ def enabled() -> bool:
     return os.getenv("RAG_VISUAL_STORE", "0").strip().lower() in _ON
 
 
+def pivot_context_enabled() -> bool:
+    """True when highlight cells are enriched with pivot context at build time and the serve pivot
+    lane may answer 抽出条件/集計内容 questions (SOT-2704, ``RAG_HIGHLIGHT_PIVOT_CONTEXT``; default OFF).
+
+    OFF ⇒ ``_extract_sheet`` bakes no ``pivot_context`` key (store byte-identical) and the serve pivot
+    lane defers, so both build artifact and answer path stay byte-identical to pre-SOT-2704.
+    """
+    return os.getenv("RAG_HIGHLIGHT_PIVOT_CONTEXT", "0").strip().lower() in _ON
+
+
 def default_out_path() -> Path:
     return settings.ARTIFACTS_DIR / "visual_store.jsonl"
 
@@ -165,6 +175,86 @@ def _row_label(ws, row: int) -> Any:
     return None
 
 
+# --------------------------------------------------------------------------- pivot context (SOT-2704)
+# Aggregate/value-column headers in a spreadsheet pivot: a group-by (dimension) column never carries
+# these markers, so a left column whose header matches is a value column, not an extraction condition.
+_AGG_MARK = re.compile(
+    r"平均|合計|総計|小計|個数|件数|最大|最小|中央|分散|標準偏差|割合|比率|構成比|"
+    r"count|sum|avg|average|mean|median|max|min|std|total|/", re.IGNORECASE)
+# The leading aggregation token of a value-column header (``平均 / bmi`` → ``平均``).
+_AGG_LEAD = re.compile(
+    r"^\s*(平均|合計|総計|小計|個数|件数|最大|最小|中央値?|分散|標準偏差|割合|比率|"
+    r"average|sum|count|mean|median|max|min|std|total)\s*/", re.IGNORECASE)
+
+
+def _fmt_label(v: Any) -> str:
+    """A pivot label as text, normalising integral floats (``2.0`` → ``2``) so a numeric group key
+    like ``charges=2`` renders exactly as the sheet displays it."""
+    if isinstance(v, bool):
+        return str(v)
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    if isinstance(v, int):
+        return str(v)
+    return str(v).strip()
+
+
+def _detect_header_row(ws, limit: int = 25) -> "int | None":
+    """The pivot's header row: the first row (top-down) carrying ≥2 non-empty *string* labels. In a
+    pandas-exported pivot the header sits above the data (rows above it are blank); a plain table has
+    it at row 1. Returns None when no label row is found (⇒ the sheet is not treated as a pivot)."""
+    for r in range(1, min(ws.max_row or 0, limit) + 1):
+        vals = [ws.cell(r, c).value for c in range(1, (ws.max_column or 0) + 1)]
+        strs = [v for v in vals if isinstance(v, str) and v.strip() != ""]
+        if len(strs) >= 2:
+            return r
+    return None
+
+
+def _pivot_context(ws, row: int, col: int, header_row: "int | None") -> "dict[str, Any] | None":
+    """Question-independent extraction condition + aggregation for a highlighted pivot cell.
+
+    Reads the cell's own column header (``column_header`` — the 集計内容, e.g. ``平均 / bmi``) and, for
+    each *dimension* column to its left (a left column whose header is NOT an aggregate marker), the
+    nearest non-empty label at-or-above ``row`` (upward scan) — the parent group key of that cell. For
+    ``F22`` in a sex/smoker/region/charges pivot this yields ``sex=female, smoker=yes, region=southeast,
+    charges=2``. Returns None (⇒ no enrichment) when the sheet is not a pivot below the header or no
+    dimension binds. Never reads the question or gold.
+    """
+    if header_row is None or header_row >= row:
+        return None
+    raw_header = ws.cell(header_row, col).value
+    if raw_header is None or str(raw_header).strip() == "":
+        return None
+    column_header = str(raw_header).strip()
+    row_context: list[dict[str, Any]] = []
+    for c in range(1, col):
+        h = ws.cell(header_row, c).value
+        if h is None or str(h).strip() == "":
+            continue
+        name = str(h).strip()
+        if _AGG_MARK.search(name):  # a value/aggregate column, not an extraction condition
+            continue
+        label = None
+        for rr in range(row, header_row, -1):  # upward scan for the nearest parent label
+            v = ws.cell(rr, c).value
+            if v is not None and str(v).strip() != "":
+                label = v
+                break
+        if label is None:
+            continue
+        row_context.append({"name": name, "value": _fmt_label(label)})
+    if not row_context:
+        return None
+    m = _AGG_LEAD.match(column_header)
+    return {
+        "header_row": header_row,
+        "column_header": column_header,
+        "agg_hint": m.group(1) if m else None,
+        "row_context": row_context,
+    }
+
+
 def _extract_sheet(ws) -> dict[str, Any]:
     """Structured visual facts for one worksheet (static fills + derived line/colour structures)."""
     used_cols = ws.max_column or 0
@@ -203,6 +293,16 @@ def _extract_sheet(ws) -> dict[str, Any]:
     for ch in col_hi:
         ch["col_letter"] = _col_letter(ch["col"])
         ch["header"] = _hdr(ws, ch["col"])
+
+    # SOT-2704: bake each highlighted cell's pivot context (parent extraction conditions + the
+    # aggregation column header) so serve can answer 抽出条件/集計内容 without in-budget reconstruction.
+    # Gated so OFF ⇒ no new key ⇒ store + serve byte-identical.
+    if pivot_context_enabled() and statics:
+        header_row = _detect_header_row(ws)
+        for it in statics:
+            pc = _pivot_context(ws, it["row"], it["column"], header_row)
+            if pc:
+                it["pivot_context"] = pc
 
     return {
         "state": ws.sheet_state,
