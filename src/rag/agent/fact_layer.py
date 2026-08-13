@@ -826,6 +826,15 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
                 result = nb_chart_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
+        # SOT-2686 — xlsx 数式依存トレース＋記載回帰係数の行適用の決定論直答レーン（黄色ハイライト数式が
+        # 参照するデータ行の属性 idx47 / 係数表を index=N 行へ当てはめた予測値 idx83）。上位レーンが束縛
+        # できない時のみ後置。RAG_XLSX_FORMULA_TRACE OFF ⇒ xlsx_formula_lane.resolve() は None ⇒ byte-identical。
+        if result is None:
+            try:
+                from src.rag.agent import xlsx_formula_lane
+                result = xlsx_formula_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path
         return None
     if result is None or not _contract.is_contract(result):
