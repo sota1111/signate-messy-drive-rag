@@ -468,6 +468,15 @@ def _analysis_metrics_tool() -> "tuple[str, str, dict[str, Any], Callable[..., A
         return None
 
 
+def _contact_master_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | None":
+    """SOT-2707 担当者マスタ（契約書署名欄 権威ソース）lookup tool (default OFF ⇒ None ⇒ surface byte-identical)。"""
+    try:
+        from src.rag.agent import contact_master_lane
+        return contact_master_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return None
+
+
 def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     """The 4 fact-layer tools, or ``[]`` when the layer is OFF (⇒ tool set / MCP surface byte-identical)."""
     if not enabled():
@@ -479,7 +488,8 @@ def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     optional += _doc_reach_tools()
     optional += _raw_artifact_tools()
     optional += [x for x in (_xref_coverage_tool(), _nb_chart_tool(), _analysis_xref_tool(),
-                            _staged_metrics_tool(), _derived_ranking_tool(), _analysis_metrics_tool())
+                            _staged_metrics_tool(), _derived_ranking_tool(), _analysis_metrics_tool(),
+                            _contact_master_tool())
                  if x is not None]
     return optional + [
         (CASE_FILTER,
@@ -961,6 +971,15 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
             try:
                 from src.rag.agent import analysis_metrics_lane
                 result = analysis_metrics_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
+        # SOT-2707 — 契約書署名欄を権威ソースとする担当者マスタの完全ラベル直答レーン（クライアント/受託の
+        # 主担当者・役職・部署名, idx21 型）。上位レーンが束縛できない時のみ後置。RAG_CONTACT_MASTER OFF ⇒
+        # contact_master_lane.resolve() は None ⇒ byte-identical。値は署名欄の構造化フィールドを完全写経。
+        if result is None:
+            try:
+                from src.rag.agent import contact_master_lane
+                result = contact_master_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path

@@ -328,6 +328,23 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  case finance store skipped: {type(e).__name__}: {e}")
 
+    # Contact-master store (SOT-2707 / cycle10): all-case × all-contract signature-block structured
+    # fields (会社名/部署名/主担当者/役職, 甲=client・乙=vendor) extracted verbatim at build time so the
+    # authoritative 契約書署名欄 role/contact answers (idx21 型) reduce to an O(1) lookup instead of
+    # writing the 会議録 attendee expansion form. LLM-free (re over decrypted contract text); runtime
+    # consumption is opt-in (RAG_CONTACT_MASTER) so the champion serve path is byte-identical.
+    try:
+        from src.rag.index import contact_master_store
+        cms = contact_master_store.build(refs)
+        if verbose:
+            cert = cms["report"]["certificate"]
+            print(f"  contact master store: {cms['cases']} cases "
+                  f"(universe_ok={cert['row_count_equals_universe']}) "
+                  f"-> {contact_master_store.default_out_path()}")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  contact master store skipped: {type(e).__name__}: {e}")
+
     # Action-row store (SOT-2652): question-independent extraction of AI/task action rows, priority-task
     # lists and priority-follow notes from scanned-PDF minutes/reports (idx20/34/70/93 action-row abstains).
     # LLM-free (reads persisted OCR + text-layer); runtime consultation is opt-in (RAG_ACTION_ROW_STORE)
