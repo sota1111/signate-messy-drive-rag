@@ -237,7 +237,7 @@ def _diff_lookup(question: str = "", old: str = "", new: str = "", project: str 
         item = {"rank": c.get("rank"), "kind": c.get("kind"), "intent": c.get("intent"),
                 "before": c.get("old", c.get("before")), "after": c.get("new", c.get("after")),
                 "structural_location": c.get("structural_location"), "attributes": c.get("attributes")}
-        for k in ("headers_added", "headers_removed", "headers_old_count", "headers_new_count"):
+        for k in ("headers_added", "headers_removed", "headers_old_count", "headers_new_count", "summary"):
             if c.get(k) not in (None, []):
                 item[k] = c[k]
         value.append(item)

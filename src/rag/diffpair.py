@@ -301,6 +301,83 @@ def _docx_struct(path) -> _Struct | None:
     return st
 
 
+# SOT-2700 (idx95, flag-gated) — row-label keying for a tabular xlsx.
+# ``␟`` (␟ UNIT SEPARATOR) never occurs in real cell text, so a ``sheet␟row␟col`` key can never be
+# confused with a pptx (``s1:t1:…``) / docx (``t1:…``) table key that the table-collapse pass scans.
+_XL_KEYSEP = "␟"
+# A column header that identifies a stable per-row identity (survives a row insert): 「タスクID」「管理番号」…
+_XL_ID_HEADER = re.compile(r"(タスク\s*id|課題\s*id|項目\s*id|管理番号|チケット|コード|^id$|id$|^code|key$|キー$|番号)", re.I)
+# A weaker sequential row number (「No.」「項番」) — renumbers on insert, so only used when no strong id exists.
+_XL_SEQ_HEADER = re.compile(r"(^no\.?$|^№$|^#$|項番|通し番号|連番|行番号|^seq)", re.I)
+# A descriptive column whose value names the row for a human («T15 モデル評価…»); used to enrich the label.
+_XL_NAME_HEADER = re.compile(r"(タスク名|項目名|名称|件名|title|タイトル|作業名|工程名|項目$)", re.I)
+
+
+def _key_sheet_by_rowlabel(st: _Struct, sheet: str, rows: list[list]) -> bool:
+    """Key one sheet's cells by ``(row-identity, column-header)`` instead of coordinate. False when the
+    sheet has no detectable header + identity column (caller falls back to coordinate keying)."""
+    def _cellstr(v) -> str:
+        return "" if v is None else str(v).strip()
+
+    scan = rows[:12]
+    if not scan:
+        return False
+    # Header = the earliest of the top rows carrying the most non-empty cells (≥3 to look like a table).
+    counts = [(sum(1 for v in r if _cellstr(v)), -i, i) for i, r in enumerate(scan)]
+    best_count, _, h = max(counts)
+    if best_count < 3:
+        return False
+    headers = [_cellstr(v) for v in rows[h]]
+    ncol = len(headers)
+    data = rows[h + 1:]
+    if not data:
+        return False
+
+    def _distinct_nonempty(ci: int) -> bool:
+        vals = [_cellstr(r[ci]) if ci < len(r) else "" for r in data]
+        seen: set[str] = set()
+        got = False
+        for v in vals:
+            if not v:
+                continue
+            got = True
+            k = _norm(v)
+            if k in seen:
+                return False
+            seen.add(k)
+        return got
+
+    strong = [ci for ci in range(ncol) if headers[ci] and _XL_ID_HEADER.search(_norm(headers[ci]))]
+    seq = [ci for ci in range(ncol) if headers[ci] and _XL_SEQ_HEADER.search(_norm(headers[ci]))]
+    key_ci = None
+    for cand in strong + seq + list(range(ncol)):
+        if headers[cand] and _distinct_nonempty(cand):
+            key_ci = cand
+            break
+    if key_ci is None:
+        return False
+    name_ci = next((ci for ci in range(ncol)
+                    if ci != key_ci and headers[ci] and _XL_NAME_HEADER.search(_norm(headers[ci]))), None)
+
+    added = False
+    for r in data:
+        label_val = _cellstr(r[key_ci]) if key_ci < len(r) else ""
+        if not label_val:
+            continue
+        desc = _cellstr(r[name_ci]) if (name_ci is not None and name_ci < len(r)) else ""
+        for ci in range(ncol):
+            if ci == key_ci or not headers[ci]:
+                continue
+            val = _cellstr(r[ci]) if ci < len(r) else ""
+            if not val:
+                continue
+            key = f"{sheet}{_XL_KEYSEP}{_norm(label_val)}{_XL_KEYSEP}{_norm(headers[ci])}"
+            row_label = f"{label_val} {desc}".strip() if desc else label_val
+            _add_cell(st, key, f"{row_label}／{headers[ci]}", val)
+            added = True
+    return added
+
+
 def _xlsx_struct(path) -> _Struct | None:
     try:
         import openpyxl
@@ -311,13 +388,25 @@ def _xlsx_struct(path) -> _Struct | None:
     except Exception:
         return None
     st = _Struct()
-    for ws in wb.worksheets:
-        for row in ws.iter_rows(max_row=min(ws.max_row or 0, 300)):
-            for c in row:
-                if c.value is None:
-                    continue
-                coord = f"{ws.title}!{c.coordinate}"
-                _add_cell(st, coord, coord, str(c.value))
+    row_label_ok = False
+    if struct_enabled():
+        row_label_ok = True
+        for ws in wb.worksheets:
+            rows = [list(r) for r in ws.iter_rows(max_row=min(ws.max_row or 0, 300), values_only=True)]
+            if not _key_sheet_by_rowlabel(st, ws.title, rows):
+                # a sheet with no header/identity column ⇒ abandon row-label keying for the whole
+                # workbook (mixing keying schemes across sheets would desync old↔new) and fall back.
+                row_label_ok = False
+                break
+    if not row_label_ok:
+        st = _Struct()
+        for ws in wb.worksheets:
+            for row in ws.iter_rows(max_row=min(ws.max_row or 0, 300)):
+                for c in row:
+                    if c.value is None:
+                        continue
+                    coord = f"{ws.title}!{c.coordinate}"
+                    _add_cell(st, coord, coord, str(c.value))
     try:
         wb.close()
     except Exception:
@@ -412,12 +501,91 @@ def structural_diff(pair: VersionPair) -> list[Change] | None:
     return _structural_diff_live(pair)
 
 
+# SOT-2700 (idx1) — a pptx/docx table key is ``s{si}:t{ti}:…`` / ``t{ti}:…``; its prefix groups a table.
+_PPTX_TABLE_KEY = re.compile(r"^(s\d+:t\d+):")
+_DOCX_TABLE_KEY = re.compile(r"^(t\d+):")
+# A newly-added line that summarises a deleted comparison table (改善幅のみを示す1行要約, idx1).
+_TABLE_SUMMARY_RE = re.compile(r"(改善|向上|ポイント|改善幅|要約|サマリ|まとめ|のみ)")
+
+
+def _collapse_deleted_tables(so: "_Struct", sn: "_Struct") -> tuple[list[Change], set[str], set[str]]:
+    """Detect pptx/docx tables that are wholly gone in NEW and collapse each into ONE summarising change.
+
+    Returns ``(summary_changes, skip_old_keys, skip_new_flow_norms)``: the per-table summary Changes, the
+    old keyed-cell keys those tables own (so the caller emits no per-cell remove for them), and the
+    normalised text of any NEW summary line consumed into a table→summary MODIFY (so the flow diff does not
+    also report it as a bare addition). A table qualifies only when *every* one of its ≥4 old cells is
+    absent from NEW — a partial edit is left to the normal per-cell diff. Deterministic; no gold value."""
+    tables: dict[str, list[tuple[str, str, str]]] = {}
+    for key, (label, val) in so.cells.items():
+        m = _PPTX_TABLE_KEY.match(key) or _DOCX_TABLE_KEY.match(key)
+        if m:
+            tables.setdefault(m.group(1), []).append((key, label, val))
+    summaries: list[Change] = []
+    skip_keys: set[str] = set()
+    skip_flow: set[str] = set()
+    old_flow_norm = {_norm(x) for x in so.flow}
+    # A table whose cell values REAPPEAR verbatim as new cells / flow lines was reorganized / moved, not
+    # deleted (idx9: a リスク表 folded into bullet cells — every value survives, so the moved-block detector
+    # must still see its removes). Only a table whose content genuinely vanished is a deletion (idx1: the
+    # 中間/最終 実測値 are gone, replaced by a prose 改善幅 summary that restates none of them verbatim).
+    new_moved = {_norm(v) for _lab, v in sn.cells.values()} | {_norm(x) for x in sn.flow}
+    new_moved.discard("")
+    for prefix, cells in tables.items():
+        if len(cells) < 4 or any(k in sn.cells for k, _, _ in cells):
+            continue
+        vanished = sum(1 for _k, _lab, v in cells if _norm(v) and _norm(v) not in new_moved)
+        if vanished < 0.6 * len(cells):
+            continue
+        sm = re.match(r"s(\d+):", prefix)
+        si = sm.group(1) if sm else ""
+        loc = f"スライド{si}" if si else ""
+        labels = list(dict.fromkeys(lab for _, lab, _ in cells))
+        header_label = labels[0]
+        metric_labels = [l for l in labels if l != header_label]
+        # Keep the advisory structural: the old per-cell values/model names are precisely the detail
+        # flood this collapse replaces. Metric names identify the table without leaking its contents.
+        desc = f"{header_label}の比較表"
+        if metric_labels:
+            desc += f"（{'・'.join(metric_labels[:8])}）"
+        after_line = ""
+        for txt, flab in zip(sn.flow, sn.flow_labels):
+            if loc and loc not in (flab or ""):
+                continue
+            if _norm(txt) in old_flow_norm or not txt.strip():
+                continue
+            if _TABLE_SUMMARY_RE.search(nfc(txt)):
+                after_line = txt.strip()
+                skip_flow.add(_norm(txt))
+                break
+        for k, _, _ in cells:
+            skip_keys.add(k)
+        if after_line:
+            summaries.append(Change(loc, desc, "改善幅のみを示す1行要約に置換", "modify"))
+        else:
+            summaries.append(Change(f"{loc} 削除".strip(), desc, "", "remove"))
+    return summaries, skip_keys, skip_flow
+
+
 def _structural_diff_live(pair: VersionPair) -> list[Change] | None:
     """Live (store-bypassing) structural diff — the deterministic extraction core."""
     so, sn = _struct(pair.old), _struct(pair.new)
     if so is None or sn is None:
         return None
     changes: list[Change] = []
+    skip_flow: set[str] = set()
+    if struct_enabled():
+        summaries, _skip_keys, skip_flow = _collapse_deleted_tables(so, sn)
+        changes.extend(summaries)
+        # SOT-2700 (idx14): surface the deterministic column-name underscore renames on the advisory path
+        # too (the champion adds them only inside rank_changes). A block reorg can bury the rename so the
+        # keyed-cell loop never sees it; the full-text token diff recovers every one.
+        seen_ren = set()
+        for rc in _schema_underscore_renames(pair):
+            k = (_norm(rc.before), _norm(rc.after))
+            if k not in seen_ren:
+                seen_ren.add(k)
+                changes.append(rc)
     # keyed cells: match by field key; report only value changes (cosmetic folded away by _norm)
     for key, (label, ov) in so.cells.items():
         if key in sn.cells:
@@ -425,7 +593,10 @@ def _structural_diff_live(pair: VersionPair) -> list[Change] | None:
             if _norm(ov) != _norm(nv):
                 changes.append(Change(nlabel or label, ov, nv, "modify"))
     # flowing paragraphs: aligned sequence replacements
-    changes.extend(_diff_flow(so.flow, sn.flow, so.flow_labels, sn.flow_labels))
+    for ch in _diff_flow(so.flow, sn.flow, so.flow_labels, sn.flow_labels):
+        if ch.kind == "add" and _norm(ch.after) in skip_flow:
+            continue
+        changes.append(ch)
     # de-dup identical rendered changes, keep order
     seen, out = set(), []
     for c in changes:
@@ -592,6 +763,27 @@ def classify_enabled() -> bool:
     return os.getenv("RAG_VDIFF_CLASSIFY", "0").strip().lower() in _DIFF_ALIGN_ON
 
 
+def struct_enabled() -> bool:
+    """SOT-2700 — deterministic *structural* diff repairs for the four version_diff wrong cases (default OFF).
+
+    OFF ⇒ every function below is byte-identical to the champion (the whole lane is skipped and the
+    historical coordinate/enumeration behaviour is preserved). ON adds, purely additively and question-
+    independently:
+      * **xlsx row-label keying (idx95).** ``_xlsx_struct`` keys cells by ``(row-identity, column-header)``
+        read from the table's own header + id column instead of the absolute cell coordinate, so a header
+        shift / column reorder no longer manufactures a modify for every cell — only genuine value edits
+        (an added 担当者, a status flip) survive.
+      * **pptx/docx whole-table deletion → summary (idx1).** A table that exists in OLD but is entirely
+        gone in NEW is collapsed into ONE change describing the deleted comparison table (and, when the
+        same slide gained a summary line, rendered as a table→1-row-summary replacement) instead of
+        enumerating every deleted cell value.
+      * **schema-rename advisory (idx14).** The deterministic column-name underscore renames
+        (:func:`_schema_underscore_renames`) are also surfaced on the ``answer_question`` advisory path,
+        not only inside :func:`rank_changes`.
+    Pure, deterministic, network-free — no gold value is embedded."""
+    return os.getenv("RAG_VDIFF_STRUCT", "0").strip().lower() in _DIFF_ALIGN_ON
+
+
 # A numbered section heading decorated with a phase / quick-win sub-label — 「5. 業務提言 ― クイックウィン
 # （短期）」/「… ― モデル運用・ガバナンス（中期）」. Adding such a label, or splitting a section into
 # phase-labelled slides, is a cosmetic reorganization, not a case-execution change (idx9). All three
@@ -722,6 +914,18 @@ def _boilerplate_feature(text: str, subst: list[str]) -> str | None:
     return None
 
 
+# SOT-2700 — workflow-status vocabulary (NFKC-folded via _norm) for the idx95 status-only demotion. Mirrors
+# the set in :mod:`src.rag.index.diff_store`; kept local so :func:`classify_change` needs no store import.
+_WORKFLOW_STATUS = {
+    _norm(s) for s in (
+        "未着手", "未対応", "未開始", "未実施", "着手", "着手中", "対応中", "進行中", "実施中", "作業中",
+        "レビュー", "レビュー中", "確認中", "承認待ち", "保留", "中止", "見送り",
+        "完了", "済", "完了済", "対応済", "クローズ", "終了",
+        "todo", "wip", "doing", "inprogress", "notstarted", "done", "closed", "open", "review",
+    )
+}
+
+
 def classify_change(c: Change, moved: set[str] | None = None) -> RankedChange:
     """Assign an enterprise edit-intent + substantive score to one atomic change (deterministic).
 
@@ -751,6 +955,19 @@ def classify_change(c: Change, moved: set[str] | None = None) -> RankedChange:
     # phase-labelled slides) is a cosmetic reorganization, not a case-execution change (idx9, flag-gated).
     if classify_enabled() and _is_heading_label_change(c):
         return RankedChange(c, LAYOUT_METADATA, 0.28, location, subst + ["heading_label"])
+
+    # SOT-2700 (idx95, flag-gated): with row-label xlsx keying a bulk 未着手→完了 status flip surfaces as one
+    # modify per row. Both sides are pure workflow-status tokens, but 「未着手 完了」 trips the 姓 名 person
+    # regex, so absent this guard every status row would score as SUBSTANTIVE and tie with the real edit.
+    #   * A pure status-token modify is demoted to UNCERTAIN (still carries a status_transition attribute
+    #     downstream so 「未着手→完了 を除く」 filters it out) — it must never outrank a genuine value change.
+    #   * A genuine assignee APPEND (「渡辺 遥」→「渡辺 遥 / 小林 直樹」, all old members survive + a new person)
+    #     is the strongest substantive signal on such a sheet, so it is boosted above the status ties.
+    if struct_enabled() and c.kind == "modify":
+        if _norm(c.before) in _WORKFLOW_STATUS and _norm(c.after) in _WORKFLOW_STATUS:
+            return RankedChange(c, UNCERTAIN, 0.45, location, subst + ["status_only"])
+        if "person_name" in subst and is_list_append(c.before, c.after):
+            return RankedChange(c, SUBSTANTIVE, 0.96, location, subst + ["assignee_append", "kind:modify"])
 
     if subst:
         tie = 0.02 * min(len(subst), 3)
@@ -869,7 +1086,16 @@ def _atomic_changes(pair: VersionPair) -> list[Change] | None:
     if so is None or sn is None:
         return None
     changes: list[Change] = []
+    skip_keys: set[str] = set()
+    skip_flow: set[str] = set()
+    if struct_enabled():
+        # SOT-2700 (idx1): a wholly-deleted comparison table collapses to one table→summary change instead
+        # of a per-cell remove flood; its cell keys / paired summary line are then skipped below.
+        summaries, skip_keys, skip_flow = _collapse_deleted_tables(so, sn)
+        changes.extend(summaries)
     for key, (label, ov) in so.cells.items():
+        if key in skip_keys:
+            continue
         if key in sn.cells:
             nlabel, nv = sn.cells[key]
             if _norm(ov) != _norm(nv):
@@ -879,7 +1105,10 @@ def _atomic_changes(pair: VersionPair) -> list[Change] | None:
     for key, (label, nv) in sn.cells.items():
         if key not in so.cells:
             changes.append(Change(label, "", nv, "add"))
-    changes.extend(_diff_flow(so.flow, sn.flow, so.flow_labels, sn.flow_labels))
+    for ch in _diff_flow(so.flow, sn.flow, so.flow_labels, sn.flow_labels):
+        if ch.kind == "add" and _norm(ch.after) in skip_flow:
+            continue
+        changes.append(ch)
     # de-dup identical rendered changes, keep order (mirrors _structural_diff_live)
     seen, out = set(), []
     for c in changes:
