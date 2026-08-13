@@ -110,6 +110,87 @@ def test_project_and_ext_filters(built, monkeypatch):
     assert _search(db, monkeypatch, "EXT1234", ext="md") == []  # literal only lives in the .txt
 
 
+# --------------------------------------------------------------------------- SOT-2702: permissive project filter
+
+def _write_proj(dir_: Path, rel: str, project: str, text: str) -> FileRef:
+    p = dir_ / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
+    ext = rel.rsplit(".", 1)[-1].lower()
+    return FileRef(path=p, project=project, category="", rel=rel, name=Path(rel).name, ext=ext)
+
+
+_P1 = "医療法人社団 蒼樹会 みなみ野女性医療センター"
+_P2 = "医療法人社団 蒼泉会 ひがし丘総合病院"
+
+
+@pytest.fixture()
+def proj_built(tmp_path: Path, monkeypatch):
+    """Two projects sharing the substring '蒼' / '医療法人社団'; only _P1 carries 'みなみ野'."""
+    root = tmp_path / "share"
+    refs = [
+        _write_proj(root, "minamino_report.txt", _P1, "監視ダッシュボード構築(別契約)の記載。"),
+        _write_proj(root, "higashioka_report.txt", _P2, "別契約に関する記載がここにある。"),
+    ]
+    db = tmp_path / "text_fts.db"
+    monkeypatch.setattr(text_fts, "default_report_path", lambda: tmp_path / "report.json")
+    text_fts.build(refs, out_path=db)
+    text_fts.reset_cache()
+    return db
+
+
+def _psearch(db: Path, monkeypatch, alias: bool, **kw):
+    monkeypatch.setenv("RAG_TEXT_FTS", "1")
+    if alias:
+        monkeypatch.setenv("RAG_TEXT_FTS_PROJECT_ALIAS", "1")
+    else:
+        monkeypatch.delenv("RAG_TEXT_FTS_PROJECT_ALIAS", raising=False)
+    text_fts.reset_cache()
+    return text_fts.search("別契約", path=db, limit=20, **kw)
+
+
+def test_project_matches_pure():
+    aliases = {"mn": _P1, "minamino": _P1}
+    assert text_fts._project_matches("みなみ野", _P1, {})          # short name is a substring
+    assert text_fts._project_matches(_P1, _P1, {})                # exact
+    assert text_fts._project_matches("MN".casefold(), _P1, aliases)  # alias resolves to formal
+    assert not text_fts._project_matches("かえで", _P1, {})        # unrelated short name
+    assert text_fts._project_matches("", _P1, {})                 # empty filter accepts all
+
+
+def test_project_alias_off_is_exact(proj_built, monkeypatch):
+    # OFF (historical): a short project name matches nothing → the bug the issue documents (idx52).
+    assert _psearch(proj_built, monkeypatch, alias=False, project="みなみ野") == []
+    # OFF still honours an exact project name.
+    assert _psearch(proj_built, monkeypatch, alias=False, project=_P1)
+
+
+def test_project_alias_short_name_narrows(proj_built, monkeypatch):
+    hits = _psearch(proj_built, monkeypatch, alias=True, project="みなみ野")
+    assert hits, "short name must resolve to the unique matching project (idx52 recovery)"
+    assert {h["project"] for h in hits} == {_P1}
+    assert any("監視ダッシュボード" in h["text"] for h in hits)
+
+
+def test_project_alias_formal_name_still_works(proj_built, monkeypatch):
+    hits = _psearch(proj_built, monkeypatch, alias=True, project=_P1)
+    assert hits and {h["project"] for h in hits} == {_P1}
+
+
+def test_project_alias_glossary_code(proj_built, monkeypatch):
+    # A glossary code (not a substring of the project) resolves via the alias table.
+    monkeypatch.setattr(text_fts, "_project_alias_map", lambda: {"minamino": _P1})
+    hits = _psearch(proj_built, monkeypatch, alias=True, project="MINAMINO")
+    assert hits and {h["project"] for h in hits} == {_P1}
+
+
+def test_project_alias_ambiguous_fails_open(proj_built, monkeypatch):
+    # '蒼' (or '医療法人社団') substrings BOTH projects → ambiguous → no narrowing (fail-open),
+    # so rows from both projects are returned rather than silently mis-dropped.
+    hits = _psearch(proj_built, monkeypatch, alias=True, project="医療法人社団")
+    assert {h["project"] for h in hits} == {_P1, _P2}
+
+
 def test_deterministic_build(tmp_path: Path, corpus: list[FileRef], monkeypatch):
     monkeypatch.setattr(text_fts, "default_report_path", lambda: tmp_path / "r.json")
     a = text_fts.build(corpus, out_path=tmp_path / "a.db")

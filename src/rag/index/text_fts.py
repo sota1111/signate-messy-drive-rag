@@ -115,6 +115,16 @@ def build_enabled() -> bool:
     return os.getenv("RAG_TEXT_FTS_BUILD", "0").strip().lower() in _ON
 
 
+def project_alias_enabled() -> bool:
+    """True when :func:`search`'s ``project`` filter is permissive (default OFF — opt-in, SOT-2702).
+
+    OFF ⇒ the filter demands an exact NFC-equal project name (historical, byte-identical). ON ⇒ a
+    short/alias project name (e.g. ``みなみ野`` for ``医療法人社団 蒼樹会 みなみ野女性医療センター``, or
+    the glossary code ``MINAMINO``) still resolves, and an ambiguous filter fails open (no narrowing).
+    """
+    return os.getenv("RAG_TEXT_FTS_PROJECT_ALIAS", "0").strip().lower() in _ON
+
+
 # --------------------------------------------------------------------------- build
 
 def _where(cell: str | None, page: int | None, sheet: str | None,
@@ -294,10 +304,12 @@ def build(refs: Sequence[FileRef] | None = None, out_path: Path | None = None,
 
 _CONN_CACHE: dict[str, sqlite3.Connection | None] = {}
 _IDF_CACHE: dict[str, dict[str, float]] = {}
+# NFC/casefolded glossary alias-or-code → canonical project name, parsed once from 社内用語集.docx.
+_ALIAS_CACHE: dict[str, dict[str, str]] = {}
 
 
 def reset_cache() -> None:
-    """Drop the in-process connection/idf cache (used by the build path and tests)."""
+    """Drop the in-process connection/idf/alias cache (used by the build path and tests)."""
     for conn in _CONN_CACHE.values():
         try:
             if conn is not None:
@@ -306,6 +318,71 @@ def reset_cache() -> None:
             pass
     _CONN_CACHE.clear()
     _IDF_CACHE.clear()
+    _ALIAS_CACHE.clear()
+
+
+# --- SOT-2702: permissive project-filter resolution (short name / glossary alias) ---
+# The 社内用語集 table rows are ``正式名 | CODE | 別名1, 別名2, … | 備考`` (nbsp/コンマ/読点 separators).
+_GLOSSARY_SPLIT_RE = re.compile(r"[,、]")
+
+
+def _project_alias_map() -> dict[str, str]:
+    """NFC/casefolded alias-or-code → canonical (formal) project name, parsed once from 社内用語集.docx.
+
+    Every glossary row maps its CODE (column 1) and each 別名 (column 2) to the row's formal name
+    (column 0). Fail-open to ``{}`` on any problem (glossary missing / extract error / unexpected
+    shape) so the permissive filter degrades to pure substring matching — it never raises into the
+    serve path. Cached for the process; :func:`reset_cache` clears it.
+    """
+    if "default" in _ALIAS_CACHE:
+        return _ALIAS_CACHE["default"]
+    out: dict[str, str] = {}
+    try:
+        from src.rag.corpus import walk
+        from src.rag.extract import extract
+
+        refs = list(walk())
+        # Real corpus project names — the glossary doubles as a general terminology sheet (metrics,
+        # file names, roles), so keep ONLY rows whose formal name (col 0) names an actual project.
+        projects = {p for p in (nfc(r.project) for r in refs) if p}
+        ref = next((r for r in refs if "社内用語集" in nfc(r.name)), None)
+        if ref is not None:
+            doc = extract(ref, caption_images=False)
+            for raw in (doc.text or "").split("\n"):
+                parts = [c.strip() for c in raw.split("|")]
+                if len(parts) < 2:
+                    continue
+                formal = nfc(parts[0])
+                if not formal or not any(
+                        formal == p or formal in p or p in formal for p in projects):
+                    continue
+                keys = [parts[1]]
+                if len(parts) >= 3:
+                    keys += _GLOSSARY_SPLIT_RE.split(parts[2].replace("\xa0", " "))
+                for k in keys:
+                    kk = nfc(k).strip().casefold()
+                    if len(kk) >= 2:
+                        out.setdefault(kk, formal)
+    except Exception:
+        out = {}
+    _ALIAS_CACHE["default"] = out
+    return out
+
+
+def _project_matches(proj: str, rproj: str, aliases: dict[str, str]) -> bool:
+    """True when permissive filter ``proj`` should accept row project ``rproj`` (both NFC).
+
+    Matches on exact equality, either-direction substring (a short name is a substring of the formal
+    name), or a glossary alias/code whose canonical formal name is substring-related to ``rproj``.
+    """
+    if not proj:
+        return True
+    if proj == rproj or proj in rproj or rproj in proj:
+        return True
+    canon = aliases.get(proj.casefold())
+    if canon and (canon == rproj or canon in rproj or rproj in canon):
+        return True
+    return False
 
 
 def _connect(path: Path) -> sqlite3.Connection | None:
@@ -397,10 +474,25 @@ def search(query: str, *, limit: int = 20, project: str | None = None,
     except Exception:
         return []
 
+    # Project narrowing set (SOT-2702). OFF ⇒ exact-equal filter (byte-identical to the historical
+    # `nfc(rproj) != proj` behaviour). ON ⇒ resolve `proj` permissively over the candidate projects
+    # (short name / glossary alias) and narrow ONLY when it is unambiguous; a zero- or multi-project
+    # match fails open (no narrowing) so a fuzzy filter never mis-drops the real evidence.
+    narrow: set[str] | None
+    if proj is None:
+        narrow = None
+    elif project_alias_enabled():
+        aliases = _project_alias_map()
+        cand_projs = {nfc(row[1] or "") for row in candidates}
+        matched = {p for p in cand_projs if _project_matches(proj, p, aliases)}
+        narrow = matched if len(matched) == 1 else None
+    else:
+        narrow = {proj}
+
     qset = set(qtokens)
     scored: list[tuple[float, int, str, dict[str, Any]]] = []
     for rank, (doc_id, rproj, rext, locator, snippet, tokens) in enumerate(candidates):
-        if proj is not None and nfc(rproj or "") != proj:
+        if narrow is not None and nfc(rproj or "") not in narrow:
             continue
         if exts is not None and (rext or "") not in exts:
             continue
