@@ -191,7 +191,40 @@ def _extract_rate(texts: Sequence[tuple[FileRef, str]]) -> tuple[float, dict[str
     if len(vals) == 1:
         v, src = next(iter(vals.items()))
         return v, src
+    # 「時間単価は25,000円（税別）とする」等、ラベルと数値の間に格助詞(は/が/を/に/も)が入り、
+    # 数値の後ろに税別注記が続く本文形式（ひがし丘 6.2条など）。同一契約内で単価が一意なときのみ確定。
+    particle_re = re.compile(r"時間単価[はがをにも、\s]*[¥￥]?\s*" + _DEC + r"\s*円")
+    pvals: dict[float, dict[str, Any]] = {}
+    for ref, text in texts:
+        for line in text.splitlines():
+            m = particle_re.search(line)
+            if m:
+                pvals.setdefault(_to_num(m.group(1)), _source(ref.rel, snippet=line.strip()))
+    if len(pvals) == 1:
+        v, src = next(iter(pvals.items()))
+        return v, src
     return None
+
+
+# 工数（時間）閾値付きの条件条項（「N時間を超える/上回る場合」）。質問非依存に契約から網羅抽出する。
+# rounding 規則の「30分を超え…」等は 分単位なので拾わない（時間閾値のみ）。idx78 型の
+# 「特別な精算規定の有無」判定に使う: 質問の閾値が一つも該当しなければ特別規定なしと確定できる。
+_SPECIAL_PROVISION_RE = re.compile(r"(\d[\d,]*)\s*時間を(?:超え|上回)(?:た|る)?")
+
+
+def _extract_special_provisions(texts: Sequence[tuple[FileRef, str]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[float] = set()
+    for ref, text in texts:
+        for line in text.splitlines():
+            for m in _SPECIAL_PROVISION_RE.finditer(line):
+                hours = _to_num(m.group(1))
+                if hours in seen:
+                    continue
+                seen.add(hours)
+                out.append({"threshold_hours": hours, "clause": line.strip()[:200],
+                            "source": _source(ref.rel, snippet=line.strip()[:200])})
+    return out
 
 
 # --------------------------------------------------------------------------- payment schedule
@@ -260,7 +293,7 @@ STANDARD_OPERANDS = [
     "contract_type", "settlement_type", "time_rate_excl_tax", "tax_rate", "rounding_unit_hours",
     "estimated_effort_hours", "actual_effort_hours", "effort_variance",
     "estimate_amount_incl_tax", "confirmed_amount_incl_tax",
-    "missing_row_count", "payment_schedule",
+    "missing_row_count", "payment_schedule", "special_settlement_provisions",
 ]
 
 
@@ -370,6 +403,13 @@ def _make_record(project: str, refs: Sequence[FileRef], glossary: Any) -> CaseFi
     ops["payment_schedule"] = (_cell(sched, _source(_first_doc(contract_texts),
                                                     basis="支払/精算予定行（税込金額×支払年月）の網羅抽出"))
                                if sched else _missing("支払スケジュール行を抽出できない"))
+
+    # 工数閾値付き条件条項（「N時間を超える場合」）の網羅列挙（idx78 型の特別規定有無判定の素材）。
+    # 空リストは「そのような閾値条項が契約に無い」= 特別な精算規定なし、を honest に表す（欠測ではない）。
+    provisions = _extract_special_provisions(contract_texts)
+    ops["special_settlement_provisions"] = _cell(
+        provisions, _source(_first_doc(contract_texts),
+                            basis="契約書中の『N時間を超える/上回る場合』条項の網羅抽出（時間閾値のみ）"))
 
     return CaseFinance(case_id=nfc(project), abbrev=abbrev, operands=ops)
 
