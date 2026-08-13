@@ -843,6 +843,24 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
                 result = xlsx_formula_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
+        # SOT-2693 — 書式付き数値系列の上昇率レーン（会議録/報告資料系列の 黄×赤 数値を日付順に並べ、
+        # 最初→最後の上昇率、idx17 型）。上位レーンが束縛できない時のみ後置。RAG_FORMAT_SERIES OFF ⇒
+        # format_series_lane.resolve() は None ⇒ byte-identical。
+        if result is None:
+            try:
+                from src.rag.agent import format_series_lane
+                result = format_series_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
+        # SOT-2693 — 税率表 帯別差分レーン（PDF 価格帯×現行/新税率表の |新−現行| argmin/argmax、idx48 型）。
+        # 上位レーンが束縛できない時のみ後置。RAG_RATE_TABLE OFF ⇒ rate_table_lane.resolve() は None ⇒
+        # byte-identical。
+        if result is None:
+            try:
+                from src.rag.agent import rate_table_lane
+                result = rate_table_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path
         return None
     if result is None or not _contract.is_contract(result):
