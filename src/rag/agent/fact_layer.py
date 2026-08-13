@@ -992,6 +992,16 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
                 result = vdiff_direct_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
+        # SOT-2703 — 複合書式ファクトストアの決定論 lookup レーン（黄色ハイライト×赤字 idx16 / 太字∧下線∧
+        # イタリック idx71）。全 docx の書式付き run を質問非依存で焼き、属性集合∧project∧doc-kind（本文
+        # 自己同定『中間報告』含む）で一意に絞れた時だけ run テキストを逐語直答。上位レーンが束縛できない時
+        # のみ後置。RAG_FORMAT_FACTS OFF ⇒ format_facts_lane.resolve() は None ⇒ byte-identical。
+        if result is None:
+            try:
+                from src.rag.agent import format_facts_lane
+                result = format_facts_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path
         return None
     if result is None or not _contract.is_contract(result):
