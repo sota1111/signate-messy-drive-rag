@@ -486,6 +486,15 @@ def _pptx_money_page_tool() -> "tuple[str, str, dict[str, Any], Callable[..., An
         return None
 
 
+def _master_join_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | None":
+    """SOT-2713 人物×案件×役割×座席 全数結合 lookup tool (default OFF ⇒ None ⇒ surface byte-identical)。"""
+    try:
+        from src.rag.agent import master_join_lane
+        return master_join_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return None
+
+
 def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     """The 4 fact-layer tools, or ``[]`` when the layer is OFF (⇒ tool set / MCP surface byte-identical)."""
     if not enabled():
@@ -498,7 +507,7 @@ def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     optional += _raw_artifact_tools()
     optional += [x for x in (_xref_coverage_tool(), _nb_chart_tool(), _analysis_xref_tool(),
                             _staged_metrics_tool(), _derived_ranking_tool(), _analysis_metrics_tool(),
-                            _contact_master_tool(), _pptx_money_page_tool())
+                            _contact_master_tool(), _pptx_money_page_tool(), _master_join_tool())
                  if x is not None]
     return optional + [
         (CASE_FILTER,
@@ -1029,6 +1038,17 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
             try:
                 from src.rag.agent import sep_contract_lane
                 result = sep_contract_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
+        # SOT-2713 — 人物×案件×役割×座席 全数結合マスタの決定論直答レーン（乙側最多案件関与者の内線 idx13 /
+        # 甲側主担当者フルネーム idx43 / 着手金最高案件の指定役割担当者の内線 idx46）。上位レーンが束縛できない
+        # 時のみ後置。RAG_MASTER_JOIN_LOOKUP OFF ⇒ master_join_lane.resolve() は None ⇒ byte-identical。
+        # 証拠は既存の決定論抽出器（corpus_aggregate staff/deposit・seating_chart reviewed anchor・
+        # contact_master 署名欄）をビルド時に結合したもの。argmax 同率タイ/座席非一意/案件曖昧は fail-closed。
+        if result is None:
+            try:
+                from src.rag.agent import master_join_lane
+                result = master_join_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path
