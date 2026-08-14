@@ -361,6 +361,23 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  master join store skipped: {type(e).__name__}: {e}")
 
+    # pptx note-scope store (SOT-2714 / cycle11): question-independent count of ✖-marked out-of-scope
+    # items listed under a「スコープ対象外」heading in each pptx's presenter notes (idx27 型), so the
+    # 提案書ノートの対象外項目数 reduces to an O(1) lookup instead of file_grep over notesSlides. LLM-free
+    # (reads OOXML notesSlide paragraphs); runtime consumption is opt-in (RAG_PPTX_NOTE_SCOPE) so the
+    # champion serve path is byte-identical.
+    try:
+        from src.rag.index import pptx_note_scope_store
+        pns = pptx_note_scope_store.build(refs)
+        if verbose:
+            rep = pns["report"]
+            print(f"  pptx note-scope store: {pns['docs']} pptx "
+                  f"(with_scope={rep['docs_with_scope']}, items={rep['scope_items_total']}) "
+                  f"-> {pptx_note_scope_store.default_out_path()}")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  pptx note-scope store skipped: {type(e).__name__}: {e}")
+
     # Action-row store (SOT-2652): question-independent extraction of AI/task action rows, priority-task
     # lists and priority-follow notes from scanned-PDF minutes/reports (idx20/34/70/93 action-row abstains).
     # LLM-free (reads persisted OCR + text-layer); runtime consultation is opt-in (RAG_ACTION_ROW_STORE)

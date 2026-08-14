@@ -495,6 +495,15 @@ def _master_join_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] 
         return None
 
 
+def _pptx_note_scope_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | None":
+    """SOT-2714 pptx ノート「スコープ対象外」✖項目カウント lookup tool (default OFF ⇒ None ⇒ surface byte-identical)。"""
+    try:
+        from src.rag.agent import pptx_note_scope_lane
+        return pptx_note_scope_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return None
+
+
 def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     """The 4 fact-layer tools, or ``[]`` when the layer is OFF (⇒ tool set / MCP surface byte-identical)."""
     if not enabled():
@@ -507,7 +516,8 @@ def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     optional += _raw_artifact_tools()
     optional += [x for x in (_xref_coverage_tool(), _nb_chart_tool(), _analysis_xref_tool(),
                             _staged_metrics_tool(), _derived_ranking_tool(), _analysis_metrics_tool(),
-                            _contact_master_tool(), _pptx_money_page_tool(), _master_join_tool())
+                            _contact_master_tool(), _pptx_money_page_tool(), _master_join_tool(),
+                            _pptx_note_scope_tool())
                  if x is not None]
     return optional + [
         (CASE_FILTER,
@@ -1038,6 +1048,17 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
             try:
                 from src.rag.agent import pptx_money_page_lane
                 result = pptx_money_page_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
+        # SOT-2714 — pptx 発表者ノート「スコープ対象外」✖項目カウントの決定論直答レーン（恒一会 かえで総合病院
+        # 提案書.pptx notesSlide1 の見出し『スコープ対象外』直下 ✖段落 7本 → idx27）。対象 pptx を案件 + doc-kind
+        # （提案書）で一意束縛でき scope_excluded_count>0 の時だけ裸整数で直答。段落単位で数えるので読点併記も
+        # 1 項目、見出しが『スコープ対象外』でない例（スライド18『当初合意スコープ外』例示）はノート非在で除外。
+        # 上位レーンが束縛できない時のみ後置。RAG_PPTX_NOTE_SCOPE OFF ⇒ resolve() は None ⇒ byte-identical。
+        if result is None:
+            try:
+                from src.rag.agent import pptx_note_scope_lane
+                result = pptx_note_scope_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
         # SOT-2702 — 「別契約」と明記された役割の決定論抽出レーン（idx52 型）。既存 text_fts を質問非依存で
