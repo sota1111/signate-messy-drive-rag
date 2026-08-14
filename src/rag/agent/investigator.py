@@ -2977,6 +2977,33 @@ def _eu_signals_from_investigation(inv: "Investigation", question: str) -> Any:
     )
 
 
+def _apply_currency_diff_unit(inv: "Investigation", question: str) -> "Investigation":
+    """SOT-2718 — 通貨差額型の設問回答の単位を文脈通貨へ決定論固定する Gemini serve-boundary hook (in place)。
+
+    純 Gemini 経路（``RAG_INVESTIGATOR_BACKEND`` != claude-mcp）は claude_mcp / commit_gate のような serve 整形
+    フックを通らないため、値保存の単位固定（:func:`formatting.apply_currency_diff_unit`）をここで1点だけ適用する。
+    ``RAG_CURRENCY_DIFF_UNIT`` default OFF ⇒ この関数は ``inv`` を無改変で返す（byte-identical）。棄権回答・値の
+    有効数字は決して変えず、fired 時のみ ``interventions['currency_diff_unit']`` に記録する。fail-open。"""
+    from src.rag.agent import formatting as _formatting
+
+    if not _formatting.currency_diff_unit_enabled():
+        return inv
+    try:
+        ans = inv.answer
+        if is_abstain(ans.answer):
+            return inv
+        new_text, fired = _formatting.apply_currency_diff_unit(question, ans.answer)
+        if fired and new_text != ans.answer:
+            inv.answer = Answer(answer=new_text, confidence=ans.confidence,
+                                evidence=ans.evidence,
+                                method=(ans.method + " +currency_diff_unit").strip())
+            inv.interventions["currency_diff_unit"] = {"fired": True, "rules": fired,
+                                                       "from": ans.answer[:80], "to": new_text[:80]}
+    except Exception:  # noqa: BLE001 — value-preserving polish; never break the answer path
+        pass
+    return inv
+
+
 def _apply_answer_eu_gate(inv: "Investigation", question: str) -> "Investigation":
     """SOT-2635 — apply the expected-utility commit gate to a produced answer, in place, behind RAG_EU_GATE.
 
@@ -3338,4 +3365,5 @@ def answer_question(question: str, *, model: str | None = None,
                        spin_detection=SPIN_DETECTION, pivot_detection=SPIN_PIVOT,
                        search_cap=SEARCH_CAP, preamble=preamble)
     _inv.interventions.update(packet_interventions)  # SOT-2629 — merge env/packet-level telemetry
+    _inv = _apply_currency_diff_unit(_inv, question)  # SOT-2718 — Gemini serve-path 単位固定 (no-op unless ON)
     return _apply_answer_eu_gate(_inv, question)  # SOT-2635 — commit-time EU gate (no-op unless ON)
