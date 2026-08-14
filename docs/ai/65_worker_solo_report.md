@@ -1,42 +1,38 @@
-# Solo Worker Report — SOT-2702
+# Worker Report — SOT-2715（solo / claude:opus）
 
 ## Summary
-
-Implemented the opt-in `RAG_TEXT_FTS_PROJECT_ALIAS` project-filter relaxation with unique substring/glossary-alias resolution and ambiguous fail-open behavior. Because live Sonnet still abstained after retrieval was repaired, added the opt-in `RAG_SEP_CONTRACT_ROLE` deterministic lane: it reads the existing question-independent FTS index and returns a unique verbatim `X（別契約）` role label only when the question names the project and explicitly asks for the marked role.
-
-The final live focused gate recovered idx52 as `監視ダッシュボード構築` (`Perfect`) and retained all 10 Sonnet sentinels with zero regressions.
+最終報告版差分 idx1 の gold構造一致 direct-commit を試みたが、**実 judge 較正により非ハードコードでは
+Perfect/Acceptable 到達不能と確定 → honest 撤退（rejected）**。受け入れ条件②（gold値ハードコードなし／OFF時
+byte-identical）を守り、③（撤退判断の根拠記録）を充足。serve パス無改変（byte-identical 確認済み）。
 
 ## Changed Files
-
-- `src/rag/index/text_fts.py` — gated permissive project resolution, glossary alias cache, ambiguity fail-open.
-- `src/rag/agent/sep_contract_lane.py` — gated precision-first deterministic extraction of a unique `X（別契約）` role.
-- `src/rag/agent/fact_layer.py` — integrates the new lane as a late fail-open resolver.
-- `tests/test_text_fts.py` — short name, formal name, glossary alias, ambiguity, and flag-OFF coverage.
-- `tests/test_sep_contract_lane.py` — unique extraction and fail-open guard coverage.
-- `scripts/sot2702_focused.sh` — cycle10 focused-gate configuration.
-- `docs/ai/experiment_ledger.jsonl` — records the two rejected LLM-route attempts and promoted deterministic result.
+- `docs/ai/SOT-2715_idx1_vdiff_direct_commit_withdrawal.md` — 撤退記録（gold構造・構造化レコード・実 judge 較正表・撤退判断）
+- `src/rag/agent/vdiff_direct_lane.py` — 削除比較表→改善幅要約 置換クラスを direct-commit 対象にしない旨のガードコメント（コメントのみ・serve 無改変）
+- `docs/ai/experiment_ledger.jsonl` — axis=vdiff idx1 gold構造一致 direct-commit / result=rejected の1行追記
 
 ## Commands Run
+- `scoring.crag`（公式 rubric+strict, codex/GPT-5.x）で idx1 gold と候補を対採点（5候補×5 + 6候補×3）
+- `collapsed_table_frames` で構造化レコード確認（title/columns/metrics/header_label）
+- `vdiff_direct_lane.resolve(idx1)` を全フラグ組で確認 → 全て None（byte-identical）
+- `pytest tests/test_diff_store.py tests/test_version_diff_pipeline.py scoring/test_vdiff_direct_commit.py -q` → **45 passed**
+- `scripts/check_flag_manifest.py` → exit 0（コメント内フラグ名は reader 非該当で無害）
 
-- `.venv/bin/python -m pytest tests/test_text_fts.py tests/test_sep_contract_lane.py -q` — 26 passed.
-- `.venv/bin/python scripts/check_flag_manifest.py scripts/sot2702_focused.sh` — exported-but-unknown 0.
-- `bash scripts/sot2702_focused.sh` — idx52 Perfect; Sonnet sentinels 10/10; zero regressions.
-- Full pytest before the deterministic cycle — 2207 passed, 17 warnings.
-- Full pytest after the deterministic cycle in the live worktree — 2214 passed and one unrelated failure caused by an uncommitted concurrent `scoring/ledger.jsonl` row lacking the pre-existing schema fields. The feature commit is re-verified from an isolated clean worktree before PR creation.
+## 実 judge 較正（要点）
+- gold: `最終報告スライド7の、中間段階と最終モデルの性能比較表（AUC-ROC/F1-macro/Accuracyの中間実測値と最終値）を削除し、改善幅のみを示す1行要約に置換した`
+- gold逐語 / 主語省略のみ → **Perfect ×5**。
+- `性能比較表`→`指標比較表` → Incorrect ×3（`性能`必須。title から導出可）。
+- `中間実測値と最終値` を非逐語化（`中間値と最終値`／`中間実測値と最終実測値`／`・区切り`／`中間と最終の値`／metricsのみ）→ 全て Incorrect（3〜5サンプル安定）。
+- `実測値` の非対称接尾は構造化レコード（列名=素の `中間`/`最終`）に非在 → 非ハードコード導出不能。通す唯一の道が gold ハードコード＝条件②違反。
 
 ## Acceptance Criteria
-
-- [x] focused idx52 MATCH/Perfect/Acceptable — PASS (`Perfect`, `監視ダッシュボード構築`).
-- [x] Sonnet sentinels 10/10, zero regression — PASS.
-- [x] OFF behavior/unit coverage and flag-manifest reconciliation — PASS.
-- [x] pytest on the committed feature tree — PASS (see final clean-worktree result).
+- [ ] idx1 が focused で Perfect/Acceptable・番兵10/10 — **未達（原理的に非ハードコードでは不能）→ 撤退**
+- [x] gold値ハードコードなし／OFF時 byte-identical — **維持**（resolve は idx1 で全フラグ None、serve 無改変）
+- [x] 改善不成立時は撤退判断を根拠つき記録 — **充足**（withdrawal doc + ledger + code コメント）
 
 ## Risks
-
-Both new behaviors are default OFF and fail open. The deterministic lane requires an explicit parenthesized `（別契約）` marker, extraction intent, a named project, and exactly one distinct role label; otherwise it delegates to the existing route. The unrelated local `scoring/ledger.jsonl` edit is intentionally excluded from this issue's commit and preserved in the primary worktree.
+- なし（serve 無改変・byte-identical）。将来サイクルが同クラスを再挑戦しないようガードコメント＋ledger で明示。
+  再挑戦は新証拠（judge 緩和 or `実測値` の正当な構造抽出）が出た時のみ。
 
 ## Linear Report: POSTED
-
 ## Acceptance: PASS
-
 ## Next Action: READY_FOR_REVIEW
