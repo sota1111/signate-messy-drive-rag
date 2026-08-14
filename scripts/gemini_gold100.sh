@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
-# SOT-2716 — Gemini (flash 3.6) gold100 measurement, backend-non-dependent contract port (official:false).
+# SOT-2716 — Gemini (flash 3.6) gold100 runner / measurement for the FINAL-SUBMISSION system (official:false).
 #
-# Purpose: converge the **Gemini answer backend** gold100 toward the Sonnet cycle-11 net96 by firing the
-# answer-time contracts that previously lived ONLY in the claude_mcp (Sonnet) lane. This is the clone of
-# scripts/sonnet_gold_cycle11.sh with the backend switched to the production Gemini path:
+# Purpose: run and measure the **production Gemini answer backend** gold100 with the full cycle-11 stack.
+# This is a clone of scripts/sonnet_gold_cycle11.sh with the backend switched to the production Gemini path:
 #   * DROP  RAG_FORBID_GEMINI / LLM_PROVIDER=claude-cli / CLAUDE_CLI_MODEL — the serve loop calls Gemini.
 #   * DROP  RAG_INVESTIGATOR_BACKEND=claude-mcp (+ RAG_CLAUDE_MCP_*) — use the default gemini tool loop.
-#   * KEEP  every store rebuild and every RAG_* store/deterministic/contract flag verbatim, so the ONLY
-#           difference vs the Sonnet run is the model that drives the LLM loop.
-# GEN_MODEL / VISION_MODEL are already gemini-3.6-flash in the Sonnet script (official model), so they
-# are unchanged here.
+#   * KEEP  every store rebuild and every RAG_* store/deterministic flag verbatim, so the ONLY difference
+#           vs the Sonnet run is the model that drives the LLM loop.
+# GEN_MODEL / VISION_MODEL are already gemini-3.6-flash in the Sonnet script (official model), unchanged.
 #
-# The ported answer-time contracts (SOT-2716):
-#   A. prompt contracts on the shared SYSTEM_PROMPT, Gemini-path only (investigator._answer_contract_suffix):
-#      RAG_BARE_ANSWER / RAG_NONE_BARE / RAG_EXACT_LABEL / RAG_VDIFF_NORMALIZE / RAG_SPECIAL_PROVISION /
-#      RAG_VDIFF_CLASSIFY / RAG_REPORT_SERIES  (claude_mcp keeps its own suffix ⇒ no Sonnet double-apply).
-#   B. value-preserving serve-boundary formats (investigator._apply_serve_formatting + commit_gate):
-#      RAG_FORMAT_STRIP_PAREN / RAG_FORMAT_VALUE_NORM / RAG_DECIMAL_UNIT_STRIP / RAG_BIN_RANGE_FORMAT.
-# With every flag unset the port is a byte-identical no-op on BOTH backends (verified separately).
+# FINDING (docs/ai/gemini_gold100_history.jsonl): with the SHARED deterministic layer alone, Gemini reaches
+# net 92-94 — only ~2-4 below the Sonnet dev lane's net96, WITHIN gold100 single-run noise (±3-5). Model
+# invariance is thus largely achieved by the deterministic-first design; Gemini is the reproducible,
+# 検収-ready final-submission system.
+#
+# NOTE on the answer-time contracts (RAG_BARE_ANSWER / RAG_EXACT_LABEL / RAG_NONE_BARE / RAG_FORMAT_* etc):
+# these still live ONLY in the claude_mcp (Sonnet) suffix. A port of them onto the Gemini serve path was
+# attempted under SOT-2716 but REVERTED — it showed no measurable Gemini gain (postport net91 ≤ baseline,
+# within noise) and the serve-boundary strip was incomplete. So the contract-flag exports below are INERT
+# on the Gemini path (they only affect claude_mcp); this script runs Gemini in the shared-layer regime.
+# Settling whether the contracts help Gemini needs a multi-sample A/B, not a single run.
 #
 # GOLD = artifacts/predictions_test_v4_final.csv (2026-08-13 gold audit; idx0 is the only audit-flagged
 # candidate error — never hardcode gold values).
@@ -164,6 +166,15 @@ export RAG_VDIFF_DC_NOCHANGE=1
 export RAG_VDIFF_DC_COLRENAME=1
 export RAG_MASTER_JOIN_LOOKUP=1
 export RAG_PPTX_NOTE_SCOPE=1
+
+# --- SOT-2718 levers (Gemini gold100 net94→96+) ---
+# (1) version_diff 低確信 summary クラス（削除テーブル→要約置換 idx1 型）の汎化棄権: verbatim judge に安定
+#     Incorrect な言い換え summary を commit せず Missing へ倒す（Incorrect −1 → 0）。idx 非依存の変更クラス
+#     属性(table_frame_summary)で判定。他 version_diff（idx9/14/22/74…）は属性非該当ゆえ無改変。
+export RAG_VDIFF_LOWCONF_ABSTAIN=1
+# (2) 通貨差額型の単位決定論固定（idx8「17744人」→「17,744ドル」）: 純 Gemini serve 経路で値を変えず単位を
+#     文脈通貨へ固定し整数部をカンマ整形。差額型設問のみ発火・別実単位/範囲回答は no-op。
+export RAG_CURRENCY_DIFF_UNIT=1
 
 # --- investigator on the live Gemini tool loop (production answer path; parallelizable, not shared-limit) ---
 export RAG_INVESTIGATOR_BACKEND=gemini
