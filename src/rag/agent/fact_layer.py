@@ -1020,6 +1020,16 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
                 result = format_facts_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
+        # SOT-2711 — docx コメントアンカーストアの決定論直答レーン（東都人材 会議録のコメント付き本文逐語
+        # 抽出 idx49）。全 docx のコメント（本文・アンカー範囲逐語・位置）を質問非依存で焼き、project∧doc-kind
+        # で選んだ文書群のアンカーが一意/列挙で確定した時だけ anchor_text を逐語直答。上位レーンが束縛できない
+        # 時のみ後置。RAG_DOCX_COMMENT_ANCHOR OFF ⇒ docx_comment_lane.resolve() は None ⇒ byte-identical。
+        if result is None:
+            try:
+                from src.rag.agent import docx_comment_lane
+                result = docx_comment_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
         # SOT-2705 — pptx 金額提示ページストアの決定論直答レーン(京ソ 提案書_final.pptx『費用見積』→頁 idx59)。
         # 対象 pptx を一意束縛でき、金額提示スライドが価格タイトル or 金額トークン密度で 1 枚に確定した時だけ
         # 可視頁番号(無ければ物理)を裸形式で直答。上位レーンが束縛できない時のみ後置。RAG_PPTX_MONEY_PAGE OFF ⇒

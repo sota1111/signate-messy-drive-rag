@@ -48,6 +48,16 @@ _KIND_CUES = (
 _CORP_AFFIX = re.compile(
     r"(株式会社|医療法人社団|医療法人|一般社団法人|一般財団法人|有限会社|合同会社|合資会社|合名会社)")
 
+# 列挙要求（「…をすべて抽出」「全て列挙」等）。すべて/全て/全部 の直後が抽出系動詞の時だけ列挙モード。
+# idx11「太字…イタリックの **すべてに該当** する箇所を抽出」は すべて の直後が「に該当」なので非列挙
+# （＝装飾の連言、単発 lookup）。この隣接規則で列挙(idx3)と連言(idx11/71)を機械分離する。
+_ENUM_RE = re.compile(r"(?:すべて|全て|全部|全ての)(?:を|の)?(?:抽出|列挙|挙げ|書き出|抜き出|列記|洗い出)")
+# 日付除外フィルタ（「日付以外」「日付を除」）。
+_DATE_EXCL_RE = re.compile(r"日付以外|日付を除|日付は除|日付除")
+# 日付らしい span（西暦/和暦の年月日。区切りは - / . 年月日）。列挙時の除外に使う（gold 非依存の構造規則）。
+_DATE_RE = re.compile(
+    r"^(?:令和|平成|昭和|r|h|s)?\s*\d{1,4}\s*[-/.年]\s*\d{1,2}\s*[-/.月]\s*\d{1,2}\s*日?$")
+
 
 def enabled() -> bool:
     return _store.enabled()
@@ -139,12 +149,103 @@ def _select_docs(qn: str, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [d for s, d in scored if s == top]
 
 
+# --------------------------------------------------------------------------- 強調span 収集
+def _is_date(text: str) -> bool:
+    return bool(_DATE_RE.match(unicodedata.normalize("NFKC", str(text or "")).strip()))
+
+
+def _emph_source(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """強調span の供給元。``emph_spans``（merged, docx/pptx/pdf）優先、無ければ ``runs`` から装飾ありを流用
+    （旧スキーマ/合成レコード向けの fail-open）。"""
+    spans = doc.get("emph_spans")
+    if spans:
+        return spans
+    return [r for r in doc.get("runs", [])
+            if any(r.get("attrs", {}).get(k) for k in ("bold", "underline", "italic"))]
+
+
+def _collect_emph(docs: list[dict[str, Any]], req: dict[str, Any], *,
+                  exclude_dates: bool) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
+    """選択文書の強調span から要求装飾を満たすものを文書順で収集（テキスト重複は初出のみ）。"""
+    seen: set[str] = set()
+    out: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+    for d in docs:
+        for sp in _emph_source(d):
+            if not _run_satisfies(sp.get("attrs", {}), req):
+                continue
+            text = str(sp.get("text", "")).strip()
+            if not text:
+                continue
+            if exclude_dates and _is_date(text):
+                continue
+            if text not in seen:
+                seen.add(text)
+                out.append((d, sp, text))
+    return out
+
+
 # --------------------------------------------------------------------------- 直答
-def _result(value: Any, *, evidence: dict[str, Any]) -> dict[str, Any]:
+def _result(value: Any, *, selection: str = "composite_format",
+            evidence: dict[str, Any]) -> dict[str, Any]:
     ev = {"store": "format_facts", "provenance": "precomputed (question-independent)", **evidence}
-    method = {"engine": "format_facts", "contract": "simple_lookup", "selection": "composite_format",
+    method = {"engine": "format_facts", "contract": "simple_lookup", "selection": selection,
               "naturalize": False, "verified_operand": True, "confidence": 1.0}
     return {"value": value, "evidence": ev, "method": method}
+
+
+def _resolve_color(qn: str, docs: list[dict[str, Any]],
+                   req: dict[str, Any]) -> "dict[str, Any] | None":
+    """色述語（highlight/font_color）を含む質問: docx の色付き run から一意束縛（idx16 型）。"""
+    hits: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for d in docs:
+        for run in d.get("runs", []):
+            if _run_satisfies(run.get("attrs", {}), req):
+                hits.append((d, run))
+    if not hits:
+        return None
+    distinct: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    for d, run in hits:
+        distinct.setdefault(run.get("text", ""), (d, run))
+    if len(distinct) != 1:
+        return None  # 複数の異なる値 ⇒ 曖昧 ⇒ 従来経路へ
+    value = next(iter(distinct))
+    if not str(value).strip():
+        return None
+    doc, run = distinct[value]
+    return _result(value, evidence={
+        "case": doc.get("project"), "doc_id": doc.get("rel"), "doc_kind": doc.get("doc_kind"),
+        "locator": run.get("loc"), "attrs": run.get("attrs"), "required": req, "n_hits": len(hits)})
+
+
+def _resolve_emphasis(qn: str, docs: list[dict[str, Any]],
+                      req: dict[str, Any]) -> "dict[str, Any] | None":
+    """装飾述語（太字/下線/イタリックのみ）の質問: merged 強調span から列挙 or 一意束縛。
+
+    * 列挙モード（「…をすべて抽出」）: 要求装飾を満たす span を文書順に「、」連結（日付除外つき）。
+    * 単発モード（idx11 PDF / idx71 docx の B∧U∧I 等）: 相異なる値が 1 つに絞れた時だけ逐語直答。
+    """
+    exclude_dates = bool(_DATE_EXCL_RE.search(qn))
+    collected = _collect_emph(docs, req, exclude_dates=exclude_dates)
+    if not collected:
+        return None
+    if _ENUM_RE.search(qn):
+        value = "、".join(t for _, _, t in collected)
+        doc, sp, _ = collected[0]
+        return _result(value, selection="composite_format_enumerate", evidence={
+            "case": doc.get("project"), "doc_id": doc.get("rel"), "doc_kind": doc.get("doc_kind"),
+            "locator": sp.get("loc"), "required": req, "exclude_dates": exclude_dates,
+            "n_items": len(collected)})
+    distinct: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    for d, sp, t in collected:
+        distinct.setdefault(t, (d, sp))
+    if len(distinct) != 1:
+        return None
+    value = next(iter(distinct))
+    doc, sp = distinct[value]
+    return _result(value, evidence={
+        "case": doc.get("project"), "doc_id": doc.get("rel"), "doc_kind": doc.get("doc_kind"),
+        "locator": sp.get("loc"), "attrs": sp.get("attrs"), "required": req,
+        "n_hits": len(collected)})
 
 
 def resolve(question: str) -> "dict[str, Any] | None":
@@ -166,30 +267,10 @@ def resolve(question: str) -> "dict[str, Any] | None":
         docs = _select_docs(qn, docs)
         if not docs:
             return None
-        # 全該当文書の書式付き run から要求属性を満たすものを収集。
-        hits: list[tuple[dict[str, Any], dict[str, Any]]] = []
-        for d in docs:
-            for run in d.get("runs", []):
-                if _run_satisfies(run.get("attrs", {}), req):
-                    hits.append((d, run))
-        if not hits:
-            return None
-        distinct = {}
-        for d, run in hits:
-            distinct.setdefault(run.get("text", ""), (d, run))
-        if len(distinct) != 1:
-            return None  # 複数の異なる値 ⇒ 曖昧 ⇒ 従来経路へ（無理な回答化をしない）
-        value = next(iter(distinct))
-        doc, run = distinct[value]
-        if not str(value).strip():
-            return None
-        res = _result(
-            value,
-            evidence={"case": doc.get("project"), "doc_id": doc.get("rel"),
-                      "doc_kind": doc.get("doc_kind"), "locator": run.get("loc"),
-                      "attrs": run.get("attrs"), "required": req,
-                      "n_hits": len(hits)})
-        if _contract.is_contract(res) and res.get("value") is not None:
+        wants_color = ("highlight" in req) or ("font_color" in req)
+        res = (_resolve_color(qn, docs, req) if wants_color
+               else _resolve_emphasis(qn, docs, req))
+        if res is not None and _contract.is_contract(res) and res.get("value") is not None:
             return _contract.ensure_contract(res)
     except Exception:  # noqa: BLE001 — 壊れたレーンは fall back、答えパスを壊さない
         return None

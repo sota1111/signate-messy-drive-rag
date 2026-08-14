@@ -186,3 +186,81 @@ def test_store_load_schema_roundtrip(tmp_path):
     assert len(rows) == 5
     aym = [r for r in rows if "青葉与信" in r["project"]]
     assert len(aym) == 2 and any("中間報告" in r["doc_kind"] for r in aym)
+
+
+# =========================================================================== SOT-2711 列挙 / emph_spans
+def _emph(text, *, bold=False, underline=False, italic=False, loc="p"):
+    return {"text": text, "attrs": {"bold": bold, "underline": underline, "italic": italic}, "loc": loc}
+
+
+def test_is_date_structural_rule():
+    assert L._is_date("2025-09-02") and L._is_date("2025/10/7") and L._is_date("2025年9月2日")
+    assert not L._is_date("time_and_materials")
+    assert not L._is_date("25,000円／時間")      # 数字を含むが日付ではない
+    assert not L._is_date("30分単位")
+
+
+def test_enum_regex_separates_enumerate_from_conjunction():
+    # idx3 型「…をすべて抽出」＝列挙。idx11/71 型「すべてに該当する箇所を抽出」＝装飾連言（非列挙）。
+    assert L._ENUM_RE.search(L._norm("日付以外のものをすべて抽出してください。"))
+    assert not L._ENUM_RE.search(L._norm("太字、下線、イタリックのすべてに該当する箇所を抽出してください。"))
+
+
+def _kaede_bold_record():
+    """idx3: かえで契約書の太字 merged span（日付 2 種 + 実データ 4 件）。"""
+    kaede = "医療法人社団 恒一会 かえで総合病院"
+    return {
+        "project": kaede, "rel": f"プロジェクト/{kaede}/01.契約/契約書_pw-kaede20250902.docx",
+        "name": "契約書_pw-kaede20250902.docx", "doc_kind": ["契約書"], "ext": "docx",
+        "n_runs": 0, "runs": [],
+        "emph_spans": [
+            _emph("2025-09-02", bold=True), _emph("2025-10-07", bold=True),
+            _emph("time_and_materials", bold=True),
+            _emph("実績工数に基づき、案件完了後に最終成果物の検収を経て一括精算する。", bold=True),
+            _emph("30分単位", bold=True), _emph("2025-09-02", bold=True),  # 重複日付
+            _emph("25,000円／時間", bold=True)],
+    }
+
+
+@pytest.fixture
+def enum_store(monkeypatch):
+    monkeypatch.setattr(S, "load", lambda path=None: [_kaede_bold_record()])
+    monkeypatch.setenv("RAG_FORMAT_FACTS", "1")
+    monkeypatch.setenv("RAG_FACT_LAYER", "1")
+    return None
+
+
+def test_idx3_bold_enumeration_excludes_dates(enum_store):
+    r = L.resolve("恒一会 かえで総合病院の契約書において、太字で記載されている箇所のうち、"
+                  "日付以外のものをすべて抽出してください。")
+    assert r is not None
+    assert r["value"] == ("time_and_materials、実績工数に基づき、案件完了後に最終成果物の検収を経て"
+                          "一括精算する。、30分単位、25,000円／時間")   # 日付 2 種除外・重複除去・文書順
+    assert r["method"]["selection"] == "composite_format_enumerate"
+
+
+def test_idx3_without_date_exclusion_keeps_dates(enum_store):
+    # 「日付以外」が無ければ日付も列挙に含む（構造規則は質問駆動; gold 非依存）。
+    r = L.resolve("恒一会 かえで総合病院の契約書の太字箇所をすべて列挙してください。")
+    assert r is not None and r["value"].startswith("2025-09-02、2025-10-07、time_and_materials")
+
+
+def _aomine_pdf_bui_record():
+    """idx11: 青嶺 報告資料 PDF の B∧U∧I merged span（pdf は runs 無し・emph_spans のみ）。"""
+    aomine = "株式会社青嶺不動産アセットマネジメント"
+    return {
+        "project": aomine, "rel": f"プロジェクト/{aomine}/05.会議/報告資料/報告資料_2025-08-06.pdf",
+        "name": "報告資料_2025-08-06.pdf", "doc_kind": ["報告資料"], "ext": "pdf",
+        "n_runs": 0, "runs": [],
+        "emph_spans": [_emph("4,675,000円", bold=True, underline=True, italic=True)],
+    }
+
+
+def test_idx11_pdf_bold_underline_italic_single_binding(monkeypatch):
+    monkeypatch.setattr(S, "load", lambda path=None: [_aomine_pdf_bui_record()])
+    monkeypatch.setenv("RAG_FORMAT_FACTS", "1")
+    r = L.resolve("青嶺不動産アセットマネジメントの報告資料の中で、"
+                  "太字、下線、イタリックのすべてに該当する箇所を抽出してください。")
+    assert r is not None and r["value"] == "4,675,000円"
+    assert "報告資料_2025-08-06.pdf" in r["evidence"]["doc_id"]
+    assert r["method"]["selection"] == "composite_format"       # 単発（列挙でない）
