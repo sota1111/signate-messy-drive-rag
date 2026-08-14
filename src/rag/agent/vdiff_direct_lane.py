@@ -259,6 +259,14 @@ def _resolve_no_change(rec: "dict[str, Any]") -> "dict[str, Any] | None":
     return {"value": "該当なし", "evidence": evidence, "method": method}
 
 
+# SOT-2715 (idx1) — 削除比較表→改善幅要約の置換クラスは direct-commit 対象に **しない**（撤退）。
+# 実 judge 較正で gold の弁別トークン「性能比較表」「中間実測値と最終値（中間=実測値/最終=値 の非対称接尾）」が
+# 逐語要求と確定。「性能」は collapsed_table_frames の title から導出できるが、「実測値」は構造化レコード（列名は
+# 素の 中間/最終）のどこにも無く、非ハードコードで生成した文は全て Incorrect（対称化・区切り変更・列名 naturalize・
+# metrics のみ、いずれも 3〜5 サンプルで安定 Incorrect）。通す唯一の道が gold ハードコード＝受け入れ条件違反のため、
+# RAG_VDIFF_DC_TABLEREPL 的なサブフラグは追加せず serve は byte-identical のまま従来経路へ委譲する。
+# 根拠と較正表: docs/ai/SOT-2715_idx1_vdiff_direct_commit_withdrawal.md。再挑戦は新証拠（judge緩和 or 実測値の
+# 正当な構造抽出）が出た時のみ。
 def resolve(question: str) -> "dict[str, Any] | None":
     """rank0 が summary 付き SUBSTANTIVE の一意ペアに束縛できる時だけ、その summary を逐語 commit する contract。
 
