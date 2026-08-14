@@ -285,6 +285,72 @@ def test_extract_pivot_context_off_is_absent(monkeypatch):
     assert "pivot_context" not in f22           # OFF ⇒ store byte-identical
 
 
+def _nested_pivot_workbook():
+    """SOT-2709 idx77: a workbook with (a) a flat ``train`` source sheet giving value-domains and (b) a
+    ``Sheet2`` holding two side-by-side pivots — a left ``children`` pivot (A:C) and a right *compact
+    nested* pivot (D:F) whose D column stacks the outer group (children 0..3) with inner ``no``/``yes``
+    (smoker) under a generic ``行ラベル`` header. The highlighted E14 sits at children=3 → no."""
+    wb = openpyxl.Workbook()
+    # source data sheet (row-1 header) — includes charges⊂children and a wide id to test disambiguation
+    src = wb.active
+    src.title = "train"
+    for c, h in enumerate(["id", "children", "smoker", "charges"], start=1):
+        src.cell(1, c, h)
+    # children domain {0,1,2,3} exactly matches the pivot's outer groups; charges {0,1,2} ⊂ children
+    # (shadowed); id {0..7} is a superset (never a subset of the index) — all three are disambiguated.
+    rows = [(0, 0, "no", 0), (1, 1, "yes", 1), (2, 2, "no", 2), (3, 3, "yes", 0),
+            (4, 0, "no", 1), (5, 1, "yes", 2), (6, 2, "no", 0), (7, 3, "no", 1)]
+    for r, (i, ch, sm, cg) in enumerate(rows, start=2):
+        src.cell(r, 1, i); src.cell(r, 2, ch); src.cell(r, 3, sm); src.cell(r, 4, cg)
+
+    piv = wb.create_sheet("Sheet2")
+    for c, h in enumerate(["children", "合計 / age", "合計 / bmi",
+                           "行ラベル", "合計 / age", "合計 / bmi"], start=1):
+        piv.cell(3, c, h)
+    # left pivot: children groups down column A (its first group value 0 must NOT leak into the D pivot)
+    for r, v in [(4, 0), (7, 1), (10, 2), (13, 3)]:
+        piv.cell(r, 1, v)
+    # right compact nested pivot in column D: outer children value then inner no/yes below it
+    d_col = [(4, 0), (5, "no"), (6, "yes"), (7, 1), (8, "no"), (9, "yes"),
+             (10, 2), (11, "no"), (12, "yes"), (13, 3), (14, "no"), (15, "yes")]
+    for r, v in d_col:
+        piv.cell(r, 4, v)
+    piv.cell(14, 5, 4674)                       # E14 = 合計 / age under children=3 ∧ smoker=no
+    piv.cell(14, 5).fill = _fill("FFFFFF00")
+    return wb
+
+
+def test_extract_nested_pivot_context_carry_down(monkeypatch):
+    monkeypatch.setenv("RAG_HIGHLIGHT_PIVOT_CONTEXT", "1")
+    wb = _nested_pivot_workbook()
+    rec = vs._extract_sheet(wb["Sheet2"])
+    e14 = next(s for s in rec["static"] if s["cell"] == "E14")
+    pc = e14["pivot_context"]
+    assert pc["column_header"] == "合計 / age"
+    # generic 行ラベル resolved by value-domain: children (outer, carried down) then smoker (inner);
+    # neighbouring pivot's column A (children=0) is excluded by the aggregate-column block boundary.
+    assert pc["row_context"] == [
+        {"name": "children", "value": "3"}, {"name": "smoker", "value": "no"}]
+    assert vl._format_pivot_answer(pc) == "children=3、smoker=noで抽出されたデータに対する合計 / age"
+
+
+def test_extract_nested_pivot_off_is_absent(monkeypatch):
+    monkeypatch.delenv("RAG_HIGHLIGHT_PIVOT_CONTEXT", raising=False)
+    rec = vs._extract_sheet(_nested_pivot_workbook()["Sheet2"])
+    e14 = next(s for s in rec["static"] if s["cell"] == "E14")
+    assert "pivot_context" not in e14           # OFF ⇒ store byte-identical
+
+
+def test_level_domains_shadow_and_dim_resolution():
+    domains = {"id": {str(i) for i in range(400)}, "children": {"0", "1", "2", "3", "4", "5"},
+               "smoker": {"no", "yes"}, "charges": {"0", "1", "2"}}
+    index_values = {"0", "1", "2", "3", "4", "5", "no", "yes"}
+    levels = vs._level_domains(index_values, domains)
+    assert set(levels) == {"children", "smoker"}          # charges⊂children shadowed; id not a subset
+    assert vs._dim_of_value("0", levels) == "children"    # ambiguous 0 → the real (unshadowed) level
+    assert vs._dim_of_value("no", levels) == "smoker"
+
+
 def _pivot_records():
     higashi = "プロジェクト/医療法人社団 蒼泉会 ひがし丘総合病院/03.データ/train.xlsx"
     pctx = {"header_row": 3, "column_header": "平均 / bmi", "agg_hint": "平均",
