@@ -34,6 +34,24 @@ def enabled() -> bool:
     return os.getenv("RAG_VDIFF_DIRECT_COMMIT", "0").strip().lower() in _ON
 
 
+def lowconf_abstain_enabled() -> bool:
+    """SOT-2718 — 版差分 direct-commit の**低確信 summary クラスを棄権化**するか（``RAG_VDIFF_LOWCONF_ABSTAIN``,
+    既定 OFF ⇒ byte-identical）。
+
+    経路・質問・idx 非依存の**変更クラス属性**で判定する低確信棄権。対象は :data:`_LOWCONF_SUMMARY_ATTRS`
+    が示す「削除されたテーブル/フレームを要約文へ置換した」変更（idx1 型）: gold は削除された表の内部値の逐語
+    （例「中間実測値と最終値」）を要求するが、構造化 diff record は削除済みセルを verbatim 復元できないため、
+    direct-commit の言い換え summary は verbatim judge に対し安定 Incorrect になる（SOT-2706/2715 で確定）。
+    Incorrect(−1) < Missing(0) ゆえ、このクラスは summary を commit する代わりに棄権するのが EV 正。"""
+    return os.getenv("RAG_VDIFF_LOWCONF_ABSTAIN", "0").strip().lower() in _ON
+
+
+# SOT-2718 — 低確信 summary の変更クラス属性（diff_store classifier 由来・質問非依存）。ここに列挙した属性を
+# rank0 が持つ direct-commit summary は、削除内部値の逐語復元が構造的に不可能なため verbatim judge に対し安定
+# Incorrect ⇒ commit せず棄権する。table_frame_summary=「表/フレームを1行要約へ置換した削除」クラス（idx1）。
+_LOWCONF_SUMMARY_ATTRS = ("table_frame_summary",)
+
+
 def _subflag(name: str) -> bool:
     """SOT-2712 — a direct-commit target-class extension is gated by its own sub-flag (default OFF).
 
@@ -141,6 +159,33 @@ def _bind_record(diff_store, question: str) -> "dict[str, Any] | None":
     return None
 
 
+def _lowconf_abstain(rec: "dict[str, Any]", rank0: "dict[str, Any]",
+                     lowconf_attrs: "list[str]") -> "dict[str, Any]":
+    """SOT-2718 — 低確信 summary クラスの棄権 contract（value=棄権センチネル・confidence 0.0）。
+
+    fact_layer.resolve → format_contract → _answer_from_det_contract を通ると is_abstain 判定で Missing として
+    served される（naturalize は method で無効化）。gold 値・idx はハードコードしない（属性で選ぶ）。"""
+    from config import settings
+    evidence = {
+        "old_file": rec.get("old_rel"),
+        "new_file": rec.get("new_rel"),
+        "version_basis": rec.get("basis"),
+        "structural_location": rank0.get("structural_location"),
+        "lowconf_attributes": list(lowconf_attrs),
+        "store": "diff_store",
+        "provenance": ("低確信 summary クラス（削除テーブル/フレーム→要約置換）: 削除内部値の逐語復元が構造的に"
+                       "不可能で verbatim judge に安定 Incorrect ⇒ Incorrect(−1) 回避のため棄権(Missing 0)"),
+    }
+    method = {
+        "engine": "diff_store",
+        "contract": "version_diff",
+        "selection": "lowconf_summary_abstain",
+        "naturalize": False,
+        "confidence": 0.0,
+    }
+    return {"value": settings.ABSTAIN, "evidence": evidence, "method": method}
+
+
 def _summary_commit(rec: "dict[str, Any]") -> "dict[str, Any] | None":
     """SOT-2706 の逐語 summary commit（idx1/22）— rank0 が summary 付き SUBSTANTIVE 唯一の時だけ commit。"""
     changes = rec.get("changes") or []
@@ -157,6 +202,12 @@ def _summary_commit(rec: "dict[str, Any]") -> "dict[str, Any] | None":
                   if str(c.get("summary") or "").strip() and c.get("intent") == "SUBSTANTIVE"]
     if len(summarized) != 1 or summarized[0] is not rank0:
         return None
+    # SOT-2718 — 低確信 summary クラス（削除テーブル→要約置換 等）は、言い換え summary が verbatim judge に
+    # 対し安定 Incorrect ⇒ commit せず棄権（Incorrect −1 → Missing 0）。RAG_VDIFF_LOWCONF_ABSTAIN OFF なら
+    # 従来どおり summary を commit（byte-identical）。判定は idx 非依存の変更クラス属性のみで行う。
+    lowconf = [a for a in (rank0.get("attributes") or []) if a in _LOWCONF_SUMMARY_ATTRS]
+    if lowconf and lowconf_abstain_enabled():
+        return _lowconf_abstain(rec, rank0, lowconf)
     evidence = {
         "old_file": rec.get("old_rel"),
         "new_file": rec.get("new_rel"),

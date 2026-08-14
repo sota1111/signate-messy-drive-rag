@@ -436,6 +436,83 @@ def naturalize_bin_range(question: str, value: str) -> "tuple[str, list[str]]":
     return new, rules
 
 
+# --- SOT-2718 — 通貨差額型の単位決定論固定 (idx8: 「17744人」→「17,744ドル」) ----------------------
+# 症状: 通貨の差額を問う設問（給与差 等）で LLM が値は正しく到達する（idx8=17744）のに、単位を人数系
+# （人/名/…）で framing したり裸数値のまま返して gold「17,744ドル」と judge 不一致になる (unit churn)。
+# 修正(質問・idx 非依存): 設問が「通貨差額型」（差/違い + 通貨・金額文脈 + いくら/何ドル）で、回答が
+#   * 裸数値、または
+#   * 明らかに誤った無次元カウンタ単位（人/名/社/件/個/人分/名分）付き、または
+#   * 対象通貨だが桁区切り欠落／末尾括弧注記付き
+# のとき、値は一切変えずに **設問文脈の通貨**（米国/ドル/USD/$ → ドル、円/日本円 → 円）へ単位を固定し、
+# 整数部を3桁カンマ区切りへ整形する。通貨が文脈から一意に定まらない・別の実単位が付く回答は no-op（推測しない）。
+_CURRENCY_DIFF_Q_RE = re.compile(
+    r"(?=.*(?:差|違い|差額))(?=.*(?:給与|給料|年収|報酬|金額|価格|費用|コスト|単価|総額|売上|利益|額|ドル|円|USD))"
+    r".*(?:いくら|何\s*(?:ドル|円)|差額)")
+# 対象通貨をカウンタとして誤付与しがちな無次元単位（これらは通貨差額回答では常に誤り ⇒ 上書き対象）。
+_WRONG_CURRENCY_UNITS = frozenset({"", "人", "名", "社", "件", "個", "人分", "名分", "者"})
+# 桁区切り／末尾括弧を正すため、既に対象通貨で終わる回答も再整形対象に含める。
+_CURRENCY_UNIT_TOKENS = frozenset({"ドル", "円", "米ドル", "USドル", "US$", "$", "＄"})
+# 末尾の（人）/(人) 等の括弧注記（数値+単位 or 単位のみ）。値本体の後ろに付く冗長注記のみを対象にする。
+_TRAILING_UNIT_PAREN_RE = re.compile(r"\s*[（(][0-9０-９,，.\s]*(?:人|名|社|件|個|ドル|円)?[)）]\s*$")
+
+
+def currency_diff_unit_enabled() -> bool:
+    """SOT-2718 — 通貨差額型の単位決定論固定が発火するか (``RAG_CURRENCY_DIFF_UNIT``, default OFF ⇒ byte-identical)。"""
+    return _env_flag("RAG_CURRENCY_DIFF_UNIT", False)
+
+
+def _context_currency(question: str) -> "str | None":
+    """設問文脈から対象通貨を一意決定する（米国/ドル/USD/$ → 「ドル」、円/日本円 → 「円」、不明 → None）。"""
+    q = question or ""
+    if re.search(r"米国|ドル|USD|米ドル|US\$|[\$＄]", q):
+        return "ドル"
+    if re.search(r"円|日本円|邦貨", q):
+        return "円"
+    return None
+
+
+def apply_currency_diff_unit(question: str, value: str) -> "tuple[str, list[str]]":
+    """通貨差額型の設問回答の単位を文脈通貨へ決定論固定し、整数部をカンマ整形する値保存の書式契約 (SOT-2718)。
+
+    Returns ``(new_value, fired_rules)`` — 変化なしなら ``fired_rules`` は空。設問が「通貨差額型」でないもの、
+    回答が数値+単位形に一意にパースできないもの、既に正しい書式のもの、別の実単位が付くもの、通貨が文脈から
+    定まらないものはいずれも no-op。数値そのもの（有効数字）は決して変更しない。
+    """
+    rules: list[str] = []
+    if not value or "\n" in value.strip():
+        return value, rules
+    if not _CURRENCY_DIFF_Q_RE.search(question or ""):
+        return value, rules
+    currency = _context_currency(question)
+    if currency is None:
+        return value, rules
+    text = value.strip()
+    # 末尾括弧注記（（人）等）を先に落としてから数値+単位をパース（値本体は括弧の前）。
+    core = _TRAILING_UNIT_PAREN_RE.sub("", text).strip() or text
+    m = _NUMBER_UNIT_RE.match(core)
+    if not m:
+        return value, rules
+    unit = (m.group("unit") or "").strip()
+    # 上書きしてよいのは：誤カウンタ単位・裸数値・対象通貨トークン（桁区切り/括弧の是正）に限る。
+    # それ以外の実単位（時間/%/ページ 等）が付く回答は検出外 ⇒ 触らない（推測しない）。
+    if unit not in _WRONG_CURRENCY_UNITS and unit not in _CURRENCY_UNIT_TOKENS:
+        return value, rules
+    num_raw = m.group("num").replace(",", "")
+    try:
+        if "." in num_raw:
+            ip, fp = num_raw.split(".", 1)
+            formatted_num = f"{int(ip):,}.{fp}"
+        else:
+            formatted_num = f"{int(num_raw):,}"
+    except ValueError:
+        return value, rules
+    new = f"{formatted_num}{currency}"
+    if new == text:
+        return value, rules
+    rules.append("currency_diff_unit")
+    return new, rules
+
+
 def _parse_small_int(raw: str) -> "int | None":
     """Parse a small positive integer written in ASCII/fullwidth digits or 一〜十 kanji (precision桁 use)."""
     s = raw.translate(_FULLWIDTH_DIGITS).strip()
