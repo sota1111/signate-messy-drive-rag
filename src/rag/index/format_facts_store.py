@@ -42,12 +42,15 @@ from config import settings
 from src.rag.corpus import FileRef, nfc, walk
 
 SCHEMA = "format-facts-store"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2: emph_spans（docx/pptx/pdf の merged 強調span）を追加（SOT-2711 idx3/11）
 
 _ON = {"1", "true", "yes", "on"}
 
-# 走査対象の docx 拡張子（複合書式 run を持ちうるのは docx。xlsx/pptx は visual_store/font_emphasis が担う）。
+# 色 run（highlight/font_color）を持ちうるのは docx のみ（``runs`` フィールドは docx 限定 = idx16 系）。
 _DOC_EXTS = {"docx"}
+# 強調span（太字/下線/イタリック）の抽出対象。SOT-2711: pptx/pdf の書式も font_emphasis で網羅する
+# （idx11 = 青嶺 報告資料 PDF の B∧U∧I / 契約書 pptx 等）。emph_spans は merged span = 逐語列挙の単位。
+_EMPH_EXTS = {"docx", "pptx", "pdf"}
 
 # doc-kind をパスのフォルダ名/ファイル名から決めるための語彙（質問が使う自然表現）。
 _KIND_FOLDERS = (
@@ -146,6 +149,46 @@ def _doc_runs(ref: FileRef) -> list[dict[str, Any]]:
     return out
 
 
+# --------------------------------------------------------------------------- 強調span（merged, docx/pptx/pdf）
+def _span_loc(ev: Mapping[str, Any]) -> str:
+    """font_emphasis の evidence を人間可読な locator 文字列へ（paragraph/slide/shape/page/bbox）。"""
+    parts: list[str] = []
+    for key in ("sheet", "cell", "paragraph", "slide", "shape", "page"):
+        v = ev.get(key)
+        if v not in (None, ""):
+            parts.append(f"{key}:{v}")
+    bbox = ev.get("bbox")
+    if bbox:
+        parts.append("bbox:" + ",".join(str(x) for x in bbox))
+    return "/".join(parts)
+
+
+def _emph_spans(ref: FileRef) -> list[dict[str, Any]]:
+    """全書式強調 span を font_emphasis で **merged** 抽出（bold/underline/italic, 文書順）.
+
+    ``font_emphasis`` は隣接する同一装飾 run/glyph を 1 span に束ねる（例: docx で「30」「分単位」に
+    分割された太字 run を ``30分単位`` に、pdf の sheared「4,675,000円」を 1 glyph_run に）。この merged
+    形が「太字箇所をすべて列挙」型（idx3）や PDF の B∧U∧I 一意束縛（idx11）の逐語単位になる。装飾ゼロは
+    font_emphasis が返さない。読めない/未対応拡張子は空へ（fail-open）。
+    """
+    try:
+        from src.rag.tools.font_emphasis import font_emphasis
+        res = font_emphasis(ref)  # require=None ⇒ 装飾 ≥1 の全 span
+    except Exception:  # noqa: BLE001 — 復号不能/解析不能/未対応は空へ（回帰ゼロ）
+        return []
+    out: list[dict[str, Any]] = []
+    for item in res.get("value", []):
+        text = str(item.get("value", "")).strip()
+        if not text:
+            continue
+        method = item.get("method", {}) or {}
+        attrs = {"bold": bool(method.get("bold")),
+                 "underline": bool(method.get("underline")),
+                 "italic": bool(method.get("italic"))}
+        out.append({"text": text, "attrs": attrs, "loc": _span_loc(item.get("evidence", {}) or {})})
+    return out
+
+
 # --------------------------------------------------------------------------- doc-kind
 def _folder_kinds(rel: str, name: str) -> list[str]:
     """パスのフォルダ名/ファイル名から doc-kind トークン（会議録/報告資料/…）を決定論抽出。"""
@@ -187,7 +230,7 @@ def _doc_body(ref: FileRef) -> str:
 def _universe(refs: Sequence[FileRef]) -> list[FileRef]:
     out: list[FileRef] = []
     for r in refs:
-        if r.ext not in _DOC_EXTS:
+        if r.ext not in _EMPH_EXTS:
             continue
         name = nfc(r.name).lower()
         rel = nfc(r.rel).lower()
@@ -199,16 +242,26 @@ def _universe(refs: Sequence[FileRef]) -> list[FileRef]:
 
 
 def compute_doc(ref: FileRef) -> dict[str, Any] | None:
-    """1 docx の書式付き run 全数＋doc-kind を組む（書式 run が 0 なら None — 欠測を偽装しない）。"""
-    runs = _doc_runs(ref)
-    if not runs:
+    """1 文書の書式事実を組む（docx の色 run + 全拡張子の merged 強調span + doc-kind）.
+
+    ``runs`` は docx 限定の色付き run（highlight/font_color/太字…= idx16/71 の単発 lookup 用）、
+    ``emph_spans`` は docx/pptx/pdf の merged 強調 span（太字/下線/イタリック = idx3 列挙 / idx11 PDF）。
+    両方空なら None（書式証拠のない文書は欠測を偽装せず記録しない）。
+    """
+    runs = _doc_runs(ref) if ref.ext in _DOC_EXTS else []
+    emph = _emph_spans(ref)
+    if not runs and not emph:
         return None
     folder_kinds = _folder_kinds(ref.rel, ref.name)
-    selfid = _selfid_kinds(_doc_body(ref), folder_kinds) if folder_kinds else []
+    # 本文自己同定（『中間報告』等）は docx 本文からのみ（pptx/pdf は folder-kind で足りる）。
+    selfid = (_selfid_kinds(_doc_body(ref), folder_kinds)
+              if folder_kinds and ref.ext in _DOC_EXTS else [])
     doc_kind = folder_kinds + [k for k in selfid if k not in folder_kinds]
     return {
         "project": nfc(ref.project), "rel": nfc(ref.rel), "name": nfc(ref.name),
-        "doc_kind": doc_kind, "n_runs": len(runs), "runs": runs,
+        "doc_kind": doc_kind, "ext": ref.ext,
+        "n_runs": len(runs), "runs": runs,
+        "n_emph": len(emph), "emph_spans": emph,
     }
 
 
@@ -233,6 +286,8 @@ def build(refs: Sequence[FileRef] | None = None, *, out: Path | None = None,
         "schema": SCHEMA, "version": SCHEMA_VERSION,
         "universe": len(universe), "records": len(records), "skipped": skipped,
         "total_runs": sum(r["n_runs"] for r in records),
+        "total_emph": sum(r.get("n_emph", 0) for r in records),
+        "by_ext": {e: sum(1 for r in records if r.get("ext") == e) for e in sorted(_EMPH_EXTS)},
         "docs_with_selfid": sum(1 for r in records
                                 if any(k in _SELFID_PHRASES for k in r.get("doc_kind", []))),
     }
@@ -294,4 +349,5 @@ if __name__ == "__main__":
     summary = build()
     print(f"[build] format_facts_store records={summary['records']} "
           f"docs={summary['docs']} total_runs={summary['report']['total_runs']} "
+          f"total_emph={summary['report']['total_emph']} by_ext={summary['report']['by_ext']} "
           f"-> {default_out_path()}")
