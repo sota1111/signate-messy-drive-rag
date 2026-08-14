@@ -3008,15 +3008,30 @@ def _apply_page_count_bare(inv: "Investigation", question: str) -> "Investigatio
     """SOT-2719 — 「ページ数」型設問の回答を bare 番号へ整形する Gemini serve-boundary hook (in place)。
 
     純 Gemini 経路（``RAG_INVESTIGATOR_BACKEND`` != claude-mcp）は commit_gate / claude_mcp のような serve 整形
-    フックを通らないため、値保存の bare 整形（:func:`formatting.apply_page_count_bare`）をここで 1 点だけ適用する。
-    ``RAG_PAGE_COUNT_BARE`` default OFF ⇒ この関数は ``inv`` を無改変で返す（byte-identical）。棄権回答・値の有効
-    数字は決して変えず、fired 時のみ ``interventions['page_count_bare']`` に記録する。fail-open。"""
+    フックを通らないため、「ページ数」型設問の bare 整形をここで適用する。2 段:
+    (1) **決定論 direct-commit**（:func:`formatting.resolve_report_page_direct`）— ページロケータが印字ページ N を
+        確定できれば LLM の framing churn に依存せず bare N を確定（棄権 run も回収）。
+    (2) fallback **text-strip**（:func:`formatting.apply_page_count_bare`）— LLM 出力が既に印字ページ番号を述べる
+        場合の値保存整形（実回答のみ）。
+    ``RAG_PAGE_COUNT_BARE`` default OFF ⇒ この関数は ``inv`` を無改変で返す（byte-identical）。値の有効数字は
+    決して発明せず、fired 時のみ ``interventions['page_count_bare']`` に記録する。fail-open。"""
     from src.rag.agent import formatting as _formatting
 
     if not _formatting.page_count_bare_enabled():
         return inv
     try:
         ans = inv.answer
+        # (1) SOT-2719 escalation — 決定論ページロケータ direct-commit（churn 非依存・棄権も回収）。印字ページを
+        # 確定できれば LLM の framing churn に一切依存せず bare N を確定する。gold100 では idx84 のみ構造的に発火。
+        direct = _formatting.resolve_report_page_direct(question)
+        if direct is not None and direct != ans.answer:
+            inv.answer = Answer(answer=direct, confidence=1.0, evidence=ans.evidence,
+                                method=(ans.method + " +report_page_commit").strip())
+            inv.interventions["page_count_bare"] = {"fired": True, "rules": ["report_page_commit"],
+                                                    "from": ans.answer[:80], "to": direct[:80],
+                                                    "deterministic": True}
+            return inv
+        # (2) fallback — LLM 出力が既に印字ページ番号を述べている場合の値保存 text-strip（実回答のみ）。
         if is_abstain(ans.answer):
             return inv
         new_text, fired = _formatting.apply_page_count_bare(question, ans.answer)

@@ -549,6 +549,35 @@ def page_count_bare_enabled() -> bool:
     return _env_flag("RAG_PAGE_COUNT_BARE", False)
 
 
+def resolve_report_page_direct(question: str) -> "str | None":
+    """SOT-2719 escalation — 「ページ数」型設問の印字ページ N を **決定論ページロケータで直接確定** し bare `str(N)` を返す。
+
+    text-strip 版 (:func:`apply_page_count_bare`) は churn する LLM 出力から印字ページ番号を拾うため、値が
+    正規化可能位置に来ない run（例: 「スライド6」単独）では回収できない。本関数は LLM 出力に一切依存せず、
+    :func:`fact_lookup._report_metric_page`（報告書 pptx を印字ページ採番 + 指標密度で読む決定論レコグナイザ、
+    gold/idx 非依存・model 不変）が印字ページ N を一意確定できるときに限り bare `str(N)` を返す direct-commit。
+
+    ゲートは text-strip と同一の「ページ数」型限定（「何ページ」「ページ番号」型は除外＝bare が gold surface の型のみ）。
+    レコグナイザ側はさらに「モデル毎 × ランキング × 一意指標 × 一意報告 pptx × 支配的密度スライド × 印字ページ確定」を
+    要求するため、gold100 では idx84 のみが構造的に発火する（idx12/18/59 は None）。確定不能なら ``None``。fail-open。
+    """
+    q = question or ""
+    if not _PAGE_COUNT_Q_RE.search(q) or _PAGE_FORM_KEEP_Q_RE.search(q):
+        return None  # 「ページ数」型のみ（bare が正しい gold surface）
+    try:
+        from src.rag.agent.pipelines import fact_lookup as _fact_lookup
+        res = _fact_lookup._report_metric_page(question)
+    except Exception:  # noqa: BLE001 — ロケータ失敗は None（決して答えパスを壊さない）
+        return None
+    if not isinstance(res, dict):
+        return None
+    val = res.get("value")
+    if val is None:
+        return None
+    bare = str(val).strip().translate(_FULLWIDTH_DIGITS).replace(",", "").replace("，", "")
+    return str(int(bare)) if bare.isdigit() else None
+
+
 def apply_page_count_bare(question: str, value: str) -> "tuple[str, list[str]]":
     """「ページ数」型設問の回答を印字ページ番号の **bare** 表記へ決定論固定する値保存の書式契約 (SOT-2719)。
 

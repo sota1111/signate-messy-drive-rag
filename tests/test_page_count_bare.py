@@ -113,3 +113,61 @@ def test_abstain_like_multiline_noop():
 
 def test_empty_noop():
     assert _bare(Q84, "") == ("", [])
+
+
+# ------------------------------------------------------------- SOT-2719 escalation: deterministic direct-commit
+# resolve_report_page_direct が印字ページ N を LLM 出力に依存せず確定する（churn 非依存）ことを検証する。
+_Q12 = "蒼泉会 ひがし丘総合病院の報告資料_2025-07-08.docxにおいて、WBS観点の進捗状況の見出しがあるのは何ページですか。"
+_Q18 = "白峰信用リスク評価の会議ID：M04の会議録にて、進捗サマリが記載されているページ番号を答えてください。"
+
+
+def test_direct_gate_only_page_count_type(monkeypatch):
+    # レコグナイザが常に page=5 を返すと仮定しても、direct は「ページ数」型のみ発火し「何ページ」「ページ番号」型は None。
+    from src.rag.agent.pipelines import fact_lookup
+    monkeypatch.setattr(fact_lookup, "_report_metric_page", lambda q: {"value": "5"})
+    assert formatting.resolve_report_page_direct(Q84) == "5"
+    assert formatting.resolve_report_page_direct(_Q12) is None  # 何ページ型は除外
+    assert formatting.resolve_report_page_direct(_Q18) is None  # ページ番号型は除外
+
+
+def test_direct_bare_and_fullwidth_normalized(monkeypatch):
+    from src.rag.agent.pipelines import fact_lookup
+    monkeypatch.setattr(fact_lookup, "_report_metric_page", lambda q: {"value": "５"})
+    assert formatting.resolve_report_page_direct(Q84) == "5"  # 全角→半角、bare 化
+
+
+def test_direct_none_when_locator_declines(monkeypatch):
+    from src.rag.agent.pipelines import fact_lookup
+    monkeypatch.setattr(fact_lookup, "_report_metric_page", lambda q: None)
+    assert formatting.resolve_report_page_direct(Q84) is None  # 確定不能なら None（推測しない）
+
+
+def test_direct_fail_open_on_exception(monkeypatch):
+    from src.rag.agent.pipelines import fact_lookup
+
+    def _boom(_q):
+        raise RuntimeError("locator broke")
+
+    monkeypatch.setattr(fact_lookup, "_report_metric_page", _boom)
+    assert formatting.resolve_report_page_direct(Q84) is None  # 例外は None（答えパスを壊さない）
+
+
+@pytest.mark.parametrize("q", ["", "差額はいくらですか。"])
+def test_direct_non_target_noop(q):
+    assert formatting.resolve_report_page_direct(q) is None
+
+
+# --- real-corpus grounding (skips when the corpus/pptx is unavailable) -----------------------------------------
+def test_direct_real_corpus_idx84_and_regression_guard():
+    """実コーパスで idx84→'5' を決定論確定し、idx12/18/59 は None（churn 非依存・回帰ゼロ）。corpus 無しなら skip。"""
+    from src.rag.agent.pipelines import fact_lookup
+    try:
+        got = fact_lookup._report_metric_page(Q84)
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"corpus/pptx unavailable: {exc}")
+    if not isinstance(got, dict) or got.get("value") is None:
+        pytest.skip("report pptx not indexed in this environment")
+    assert formatting.resolve_report_page_direct(Q84) == "5"
+    _Q59 = "京ソのPP_final.pptxにおいて、この案件にかかる金額の提示がまとまっているのは何ページですか。"
+    for q in (_Q12, _Q18, _Q59):
+        assert formatting.resolve_report_page_direct(q) is None
