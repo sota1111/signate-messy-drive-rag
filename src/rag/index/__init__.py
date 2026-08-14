@@ -345,6 +345,22 @@ def build(caption_images: bool = True, verbose: bool = True) -> None:
         if verbose:
             print(f"  contact master store skipped: {type(e).__name__}: {e}")
 
+    # Master-join store (SOT-2713): question-independent full join of 人物×案件×役割×座席 — 乙担当者の関与案件
+    # 数/内線と、案件の着手金/甲主担当者(署名欄)を決定論結合（既存の corpus_aggregate・seating_chart reviewed
+    # anchor・contact_master 抽出器を流用, LLM-free）。runtime 参照は opt-in (RAG_MASTER_JOIN_LOOKUP) なので
+    # champion serve path は byte-identical。
+    try:
+        from src.rag.index import master_join_store
+        mjs = master_join_store.build(refs)
+        if verbose:
+            cert = mjs["report"]["certificate"]
+            print(f"  master join store: {mjs['cases']} cases / {mjs['persons']} persons "
+                  f"(universe_ok={cert['row_count_equals_universe']}, seated={cert['seat_resolved']}) "
+                  f"-> {master_join_store.default_out_path()}")
+    except Exception as e:  # additive; never break the primary index build
+        if verbose:
+            print(f"  master join store skipped: {type(e).__name__}: {e}")
+
     # Action-row store (SOT-2652): question-independent extraction of AI/task action rows, priority-task
     # lists and priority-follow notes from scanned-PDF minutes/reports (idx20/34/70/93 action-row abstains).
     # LLM-free (reads persisted OCR + text-layer); runtime consultation is opt-in (RAG_ACTION_ROW_STORE)
