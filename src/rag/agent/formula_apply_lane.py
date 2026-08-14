@@ -20,6 +20,7 @@ import unicodedata
 from typing import Any
 
 from src.rag.index import formula_apply_store as _store
+from src.rag.index import image_ocr_store as _image_ocr_store
 from src.rag.tools import contract as _contract
 
 # 統計量列の正規化キュー（ストアの検出語と同一）。
@@ -28,6 +29,8 @@ _STAT_CUES_NORM = tuple(_store.norm(c) for c in _store._STAT_CUES)
 _DIFF_CUES = ("差", "差額", "違い", "どれだけ")
 # 式適用を問う語。
 _FORMULA_CUES = ("計算式", "式に代入", "代入", "式の数値", "を式に", "式にあてはめ", "式に当てはめ")
+_JOB_TITLE_RE = re.compile(r"(?:[一-龥ァ-ヶーA-Za-z]+(?:\s*\(\s*[A-Za-z]+\s*\))?)エンジニア")
+_AVERAGE_VALUE_RE = re.compile(r"平均(?:約)?\s*([0-9][0-9,]*)")
 
 
 def _norm(value: Any) -> str:
@@ -130,6 +133,51 @@ def _stat_diff_resolve(qn: str, company: "str | None") -> "dict[str, Any] | None
     })
 
 
+def _ocr_pairwise_currency_diff(question: str, qn: str, company: "str | None") -> "dict[str, Any] | None":
+    """OCR 表の2職種について、質問で明示された同一統計量の差を決定論計算する。
+
+    レコード内に両職種・通貨ヘッダ・各職種の一意な平均値がある場合だけ確定する。値や職種名は質問から
+    束縛し、OCR 全文からオペランドを取得するため、特定設問や gold 値には依存しない。
+    """
+    if not any(_store.norm(c) in qn for c in _DIFF_CUES) or "平均" not in question:
+        return None
+    candidates: list[dict[str, Any]] = []
+    for rec in _image_ocr_store.load():
+        text = str(rec.get("full_text") or "")
+        if not re.search(r"(?:米ドル|ドル|USD)", text, re.I):
+            continue
+        project = _store.norm(rec.get("project"))
+        if company and project and _store.norm(company) != project:
+            continue
+        titles = list(dict.fromkeys(_JOB_TITLE_RE.findall(text)))
+        asked = [title for title in titles if _norm(title) in qn]
+        if len(asked) != 2:
+            continue
+        operands: list[dict[str, Any]] = []
+        for title in asked:
+            start = text.find(title) + len(title)
+            # A job row's average follows its title (possibly after a median). Stop at the next parsed
+            # job-title anchor so a later row's average can never be bound to this row.
+            next_starts = [text.find(other, start) for other in titles if text.find(other, start) >= 0]
+            end = min([start + 60, *next_starts, len(text)])
+            hits = _AVERAGE_VALUE_RE.findall(text[start:end])
+            if len(hits) != 1:
+                break
+            operands.append({"title": title, "value": int(hits[0].replace(",", ""))})
+        if len(operands) == 2:
+            candidates.append({"rec": rec, "operands": operands})
+    if len(candidates) != 1:
+        return None
+    bound = candidates[0]
+    a, b = bound["operands"]
+    diff = abs(a["value"] - b["value"])
+    return _result(f"{diff:,}ドル", "ocr_job_metric_pairwise_diff", {
+        "doc": bound["rec"].get("name"), "locus": bound["rec"].get("locus"),
+        "unit": "ドル", "metric": "平均給与", "operands": [a, b],
+        "criterion": "|職種Aの平均給与 − 職種Bの平均給与|",
+    })
+
+
 def resolve(question: str) -> "dict[str, Any] | None":
     """記載式適用（idx68）／統計量表差分（idx50）を一意束縛できる時だけ contract を返す（OFF なら None）。"""
     if not _store.enabled():
@@ -137,7 +185,8 @@ def resolve(question: str) -> "dict[str, Any] | None":
     try:
         qn = _norm(question)
         company = _company_of(question)
-        result = _formula_resolve(qn, company) or _stat_diff_resolve(qn, company)
+        result = (_formula_resolve(qn, company) or _stat_diff_resolve(qn, company)
+                  or _ocr_pairwise_currency_diff(question, qn, company))
         if result is not None and _contract.is_contract(result) and result.get("value") is not None:
             return _contract.ensure_contract(result)
     except Exception:  # noqa: BLE001 — a broken lane must fall back, never break the answer path
