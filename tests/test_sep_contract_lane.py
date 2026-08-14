@@ -19,9 +19,17 @@ def _hit(project, text, locator="page:8", doc_id="d1"):
     return {"project": project, "text": text, "locator": locator, "doc_id": doc_id}
 
 
+def _ocr_rec(project, full_text, locus="ページ9", rel="d.pdf"):
+    return {"project": project, "full_text": full_text, "locus": locus, "rel": rel}
+
+
 @pytest.fixture()
 def wired(monkeypatch):
-    """Flag ON + text_fts enabled + a synthetic FTS result carrying the marked role label."""
+    """Flag ON + text_fts enabled + a synthetic FTS result carrying the marked role label.
+
+    SOT-2717 — also stub the image-OCR store loader to empty so the FTS-driven cases stay hermetic (the
+    real on-disk store DOES hold the minamino label; each test that exercises the OCR fallback stubs its
+    own records)."""
     monkeypatch.setenv(L.SEP_CONTRACT_ROLE_FLAG, "1")
     monkeypatch.setattr(L._tf, "enabled", lambda: True)
     monkeypatch.setattr(L._tf, "search", lambda *a, **k: [
@@ -30,6 +38,7 @@ def wired(monkeypatch):
         _hit("京橋信用ソリューションズ株式会社", "カテゴリ別契約率確認", "line:27"),  # substring, no marker
         _hit("白峰信用リスク評価株式会社", "本番移行は別契約として扱う。", "page:4"),  # bare mention
     ])
+    monkeypatch.setattr("src.rag.index.image_ocr_store.load", lambda *a, **k: [])
     return L
 
 
@@ -47,7 +56,31 @@ def test_idx52_unique_role_label(wired):
 
 
 def test_disabled_text_fts_defers(monkeypatch, wired):
+    # FTS disabled AND the OCR store carries no same-project marker ⇒ defer (no evidence in either source).
     monkeypatch.setattr(L._tf, "enabled", lambda: False)
+    assert L.resolve(_Q52) is None
+
+
+def test_ocr_store_fallback_recovers(monkeypatch, wired):
+    # SOT-2717 robustness — FTS surfaces NO marked label (e.g. index built OCR-unaware), but the persisted
+    # image-OCR store carries the ``X（別契約）`` role for the named project ⇒ recover via the durable store.
+    monkeypatch.setattr(L._tf, "search", lambda *a, **k: [])
+    monkeypatch.setattr("src.rag.index.image_ocr_store.load", lambda *a, **k: [
+        _ocr_rec(_MINAMINO, "…今後の運用 監視ダッシュボード構築(別契約) …", "ページ9"),
+        _ocr_rec("京橋信用ソリューションズ株式会社", "カテゴリ別契約率の確認", "スライド4"),
+    ])
+    r = L.resolve(_Q52)
+    assert r is not None
+    assert r["value"] == "監視ダッシュボード構築"
+    assert r["evidence"]["candidates"][0]["store"] == "image_ocr_store"
+
+
+def test_ocr_store_fallback_respects_cross_project(monkeypatch, wired):
+    # Neither source has a same-project marker (only a different project) ⇒ still defer under the fallback.
+    monkeypatch.setattr(L._tf, "search", lambda *a, **k: [])
+    monkeypatch.setattr("src.rag.index.image_ocr_store.load", lambda *a, **k: [
+        _ocr_rec("白峰信用リスク評価株式会社", "追加解析(別契約)", "ページ4"),
+    ])
     assert L.resolve(_Q52) is None
 
 

@@ -61,10 +61,55 @@ def _project_named(project: str, q: str) -> bool:
     return False
 
 
+def _collect_from_fts(q: str) -> "tuple[dict[str, str], list[dict[str, Any]]]":
+    """``X（別契約）`` role labels from the full-text FTS index (only carries OCR body when the index was
+    built OCR-aware). ``({}, [])`` when FTS is disabled/empty."""
+    labels: dict[str, str] = {}
+    provenance: list[dict[str, Any]] = []
+    if not _tf.enabled():
+        return labels, provenance
+    for h in _tf.search("別契約", limit=100, project=None):
+        proj = h.get("project") or ""
+        if not _project_named(proj, q):
+            continue
+        for m in _LABEL_RE.finditer(_nfc(h.get("text") or "")):
+            lbl = m.group(1).strip()
+            if lbl:
+                labels[lbl] = proj
+                provenance.append({"store": "text_fts", "project": proj,
+                                   "locator": h.get("locator"), "doc_id": h.get("doc_id")})
+    return labels, provenance
+
+
+def _collect_from_ocr(q: str) -> "tuple[dict[str, str], list[dict[str, Any]]]":
+    """SOT-2717 robustness — the same ``X（別契約）`` extraction over the persisted image-OCR store
+    (``image_ocr_store.jsonl``, baked at build time, always present at serve). This is the durable source
+    for the idx52 evidence ``監視ダッシュボード構築(別契約)``, which lives in a scanned-PDF page and only
+    reaches ``text_fts`` when that index was rebuilt OCR-aware — a build-flag-fragile precondition that
+    silently dropped idx52 to an LLM-budget abstain on the Gemini serve run. Reading the OCR store directly
+    makes the lane FTS-build-independent (and backend-independent). ``({}, [])`` when the store is absent."""
+    labels: dict[str, str] = {}
+    provenance: list[dict[str, Any]] = []
+    try:
+        from src.rag.index import image_ocr_store as _io
+        records = _io.load()
+    except Exception:  # noqa: BLE001 — optional durable source; never break the answer path
+        return labels, provenance
+    for r in records:
+        proj = r.get("project") or ""
+        if not _project_named(proj, q):
+            continue
+        for m in _LABEL_RE.finditer(_nfc(r.get("full_text") or "")):
+            lbl = m.group(1).strip()
+            if lbl:
+                labels[lbl] = proj
+                provenance.append({"store": "image_ocr_store", "project": proj,
+                                   "locator": r.get("locus"), "doc_id": r.get("rel")})
+    return labels, provenance
+
+
 def resolve(question: str) -> "dict[str, Any] | None":
     if not enabled():
-        return None
-    if not _tf.enabled():
         return None
     try:
         q = _nfc(question)
@@ -72,19 +117,11 @@ def resolve(question: str) -> "dict[str, Any] | None":
             return None
         if not any(cue in q for cue in _INTENT):
             return None
-        hits = _tf.search("別契約", limit=100, project=None)
-        labels: dict[str, str] = {}          # label -> project (dedup across pages/docs)
-        provenance: list[dict[str, Any]] = []
-        for h in hits:
-            proj = h.get("project") or ""
-            if not _project_named(proj, q):
-                continue
-            for m in _LABEL_RE.finditer(_nfc(h.get("text") or "")):
-                lbl = m.group(1).strip()
-                if lbl:
-                    labels[lbl] = proj
-                    provenance.append({"project": proj, "locator": h.get("locator"),
-                                       "doc_id": h.get("doc_id")})
+        # FTS first (byte-identical to the pre-SOT-2717 behavior for any case it already resolved), then
+        # fall back to the durable image-OCR store only when FTS surfaced no marked label for this project.
+        labels, provenance = _collect_from_fts(q)
+        if not labels:
+            labels, provenance = _collect_from_ocr(q)
         distinct = sorted(labels)
         if len(distinct) != 1:                # 0 (no marked label) or >1 (ambiguous) ⇒ fail-open
             return None
