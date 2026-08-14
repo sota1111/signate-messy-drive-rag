@@ -170,6 +170,14 @@ _ANNOTATION_PAREN_RE = re.compile(
     r"|W[0-9０-９]+\s*[〜～\-]\s*W[0-9０-９]+")
 # The narrower meta-commentary subset that is safe even on a verbatim-extraction ask.
 _META_ANNOTATION_RE = re.compile(r"部分|記載|該当|出典|スライド|ページ|段落|見出し")
+# SOT-2717 (idx8) — a trailing paren whose whole content is a bare unit/counter word (optionally with
+# digits): 「17,744ドル（人）」→ gold 「17,744ドル」. This is redundant unit decoration the Gemini answer
+# loop appends to a numeric value; the currency/count unit already lives in the value body. Fires ONLY
+# when the body is value-shaped (carries a digit) so a proper-noun parenthetical (e.g. 田中（人事部）) —
+# whose content 「人事部」 is NOT a bare unit — is never touched. Verified against gold v4: NO gold answer
+# ends in such a bare-unit paren, so this only ever drops decoration a real answer never carries.
+_UNIT_PAREN_CONTENT_RE = re.compile(r"^[0-9０-９,，、.\s]*(?:人|円|件|名|個|回|箇所|点|ドル|%|％)$")
+_HAS_DIGIT_RE = re.compile(r"[0-9０-９]")
 
 
 def strip_paren_enabled() -> bool:
@@ -218,10 +226,13 @@ def strip_trailing_parenthetical(question: str, value: str) -> "tuple[str, list[
         content = text[span[0] + 1:len(text) - 1].strip()
         if not body or not content:
             break  # fully parenthesized (or empty group) — the group IS the value
+        # SOT-2717 — a bare unit/counter parenthetical on a digit-bearing value is redundant decoration
+        # (「17,744ドル（人）」→「17,744ドル」), safe to drop on either ask shape.
+        unit_annotation = bool(_UNIT_PAREN_CONTENT_RE.match(content)) and bool(_HAS_DIGIT_RE.search(body))
         if verbatim:
-            annotation = bool(_META_ANNOTATION_RE.search(content))
+            annotation = bool(_META_ANNOTATION_RE.search(content)) or unit_annotation
         else:
-            annotation = bool(_ANNOTATION_PAREN_RE.search(content)) or (
+            annotation = bool(_ANNOTATION_PAREN_RE.search(content)) or unit_annotation or (
                 len(content) >= 2 and content in question)
         if not annotation:
             break  # unrecognized shape ⇒ value-bearing, keep (fail-closed)
