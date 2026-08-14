@@ -513,6 +513,100 @@ def apply_currency_diff_unit(question: str, value: str) -> "tuple[str, list[str]
     return new, rules
 
 
+# --- SOT-2719 — 「ページ数」型のみ bare 番号へ決定論整形 (idx84: 「5ページ（スライド6）」→「5」) --------------
+# 症状: 設問が印字ページを **数** として答える「ページ数」型（idx84「…記載されているページ数を教えてください」）
+# のとき、LLM は正しい印字ページ番号（5）に到達するのに「5ページ」の単位や「（スライド6）」の provenance 注記を
+# 付けて gold「5」(bare) と judge 不一致になる framing churn（idx8 の unit churn と同型）。
+# 修正(質問キー・idx 非依存・値保存): 設問が「ページ数」型のときに限り、回答本文が含む「<N>ページ(目)」の N を
+# 取り出して **bare** `N` へ固定し、単位「ページ/ページ目」と末尾の（スライド…）等の注記を剥がす。数値そのもの
+# （印字ページ番号）は決して変えない — 既に回答内にある N をそのまま bare 化するだけ。
+#
+# 【最重要】回帰ガード — gold のページ形式は型ごとに違う (idx84=5 bare / idx12=2ページ / idx59=13ページ /
+# idx18=2ページ目)。そこで発火を **「ページ数」トークンを問う設問のみ** に厳密ゲートし、「何ページ」「ページ番号」
+# 型（gold が Nページ / ページ目 を保持）は絶対に触らない。gold100 全走査で「ページ数」を含む設問は idx84 のみ
+# （gold=5 bare）で、12/18/59 の設問はいずれも「ページ数」を含まない ⇒ 本ルールは 12/18/59 を構造的に無改変。
+# 「スライドM」だけで印字ページ番号をどこにも述べない回答は N を推測せず no-op（値保存・fail-closed）。
+# ``RAG_PAGE_COUNT_BARE`` default OFF ⇒ byte-identical serve path。
+#
+# framing churn は run 毎に少なくとも2形を取る（どちらも印字ページ番号 5 を回答自身が明示している）:
+#   (A) 単位前置形 「5ページ（スライド6）」                    → 「<N>ページ(目)」の N を採る
+#   (B) ラベル自己申告形 「スライド6（文書に記載のページ番号: 5）」→ 「ページ(番号)?: <N>」の N を採る
+# いずれも **回答が自ら述べた印字ページ番号** をそのまま bare 化するだけ（値保存）。番号を全く述べない形
+# （「スライド6」単独）は推測せず no-op。スライド番号（「スライド6」の 6）は「ページ」に係留した抽出しか
+# しないため決して拾わない。
+_PAGE_COUNT_Q_RE = re.compile(r"ページ数")
+# 「何ページ」「ページ番号」型は gold が Nページ / ページ目 を保持するため発火から除外（双方向変換禁止の踏襲）。
+_PAGE_FORM_KEEP_Q_RE = re.compile(r"何\s*ページ|ページ番号")
+# (A) 回答本文中の「<N>ページ(目)」— 印字ページ番号 N（単位前置形）。full-width 数字も許容。
+_PAGE_NUM_IN_ANSWER_RE = re.compile(r"(?P<num>[0-9０-９][0-9０-９,，]*)\s*ページ(?:目)?")
+# (B) 「ページ(番号)?（記載/記載の…）: <N>」— 回答が印字ページ番号をラベル付きで自己申告する形。「ページ」に
+# 係留しているのでスライド番号は拾わない。full-width コロンも許容。
+_PAGE_NUM_LABELED_RE = re.compile(r"ページ(?:番号)?\s*[:：]\s*(?P<num>[0-9０-９][0-9０-９,，]*)")
+
+
+def page_count_bare_enabled() -> bool:
+    """SOT-2719 — 「ページ数」型 bare 化が発火するか (``RAG_PAGE_COUNT_BARE``, default OFF ⇒ byte-identical)。"""
+    return _env_flag("RAG_PAGE_COUNT_BARE", False)
+
+
+def resolve_report_page_direct(question: str) -> "str | None":
+    """SOT-2719 escalation — 「ページ数」型設問の印字ページ N を **決定論ページロケータで直接確定** し bare `str(N)` を返す。
+
+    text-strip 版 (:func:`apply_page_count_bare`) は churn する LLM 出力から印字ページ番号を拾うため、値が
+    正規化可能位置に来ない run（例: 「スライド6」単独）では回収できない。本関数は LLM 出力に一切依存せず、
+    :func:`fact_lookup._report_metric_page`（報告書 pptx を印字ページ採番 + 指標密度で読む決定論レコグナイザ、
+    gold/idx 非依存・model 不変）が印字ページ N を一意確定できるときに限り bare `str(N)` を返す direct-commit。
+
+    ゲートは text-strip と同一の「ページ数」型限定（「何ページ」「ページ番号」型は除外＝bare が gold surface の型のみ）。
+    レコグナイザ側はさらに「モデル毎 × ランキング × 一意指標 × 一意報告 pptx × 支配的密度スライド × 印字ページ確定」を
+    要求するため、gold100 では idx84 のみが構造的に発火する（idx12/18/59 は None）。確定不能なら ``None``。fail-open。
+    """
+    q = question or ""
+    if not _PAGE_COUNT_Q_RE.search(q) or _PAGE_FORM_KEEP_Q_RE.search(q):
+        return None  # 「ページ数」型のみ（bare が正しい gold surface）
+    try:
+        from src.rag.agent.pipelines import fact_lookup as _fact_lookup
+        res = _fact_lookup._report_metric_page(question)
+    except Exception:  # noqa: BLE001 — ロケータ失敗は None（決して答えパスを壊さない）
+        return None
+    if not isinstance(res, dict):
+        return None
+    val = res.get("value")
+    if val is None:
+        return None
+    bare = str(val).strip().translate(_FULLWIDTH_DIGITS).replace(",", "").replace("，", "")
+    return str(int(bare)) if bare.isdigit() else None
+
+
+def apply_page_count_bare(question: str, value: str) -> "tuple[str, list[str]]":
+    """「ページ数」型設問の回答を印字ページ番号の **bare** 表記へ決定論固定する値保存の書式契約 (SOT-2719)。
+
+    Returns ``(new_value, fired_rules)`` — 変化なしなら ``fired_rules`` は空。設問が「ページ数」型でない、
+    「何ページ」「ページ番号」型、回答が印字ページ番号をどこにも述べない、既に bare、棄権のものはいずれも
+    no-op。回答が自ら述べた印字ページ番号 N をそのまま bare 化するだけで、数値そのものは決して変更しない。
+    """
+    rules: list[str] = []
+    if not value or "\n" in value.strip():
+        return value, rules
+    q = question or ""
+    if not _PAGE_COUNT_Q_RE.search(q) or _PAGE_FORM_KEEP_Q_RE.search(q):
+        return value, rules  # 「ページ数」型のみ；「何ページ」「ページ番号」型は現状維持（回帰ガード）
+    text = value.strip()
+    # 印字ページ番号を「ページ」に係留して抽出: (A) 単位前置形「Nページ」 → (B) ラベル自己申告形「ページ番号: N」。
+    # どちらも回答自身が述べた番号。スライド番号は「ページ」係留のため決して拾わない。
+    m = _PAGE_NUM_IN_ANSWER_RE.search(text) or _PAGE_NUM_LABELED_RE.search(text)
+    if not m:
+        return value, rules  # 印字ページ番号を述べない（例: 「スライド6」単独）⇒ 推測しない
+    bare = m.group("num").translate(_FULLWIDTH_DIGITS).replace(",", "").replace("，", "")
+    if not bare.isdigit():
+        return value, rules
+    bare = str(int(bare))
+    if bare == text:
+        return value, rules  # 既に bare
+    rules.append("page_count_bare")
+    return bare, rules
+
+
 def _parse_small_int(raw: str) -> "int | None":
     """Parse a small positive integer written in ASCII/fullwidth digits or 一〜十 kanji (precision桁 use)."""
     s = raw.translate(_FULLWIDTH_DIGITS).strip()

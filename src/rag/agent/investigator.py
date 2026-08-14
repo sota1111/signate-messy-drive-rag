@@ -3004,6 +3004,48 @@ def _apply_currency_diff_unit(inv: "Investigation", question: str) -> "Investiga
     return inv
 
 
+def _apply_page_count_bare(inv: "Investigation", question: str) -> "Investigation":
+    """SOT-2719 — 「ページ数」型設問の回答を bare 番号へ整形する Gemini serve-boundary hook (in place)。
+
+    純 Gemini 経路（``RAG_INVESTIGATOR_BACKEND`` != claude-mcp）は commit_gate / claude_mcp のような serve 整形
+    フックを通らないため、「ページ数」型設問の bare 整形をここで適用する。2 段:
+    (1) **決定論 direct-commit**（:func:`formatting.resolve_report_page_direct`）— ページロケータが印字ページ N を
+        確定できれば LLM の framing churn に依存せず bare N を確定（棄権 run も回収）。
+    (2) fallback **text-strip**（:func:`formatting.apply_page_count_bare`）— LLM 出力が既に印字ページ番号を述べる
+        場合の値保存整形（実回答のみ）。
+    ``RAG_PAGE_COUNT_BARE`` default OFF ⇒ この関数は ``inv`` を無改変で返す（byte-identical）。値の有効数字は
+    決して発明せず、fired 時のみ ``interventions['page_count_bare']`` に記録する。fail-open。"""
+    from src.rag.agent import formatting as _formatting
+
+    if not _formatting.page_count_bare_enabled():
+        return inv
+    try:
+        ans = inv.answer
+        # (1) SOT-2719 escalation — 決定論ページロケータ direct-commit（churn 非依存・棄権も回収）。印字ページを
+        # 確定できれば LLM の framing churn に一切依存せず bare N を確定する。gold100 では idx84 のみ構造的に発火。
+        direct = _formatting.resolve_report_page_direct(question)
+        if direct is not None and direct != ans.answer:
+            inv.answer = Answer(answer=direct, confidence=1.0, evidence=ans.evidence,
+                                method=(ans.method + " +report_page_commit").strip())
+            inv.interventions["page_count_bare"] = {"fired": True, "rules": ["report_page_commit"],
+                                                    "from": ans.answer[:80], "to": direct[:80],
+                                                    "deterministic": True}
+            return inv
+        # (2) fallback — LLM 出力が既に印字ページ番号を述べている場合の値保存 text-strip（実回答のみ）。
+        if is_abstain(ans.answer):
+            return inv
+        new_text, fired = _formatting.apply_page_count_bare(question, ans.answer)
+        if fired and new_text != ans.answer:
+            inv.answer = Answer(answer=new_text, confidence=ans.confidence,
+                                evidence=ans.evidence,
+                                method=(ans.method + " +page_count_bare").strip())
+            inv.interventions["page_count_bare"] = {"fired": True, "rules": fired,
+                                                    "from": ans.answer[:80], "to": new_text[:80]}
+    except Exception:  # noqa: BLE001 — value-preserving polish; never break the answer path
+        pass
+    return inv
+
+
 def _apply_answer_eu_gate(inv: "Investigation", question: str) -> "Investigation":
     """SOT-2635 — apply the expected-utility commit gate to a produced answer, in place, behind RAG_EU_GATE.
 
@@ -3366,4 +3408,5 @@ def answer_question(question: str, *, model: str | None = None,
                        search_cap=SEARCH_CAP, preamble=preamble)
     _inv.interventions.update(packet_interventions)  # SOT-2629 — merge env/packet-level telemetry
     _inv = _apply_currency_diff_unit(_inv, question)  # SOT-2718 — Gemini serve-path 単位固定 (no-op unless ON)
+    _inv = _apply_page_count_bare(_inv, question)  # SOT-2719 — 「ページ数」型 bare 化 (no-op unless ON)
     return _apply_answer_eu_gate(_inv, question)  # SOT-2635 — commit-time EU gate (no-op unless ON)

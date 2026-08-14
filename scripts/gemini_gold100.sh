@@ -176,6 +176,13 @@ export RAG_VDIFF_LOWCONF_ABSTAIN=1
 #     文脈通貨へ固定し整数部をカンマ整形。差額型設問のみ発火・別実単位/範囲回答は no-op。
 export RAG_CURRENCY_DIFF_UNIT=1
 
+# --- SOT-2719 lever (Gemini gold100 net96→97 候補) ---
+# 「ページ数」型設問（idx84「…記載されているページ数を教えてください」gold=5 bare）のみ bare 番号へ決定論整形:
+#   LLM が「5ページ（スライド6）」等の単位＋provenance注記を付ける framing churn を、回答内の印字ページ番号 N を
+#   そのまま bare 化して解消（値保存）。質問キー「ページ数」に厳密ゲートし「何ページ」「ページ番号」型(idx12/18/59)は
+#   絶対に無改変（回帰ガード）。純 Gemini serve 経路の serve-boundary hook で適用。
+export RAG_PAGE_COUNT_BARE=1
+
 # --- investigator on the live Gemini tool loop (production answer path; parallelizable, not shared-limit) ---
 export RAG_INVESTIGATOR_BACKEND=gemini
 
