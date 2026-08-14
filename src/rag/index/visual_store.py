@@ -185,6 +185,11 @@ _AGG_MARK = re.compile(
 _AGG_LEAD = re.compile(
     r"^\s*(平均|合計|総計|小計|個数|件数|最大|最小|中央値?|分散|標準偏差|割合|比率|"
     r"average|sum|count|mean|median|max|min|std|total)\s*/", re.IGNORECASE)
+# A generic PivotTable index placeholder header (Excel's compact layout). A column with this header
+# encodes a *nested* multi-level index in one column, so its level names cannot come from the header —
+# they are resolved by value-domain match against the source data sheet (SOT-2709). Never a real
+# extraction-condition dimension name.
+_GENERIC_LABEL = re.compile(r"^(行ラベル|列ラベル|row labels|column labels)$", re.IGNORECASE)
 
 
 def _fmt_label(v: Any) -> str:
@@ -211,15 +216,110 @@ def _detect_header_row(ws, limit: int = 25) -> "int | None":
     return None
 
 
-def _pivot_context(ws, row: int, col: int, header_row: "int | None") -> "dict[str, Any] | None":
+def _source_domains(wb) -> "dict[str, set[str]]":
+    """Value-domains of the workbook's flat source tables, keyed by column name.
+
+    A *source* sheet is any sheet with a row-1 header of ≥2 named string columns (a raw data table, not a
+    pivot whose header sits lower). Each named column maps to the set of its distinct cell values
+    (normalised via ``_fmt_label`` so ``3`` and ``3.0`` unify). Used to name a compact nested-pivot
+    index's levels by value-domain when the pivot header is a generic ``行ラベル`` placeholder (SOT-2709).
+    """
+    domains: dict[str, set[str]] = {}
+    for ws in getattr(wb, "worksheets", []):
+        max_col = ws.max_column or 0
+        max_row = ws.max_row or 0
+        named = [(c, str(ws.cell(1, c).value).strip())
+                 for c in range(1, max_col + 1)
+                 if isinstance(ws.cell(1, c).value, str) and str(ws.cell(1, c).value).strip() != ""]
+        if len(named) < 2:
+            continue  # not a flat data table (blank/low header ⇒ likely a pivot)
+        for c, name in named:
+            vals: set[str] = set()
+            for r in range(2, max_row + 1):
+                v = ws.cell(r, c).value
+                if v is None or (isinstance(v, str) and v.strip() == ""):
+                    continue
+                vals.add(_fmt_label(v))
+            if vals:
+                domains.setdefault(name, set()).update(vals)
+    return domains
+
+
+def _level_domains(index_values: "set[str]", domains: "dict[str, set[str]]") -> "dict[str, set[str]]":
+    """The source columns that are group-by *levels* of a compact index column.
+
+    A level's group keys enumerate the source column's full domain, so a source domain qualifies only
+    when it is a subset of the index column's distinct values. A domain that is a strict subset of
+    another matching domain is *shadowed* and dropped (e.g. ``charges={0,1,2} ⊂ children={0..5}``) so an
+    ambiguous value like ``0`` resolves to the actual level (children), never the shadowed one.
+    """
+    matched = {name: dom for name, dom in domains.items() if len(dom) >= 2 and dom <= index_values}
+    levels: dict[str, set[str]] = {}
+    for name, dom in matched.items():
+        if any(dom < other for other in matched.values()):
+            continue  # a strict subset of another level ⇒ shadowed
+        levels[name] = dom
+    return levels
+
+
+def _dim_of_value(val: str, levels: "dict[str, set[str]]") -> "str | None":
+    """The unique level whose domain contains ``val`` (None if 0 or >1 — fail-closed)."""
+    hits = [name for name, dom in levels.items() if val in dom]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _nested_dim_context(ws, col: int, row: int, header_row: int,
+                        levels: "dict[str, set[str]]") -> "list[dict[str, Any]]":
+    """Levels of a compact nested-pivot index column for the cell at ``row``.
+
+    Scans upward from the cell's own row, taking the nearest value of each distinct level (carry-down of
+    the outer group above the inner value), then orders the collected levels by source row ascending so
+    the outer group comes first (``children=3`` before ``smoker=no``). A value whose level can't be
+    uniquely resolved is skipped (fail-closed). Returns ``[]`` when nothing resolves.
+    """
+    picks: list[tuple[int, str, str]] = []
+    seen: set[str] = set()
+    for rr in range(row, header_row, -1):
+        v = ws.cell(rr, col).value
+        if v is None or str(v).strip() == "":
+            continue
+        val = _fmt_label(v)
+        name = _dim_of_value(val, levels)
+        if name is None or name in seen:
+            continue
+        seen.add(name)
+        picks.append((rr, name, val))
+    picks.sort(key=lambda t: t[0])
+    return [{"name": n, "value": v} for _, n, v in picks]
+
+
+def _nearest_label(ws, col: int, row: int, header_row: int) -> "Any | None":
+    """The nearest non-empty label at-or-above ``row`` in ``col`` (a sparse pivot parent key)."""
+    for rr in range(row, header_row, -1):
+        v = ws.cell(rr, col).value
+        if v is not None and str(v).strip() != "":
+            return v
+    return None
+
+
+def _pivot_context(ws, row: int, col: int, header_row: "int | None",
+                   domains: "dict[str, set[str]] | None" = None) -> "dict[str, Any] | None":
     """Question-independent extraction condition + aggregation for a highlighted pivot cell.
 
-    Reads the cell's own column header (``column_header`` — the 集計内容, e.g. ``平均 / bmi``) and, for
-    each *dimension* column to its left (a left column whose header is NOT an aggregate marker), the
-    nearest non-empty label at-or-above ``row`` (upward scan) — the parent group key of that cell. For
-    ``F22`` in a sex/smoker/region/charges pivot this yields ``sex=female, smoker=yes, region=southeast,
-    charges=2``. Returns None (⇒ no enrichment) when the sheet is not a pivot below the header or no
-    dimension binds. Never reads the question or gold.
+    Reads the cell's own column header (``column_header`` — the 集計内容, e.g. ``平均 / bmi``) and the
+    dimension columns of the *same* pivot block to its left. Two column kinds:
+
+    * a named dimension column (``sex``/``smoker``/…) → one condition ``name=<nearest upward label>``
+      (idx42, unchanged);
+    * a generic PivotTable index column (``行ラベル``) → a *nested* multi-level index; each level is
+      named by value-domain match against the workbook's source sheets and the outer group is carried
+      down to the inner value (``children=3, smoker=no`` for ``E14``; SOT-2709).
+
+    Block scoping: scanning left from the value cell, sibling value columns of this block are skipped,
+    the contiguous dimension columns are collected, and the scan stops at the next aggregate column —
+    which belongs to a *previous* side-by-side pivot — so a neighbouring pivot's dimension (Sheet2 col A)
+    is never picked up. Returns None when the sheet is not a pivot below the header or no dimension binds.
+    Never reads the question or gold.
     """
     if header_row is None or header_row >= row:
         return None
@@ -227,23 +327,40 @@ def _pivot_context(ws, row: int, col: int, header_row: "int | None") -> "dict[st
     if raw_header is None or str(raw_header).strip() == "":
         return None
     column_header = str(raw_header).strip()
-    row_context: list[dict[str, Any]] = []
-    for c in range(1, col):
+    if domains is None:
+        domains = _source_domains(getattr(ws, "parent", None)) if getattr(ws, "parent", None) else {}
+
+    # Collect this block's dimension columns (right→left), stopping at the previous block's value cols.
+    dim_cols: list[int] = []
+    seen_dim = False
+    for c in range(col - 1, 0, -1):
         h = ws.cell(header_row, c).value
-        if h is None or str(h).strip() == "":
-            continue
-        name = str(h).strip()
-        if _AGG_MARK.search(name):  # a value/aggregate column, not an extraction condition
-            continue
-        label = None
-        for rr in range(row, header_row, -1):  # upward scan for the nearest parent label
-            v = ws.cell(rr, c).value
-            if v is not None and str(v).strip() != "":
-                label = v
-                break
-        if label is None:
-            continue
-        row_context.append({"name": name, "value": _fmt_label(label)})
+        name = "" if h is None else str(h).strip()
+        if name == "":
+            continue  # blank-header spacer column (matches legacy skip)
+        if _AGG_MARK.search(name):  # a value/aggregate column
+            if seen_dim:
+                break  # crossed into the previous pivot block's value columns
+            continue   # a sibling value column of this block, still left of its dimensions
+        dim_cols.append(c)
+        seen_dim = True
+    dim_cols.reverse()  # left→right order for stable, legacy-matching output
+
+    row_context: list[dict[str, Any]] = []
+    for c in dim_cols:
+        name = str(ws.cell(header_row, c).value).strip()
+        if _GENERIC_LABEL.match(name):
+            index_values = set()
+            for rr in range(header_row + 1, (ws.max_row or 0) + 1):
+                v = ws.cell(rr, c).value
+                if v is not None and str(v).strip() != "":
+                    index_values.add(_fmt_label(v))
+            levels = _level_domains(index_values, domains)
+            row_context.extend(_nested_dim_context(ws, c, row, header_row, levels))
+        else:
+            label = _nearest_label(ws, c, row, header_row)
+            if label is not None:
+                row_context.append({"name": name, "value": _fmt_label(label)})
     if not row_context:
         return None
     m = _AGG_LEAD.match(column_header)
@@ -299,8 +416,9 @@ def _extract_sheet(ws) -> dict[str, Any]:
     # Gated so OFF ⇒ no new key ⇒ store + serve byte-identical.
     if pivot_context_enabled() and statics:
         header_row = _detect_header_row(ws)
+        domains = _source_domains(getattr(ws, "parent", None)) if getattr(ws, "parent", None) else {}
         for it in statics:
-            pc = _pivot_context(ws, it["row"], it["column"], header_row)
+            pc = _pivot_context(ws, it["row"], it["column"], header_row, domains)
             if pc:
                 it["pivot_context"] = pc
 
