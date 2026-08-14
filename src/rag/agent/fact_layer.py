@@ -504,6 +504,15 @@ def _pptx_note_scope_tool() -> "tuple[str, str, dict[str, Any], Callable[..., An
         return None
 
 
+def _schedule_plan_tool() -> "tuple[str, str, dict[str, Any], Callable[..., Any]] | None":
+    """SOT-2710 xlsx スケジュール/プラン派生 lookup tool (default OFF ⇒ None ⇒ surface byte-identical)。"""
+    try:
+        from src.rag.agent import schedule_plan_lane
+        return schedule_plan_lane.tool()
+    except Exception:  # noqa: BLE001 — a broken optional tool must never break the tool set
+        return None
+
+
 def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     """The 4 fact-layer tools, or ``[]`` when the layer is OFF (⇒ tool set / MCP surface byte-identical)."""
     if not enabled():
@@ -517,7 +526,7 @@ def tools() -> list[tuple[str, str, dict[str, Any], Callable[..., Any]]]:
     optional += [x for x in (_xref_coverage_tool(), _nb_chart_tool(), _analysis_xref_tool(),
                             _staged_metrics_tool(), _derived_ranking_tool(), _analysis_metrics_tool(),
                             _contact_master_tool(), _pptx_money_page_tool(), _master_join_tool(),
-                            _pptx_note_scope_tool())
+                            _pptx_note_scope_tool(), _schedule_plan_tool())
                  if x is not None]
     return optional + [
         (CASE_FILTER,
@@ -1080,6 +1089,17 @@ def resolve(question: str, contract: "str | None", *, profile: Any = None,
             try:
                 from src.rag.agent import master_join_lane
                 result = master_join_lane.resolve(question)
+            except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
+                result = None
+        # SOT-2710 — xlsx スケジュール/プラン既存ストアの自動発火 決定論直答レーン（オレンジ行ハイライトの
+        # タスク名列挙 idx2 / 担当者別タスク数 idx41 / 提案書ガントのフェーズ実施週 idx75 / フェーズ内最終開始
+        # タスク名 idx89 / バッファ工数合計 idx90）。上位レーンが束縛できない時のみ後置。証拠は既存の
+        # visual_store / plan_coverage_store と新設 schedule_plan_store（質問非依存の全数事前計算）由来。
+        # RAG_SCHEDULE_PLAN_LOOKUP OFF ⇒ schedule_plan_lane.resolve() は None ⇒ byte-identical。
+        if result is None:
+            try:
+                from src.rag.agent import schedule_plan_lane
+                result = schedule_plan_lane.resolve(question)
             except Exception:  # noqa: BLE001 — 壊れた任意レーンは fall back、答えパスを壊さない
                 result = None
     except Exception:  # noqa: BLE001 — a broken lane must fall back, not break the answer path
