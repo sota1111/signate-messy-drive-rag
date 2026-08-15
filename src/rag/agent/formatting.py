@@ -683,7 +683,7 @@ def apply_decimal_precision(question: str, value: str) -> "tuple[str, list[str]]
 # 列挙/挙示型の設問キー（該当なしが正しい gold surface になり得る設問）。
 _ENUM_ASK_Q_RE = re.compile(r"挙げ|列挙|すべて|全て|一覧|それぞれ|該当する(?:もの|項目)|洗い出|抽出して")
 # 末尾の括弧注記（（全6項目達成）/（なし）等）— 本体の非存在結論の後ろに付く冗長注記のみ剥がす。
-_TRAILING_PAREN_NOTE_RE = re.compile(r"\s*[（(][^（()）]*[)）]\s*$")
+_TRAILING_PAREN_NOTE_RE = re.compile(r"\s*[（(][^（()）]*[)）][。\.！!]?\s*$")
 # 回答本体が「非存在の結論」で終わるか（末尾係留）。〜はありません/ございません/存在しません/見つかりません/ない/該当なし。
 _NONE_CONCLUSION_TAIL_RE = re.compile(
     r"(?:は|が|も)?(?:特に|一つ(?:も)?|1つ(?:も)?)?"
@@ -691,6 +691,9 @@ _NONE_CONCLUSION_TAIL_RE = re.compile(
     r"見当たりま?せん(?:でした)?|該当(?:する(?:もの|項目))?(?:は)?(?:なし|無し|ありません)|"
     r"ない(?:です)?|無い(?:です)?|皆無)"
     r"[。\.！!]?\s*$")
+# A question asking for *unmet* items has an empty result when the answer explicitly certifies that all
+# items were achieved.  This is stronger than generic positive wording and remains question-keyed.
+_ALL_ACHIEVED_RE = re.compile(r"(?:全|すべて|全て)\s*\d*\s*(?:項目|つ|件)?[^。\n]{0,80}(?:達成|満た(?:す|した|している))")
 
 
 def none_bare_fold_enabled() -> bool:
@@ -717,6 +720,11 @@ def fold_none_bare(question: str, value: str) -> "tuple[str, list[str]]":
     core = _TRAILING_PAREN_NOTE_RE.sub("", text).strip() or text
     # 既に正規 none 形（whole-string）なら畳む。
     is_none = bool(_NONE_RE.match(core))
+    if not is_none:
+        # 「未達成項目」を問われ、回答自身が全項目達成を証明する場合も空集合。括弧内に KPI 名の
+        # 読点列挙があっても、それは未達成項目の列挙ではないため、この強い証明を先に評価する。
+        if "未達成" in (question or "") and _ALL_ACHIEVED_RE.search(core):
+            is_none = True
     if not is_none:
         # 読点で実項目を並べた回答は複数項目列挙 ⇒ 畳まない（fail-closed）。
         if "、" in core:

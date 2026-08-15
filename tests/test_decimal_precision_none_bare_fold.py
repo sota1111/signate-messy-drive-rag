@@ -16,6 +16,7 @@ from __future__ import annotations
 import pytest
 
 from src.rag.agent import formatting
+from src.rag.agent import investigator
 
 
 # =============================================================== レバーA: 小数精度丸め
@@ -137,10 +138,16 @@ def test_idx85_verbose_no_items_with_paren_note():
 
 
 def test_idx85_variants():
-    for v in ["未達成の項目は存在しません", "該当する項目はありません", "未達成とされている項目はございません（6項目すべて達成）"]:
+    for v in ["未達成の項目は存在しません", "該当する項目はありません", "未達成とされている項目はございません（6項目すべて達成）",
+              "未達成とされている項目はありません（全6項目のKPIにおいてすべて「達成」と評価されています）。"]:
         out, rules = _fold(Q85, v)
         assert out == "該当なし", v
         assert rules == ["none_bare_fold"], v
+
+
+def test_idx85_all_achieved_certificate():
+    v = "設定されたKPI（データ理解、要因把握、モデル評価、説明可能性、実務接続、ガバナンスの全6項目）はすべて「達成」と評価されています。"
+    assert _fold(Q85, v) == ("該当なし", ["none_bare_fold"])
 
 
 def test_already_bare_none_is_noop():
@@ -180,3 +187,21 @@ def test_multiline_noop():
 
 def test_empty_noop_fold():
     assert _fold(Q85, "") == ("", [])
+
+
+def test_serve_boundary_formats_deterministic_answer(monkeypatch):
+    """The final contract must also cover deterministic early-return answers (idx57/63 route)."""
+    monkeypatch.setenv("RAG_DECIMAL_PRECISION", "1")
+    inv = investigator.Investigation(
+        question=Q57,
+        answer=investigator.Answer(answer="0.42395962", confidence=1.0),
+        iterations=1,
+        tool_calls=["det_pipeline:numeric"],
+        usage=investigator.Usage(),
+        model="deterministic",
+        elapsed_s=0.0,
+        stop_reason="answered",
+    )
+    out = investigator._apply_sot2720_formatting(inv, Q57)
+    assert out.answer.answer == "0.42396"
+    assert out.interventions["decimal_precision"]["fired"] is True
