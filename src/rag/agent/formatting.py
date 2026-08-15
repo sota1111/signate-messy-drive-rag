@@ -578,6 +578,112 @@ def resolve_report_page_direct(question: str) -> "str | None":
     return str(int(bare)) if bare.isdigit() else None
 
 
+# --- SOT-2721 (idx29) — 「<列>のヒストグラムで N 番目にカウント数が多いビンの範囲」の決定論 direct-commit -----
+# 純 Gemini 経路は idx29「TP のヒストグラムで3番目にカウント数が多いビンの範囲」を LLM 経路で解こうとして
+# framing churn で棄権する。ビン境界は既存の権威実装 :func:`chart_numcache._scott_histogram`（Excel 自動
+# ヒストグラム＝Scott 正規参照則の幅を3桁 truncate＝ROUNDDOWN、bin グリッド ``min + k*width``）が corpus の
+# 実データから機械計算する（同一規則で idx10 の AG_ratio 幅0.053/最多958 と idx29 の TP 幅0.200/
+# [6.088138,6.288138] を再現）。本 direct-commit は LLM 出力に一切依存せず、質問が名指す案件×列のヒストグラムを
+# :func:`chart_numcache.read_chart_values` で再集計し、カウント降順（「多い」）/昇順（「少ない」）K 番目のビン範囲を
+# 『lo ~ hi』（小数第 N 位）で確定する。**幅は実データから導出（0.2 は直書きしない）**。gold100 全走査で本ゲート
+# （ヒストグラム × ビン × 範囲 × 「N番目」 × カウント × 多い/少ない）に合致するのは idx29 のみ（idx10「最も多い
+# カウント数」型は範囲/「N番目」を含まず構造的に除外）。確定不能なら ``None``。``RAG_HIST_BIN`` default OFF ⇒
+# byte-identical serve path。
+_HIST_Q_RE = re.compile(r"ヒストグラム")
+_HIST_BIN_Q_RE = re.compile(r"ビン")
+_HIST_RANGE_Q_RE = re.compile(r"範囲|レンジ|区間")
+_HIST_ORDINAL_RE = re.compile(r"(\d+)\s*番目")
+_HIST_COUNT_Q_RE = re.compile(r"カウント|件数|度数|頻度|数")
+_HIST_MOST_RE = re.compile(r"多い")
+_HIST_LEAST_RE = re.compile(r"少ない")
+# 「<col>のヒストグラム」の先頭データ列トークン（ASCII識別子 or 日本語列名、chart_spatial と同一パターン）。
+_HIST_COL_RE = re.compile(r"([A-Za-z0-9_.一-鿿]+?)\s*の?\s*ヒストグラム")
+# 案件フォルダに data 系 xlsx が複数ある場合の曖昧性回避に使う、質問中の ASCII ファイル名（例 train.xlsx）。
+_HIST_FILE_RE = re.compile(r"([A-Za-z0-9_\-]+\.(?:xlsx|xlsm))")
+_HIST_PRECISION_RE = re.compile(r"小数第\s*(\d+)\s*位")
+# ビン区間記法 ``(lo, hi]`` から両端の数値トークンを取り出すための緩い数値マッチ。
+_HIST_INTERVAL_NUM_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+
+
+def histogram_bin_enabled() -> bool:
+    """SOT-2721 — ヒストグラムのビン範囲 direct-commit が発火するか (``RAG_HIST_BIN``, default OFF ⇒ byte-identical)。"""
+    return _env_flag("RAG_HIST_BIN", False)
+
+
+def _histogram_series(question: str, column: str) -> "tuple[list[int], list[str]]":
+    """質問が名指す案件×列の Excel 自動ヒストグラムを再集計し ``(counts, categories)`` を返す。
+
+    案件は SOT-2494 canonical route で確定し、その data カテゴリ xlsx（質問が ASCII ファイル名を名指すなら
+    その basename に一致するもの）を一意に選ぶ。ビン境界は :func:`chart_numcache.read_chart_values`
+    （numCache 優先、無ければ埋め込みチャート→ソース列マッピング + :func:`_scott_histogram` 再集計）が
+    実データから機械計算する。曖昧（0/複数案件・0/複数 xlsx・列非一致）なら ``([], [])``。
+    """
+    from src.rag.agent.pipelines import fact_lookup as _fact_lookup
+    from src.rag.tools import chart_numcache as _chart_numcache
+
+    project = _fact_lookup._resolve_project(question)
+    refs = _fact_lookup._project_refs(project)
+    cands = [r for r in refs
+             if getattr(r, "ext", "") == "xlsx" and getattr(r, "category", "") == "data"]
+    m_file = _HIST_FILE_RE.search(question or "")
+    if m_file:
+        wanted = m_file.group(1).casefold()
+        matched = [r for r in cands if r.rel.split("/")[-1].casefold() == wanted]
+        if not matched:
+            return [], []  # 質問が名指す data ファイルが見つからない ⇒ 推測しない
+        cands = matched
+    if len(cands) != 1:
+        return [], []  # 案件の data xlsx が一意でない ⇒ fail-closed
+    res = _chart_numcache.read_chart_values(str(cands[0].path), column=column, operation="histogram")
+    series = res["value"]["charts"][0]["series"][0]
+    return list(series["values"]), list(series["categories"])
+
+
+def resolve_histogram_bin_direct(question: str) -> "str | None":
+    """SOT-2721 — 「<列>のヒストグラムで N 番目にカウント数が多いビンの範囲」を決定論再集計で直接確定する。
+
+    LLM 出力に一切依存せず、Excel 自動ヒストグラム（Scott 幅の3桁 truncate、:func:`_histogram_series`）を
+    実データから再集計し、カウント降順（「多い」）/昇順（「少ない」）で K 番目のビンの範囲を
+    ``f"{lo:.{N}f} ~ {hi:.{N}f}"``（gold のチルダ書式、小数第 N 位）で返す。ゲート＝ヒストグラム × ビン ×
+    範囲/レンジ/区間 × 「N番目」 × カウント/件数/度数/… × 多い/少ない を全て要求する（idx10「最も多いカウント
+    数」型は範囲/「N番目」を含まず None）。列名・ファイル名・K・小数第N位・向きはすべて質問から抽出し、
+    ビン幅は実データから導出する（0.2 直書きなし）。確定不能・曖昧はいずれも ``None``。fail-open。
+    """
+    q = question or ""
+    if not (_HIST_Q_RE.search(q) and _HIST_BIN_Q_RE.search(q) and _HIST_RANGE_Q_RE.search(q)):
+        return None
+    m_ord = _HIST_ORDINAL_RE.search(q)
+    if m_ord is None or not _HIST_COUNT_Q_RE.search(q):
+        return None
+    descending = bool(_HIST_MOST_RE.search(q))
+    if not descending and not _HIST_LEAST_RE.search(q):
+        return None  # 「多い」/「少ない」の向きが不明なら触らない
+    k = int(m_ord.group(1))
+    m_col = _HIST_COL_RE.search(q)
+    m_prec = _HIST_PRECISION_RE.search(q)
+    if k < 1 or m_col is None or m_prec is None:
+        return None  # 列名 or 小数第N位の指定が無ければ整形不能 ⇒ 触らない
+    precision = int(m_prec.group(1))
+    try:
+        counts, categories = _histogram_series(q, m_col.group(1).strip())
+    except Exception:  # noqa: BLE001 — 再集計失敗は None（決して答えパスを壊さない）
+        return None
+    if not counts or k > len(counts):
+        return None
+    # 「N番目に多い」＝カウント降順、同数は bin index 昇順で安定。「少ない」＝昇順。
+    order = sorted(range(len(counts)),
+                   key=lambda i: (-counts[i], i) if descending else (counts[i], i))
+    nums = _HIST_INTERVAL_NUM_RE.findall(categories[order[k - 1]])
+    if len(nums) < 2:
+        return None
+    try:
+        lo = float(nums[0].replace(",", ""))
+        hi = float(nums[1].replace(",", ""))
+    except ValueError:
+        return None
+    return f"{lo:.{precision}f} ~ {hi:.{precision}f}"
+
+
 def apply_page_count_bare(question: str, value: str) -> "tuple[str, list[str]]":
     """「ページ数」型設問の回答を印字ページ番号の **bare** 表記へ決定論固定する値保存の書式契約 (SOT-2719)。
 
