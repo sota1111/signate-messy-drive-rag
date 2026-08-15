@@ -66,3 +66,45 @@
 
 将来の再挑戦条件（新証拠）: (a) judge rubric/gold が緩和され値節の言い換えを許容する、または
 (b) gold 語彙 `実測値` が構造化抽出で正当に得られる根拠が現れた場合のみ。それ以外は再試行しない。
+
+---
+
+## SOT-2723（2026-08-15）再確認：構造テンプレ direct-commit も現行 judge で Incorrect（撤退維持）
+
+SOT-2723 は本件を「diff_store 構造テンプレを使えば通せるのでは」という新角度で再依頼し、**judge Perfect の時のみ
+promote・そうでなければ棄権据置（net 悪化ゼロ）・full は回さない** という明示ゲート付きだった。結論は **撤退維持（棄権据置）**。
+
+### 新証拠1: rank0 レコード実体に `実測値` トークンは存在しない（再確認）
+
+現行 `artifacts/diff_store.jsonl` の かえで最終報告ペア rank0（`table_frame_summary`）実体:
+
+| フィールド | 値 |
+| --- | --- |
+| old | `指標の比較表（AUC-ROC・F1-macro・Accuracy）` |
+| new | `改善幅のみを示す1行要約に置換` |
+| columns（summary 内） | `中間・最終・改善幅` |
+| summary | `スライド7にあった「最終モデル性能指標と中間段階との比較」の比較表（AUC-ROC・F1-macro・Accuracyを中間・最終・改善幅で比較）が削除され、改善幅のみを示す1行要約に置換` |
+
+レコード全体（JSON 全文）を `実測` で grep して **ヒット 0**。さらに index_store/chunks.jsonl の かえで最終報告
+コーパス全体でも `実測` は 1 件のみで、それは無関係なスケジュール行（`…目的変数分布の実測確認…`）＝スライド7の
+比較表とは別物・`実測値` ですらない。⇒ **gold の非対称接尾 `中間実測値` は構造抽出で正当に得られない**（再挑戦条件(b) 不成立）。
+
+### 新証拠2: 現行 judge（codex/GPT-5.x・strict）での実測（votes=1・安定）
+
+| 候補 | 判定 |
+| --- | --- |
+| gold 逐語（サニティ） | **Perfect** |
+| 構造テンプレ最良（非ハードコード・列名素直 naturalize `中間値と最終値`） | **Incorrect** |
+| rank0 record summary そのもの（LOWCONF_ABSTAIN OFF 時に direct-commit される文） | **Incorrect** |
+
+SOT-2715 の較正結論を現行 judge で再現。judge rubric も緩和されていない（再挑戦条件(a) 不成立）。
+
+### 採否（ゲート適用）
+
+- idx1 は **Perfect にならない** ⇒ **promote せず**。`RAG_VDIFF_LOWCONF_ABSTAIN` の棄権を**据置**。
+- record summary を direct-commit すると Incorrect(−1) < 棄権 Missing(0) ⇒ **棄権が EV 正**（現行 net98 の abstain[1,98] を維持）。
+- serve 無改変（byte-identical）・他 version_diff 回帰ゼロ・full は回さない（ゲート指示どおり）。
+- 新サブフラグ（削除表→置換クラスの direct-commit レーン）は **追加しない**（通す唯一の道が gold ハードコード＝受入条件違反）。
+  `src/rag/agent/vdiff_direct_lane.py` のガードコメントに SOT-2723 を追記。
+
+ledger/history: result=`rejected`（net 不変・悪化ゼロ）で記録。

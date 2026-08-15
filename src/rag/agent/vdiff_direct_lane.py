@@ -318,6 +318,12 @@ def _resolve_no_change(rec: "dict[str, Any]") -> "dict[str, Any] | None":
 # RAG_VDIFF_DC_TABLEREPL 的なサブフラグは追加せず serve は byte-identical のまま従来経路へ委譲する。
 # 根拠と較正表: docs/ai/SOT-2715_idx1_vdiff_direct_commit_withdrawal.md。再挑戦は新証拠（judge緩和 or 実測値の
 # 正当な構造抽出）が出た時のみ。
+# SOT-2723 (2026-08-15) 再確認: 「構造テンプレ direct-commit なら通せる」角度で再挑戦したが撤退維持。現行 diff_store
+# rank0 実体の列名は素の 中間/最終/改善幅 で `実測値` トークンはレコード全体にも かえで最終報告コーパスにも不在
+# （唯一の `実測` は無関係な EDA スケジュール行）。現行 judge(codex/GPT-5.x・strict) 実測=構造テンプレ最良
+# 「中間値と最終値」Incorrect・record summary Incorrect・gold逐語のみ Perfect。⇒ promote せず LOWCONF_ABSTAIN 据置
+# （棄権 Missing 0 > direct-commit Incorrect −1）。full 非実行・serve byte-identical。詳細は上記 withdrawal.md の
+# SOT-2723 セクション。
 def resolve(question: str) -> "dict[str, Any] | None":
     """rank0 が summary 付き SUBSTANTIVE の一意ペアに束縛できる時だけ、その summary を逐語 commit する contract。
 
