@@ -91,9 +91,17 @@ match96 / abstain3 / wrong1、net=95 で、要求 net>=98 を満たさなかっ�
 - [x] 番兵10/10、フラグOFF byte-identical（default OFF unit coverage）。
 - [ ] full net>=98 — 未達（net95）。
 
+## Handoff後の clean full resample
+- 既存の background job（PID 861055）を重複起動せず完了まで監視。
+- full official:false: **match97 / abstain2 / wrong1 / net96**、cost $1.058737。
+- idx57=`0.42396`、idx63=`0.15002`、idx85=`該当なし` は全て exact match。
+- intervention は decimal_precision 2/2、none_bare_fold 1/1 が全て match。
+- 残差は非対象の idx29 wrong-bin、idx1/98 abstain。net>=98 は再現せず、受け入れ条件は未達。
+
 ## Risks / Remaining
-full の非対象 churn（abstain idx1/25/98、wrong idx29）により aggregate gate 未達。仕様どおり full の再実行は
-せず、レバーは experiment ledger で inconclusive とした。PR/merge なし、Linear は In Progress のまま。
+clean resample でも aggregate gate は net96 に留まった。対象レバーの因果的回帰はないが、issue が要求する
+full net>=98 を満たさないため experiment ledger は inconclusive のまま、PR/merge は行わない。Linear は
+In Progress に維持する。
 
 ## Linear Report: POSTED
 ## Acceptance: FAIL
