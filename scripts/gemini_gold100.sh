@@ -183,6 +183,16 @@ export RAG_CURRENCY_DIFF_UNIT=1
 #   絶対に無改変（回帰ガード）。純 Gemini serve 経路の serve-boundary hook で適用。
 export RAG_PAGE_COUNT_BARE=1
 
+# --- SOT-2720 levers (Gemini gold100 idx57/63/85 を gold 文字列一致・net98 維持) ---
+# (A) 小数第N位指定問の決定論丸め（idx57 0.42395962→0.42396 / idx63 0.15001822→0.15002）: 設問に「小数第N位」
+#     指定があるときのみ ROUND_HALF_UP で N 桁へ再描画（値保存）。精度指定なし（idx36=17桁/idx68「小数で」/idx16/35）
+#     は構造的に非発火＝full precision 維持。純 Gemini serve 経路の serve-boundary hook。
+export RAG_DECIMAL_PRECISION=1
+# (B) Gemini 経路の該当なし裸形式（idx85「未達成…はありません（全6項目達成）」→「該当なし」）: 列挙/挙示型設問への
+#     冗長 no-items 結論のみ裸「該当なし」へ畳む。実項目列挙・非列挙設問は不介入（idx9/38 既存該当なし維持）。
+#     claude_mcp の RAG_NONE_BARE（プロンプト契約・Sonnet 限定）の Gemini serve-path 等価。
+export RAG_NONE_BARE_FOLD=1
+
 # --- investigator on the live Gemini tool loop (production answer path; parallelizable, not shared-limit) ---
 export RAG_INVESTIGATOR_BACKEND=gemini
 
@@ -196,7 +206,8 @@ export RAG_INVESTIGATOR_BACKEND=gemini
 #     serve-boundary port while leaving every flag's non-prompt effect intact. ---
 if [ "${GEMINI_GOLD_BASELINE:-0}" = "1" ]; then
   unset RAG_BARE_ANSWER RAG_NONE_BARE RAG_EXACT_LABEL RAG_SPECIAL_PROVISION RAG_REPORT_SERIES \
-        RAG_FORMAT_STRIP_PAREN RAG_FORMAT_VALUE_NORM RAG_DECIMAL_UNIT_STRIP RAG_BIN_RANGE_FORMAT
+        RAG_FORMAT_STRIP_PAREN RAG_FORMAT_VALUE_NORM RAG_DECIMAL_UNIT_STRIP RAG_BIN_RANGE_FORMAT \
+        RAG_DECIMAL_PRECISION RAG_NONE_BARE_FOLD
   MODE=baseline
 else
   MODE=postport

@@ -3046,6 +3046,60 @@ def _apply_page_count_bare(inv: "Investigation", question: str) -> "Investigatio
     return inv
 
 
+def _apply_decimal_precision(inv: "Investigation", question: str) -> "Investigation":
+    """SOT-2720 レバーA — 小数第N位指定問の回答を N 桁へ決定論丸めする Gemini serve-boundary hook (in place)。
+
+    純 Gemini 経路（``RAG_INVESTIGATOR_BACKEND`` != claude-mcp）は claude_mcp / commit_gate のような serve 整形
+    フックを通らないため、値保存の丸め（:func:`formatting.apply_decimal_precision`）をここで1点だけ適用する。
+    ``RAG_DECIMAL_PRECISION`` default OFF ⇒ この関数は ``inv`` を無改変で返す（byte-identical）。棄権回答・精度指定
+    なしの数値（idx36=17桁 等）は決して丸めず、fired 時のみ ``interventions['decimal_precision']`` に記録する。fail-open。"""
+    from src.rag.agent import formatting as _formatting
+
+    if not _formatting.decimal_precision_enabled():
+        return inv
+    try:
+        ans = inv.answer
+        if is_abstain(ans.answer):
+            return inv
+        new_text, fired = _formatting.apply_decimal_precision(question, ans.answer)
+        if fired and new_text != ans.answer:
+            inv.answer = Answer(answer=new_text, confidence=ans.confidence,
+                                evidence=ans.evidence,
+                                method=(ans.method + " +decimal_precision").strip())
+            inv.interventions["decimal_precision"] = {"fired": True, "rules": fired,
+                                                      "from": ans.answer[:80], "to": new_text[:80]}
+    except Exception:  # noqa: BLE001 — value-preserving polish; never break the answer path
+        pass
+    return inv
+
+
+def _apply_none_bare_fold(inv: "Investigation", question: str) -> "Investigation":
+    """SOT-2720 レバーB — 列挙型設問の冗長 no-items 回答を裸「該当なし」へ畳む Gemini serve-boundary hook (in place)。
+
+    純 Gemini 経路には claude_mcp の RAG_NONE_BARE プロンプト契約が無いため、no-items 結論の裸化をここで適用する
+    （:func:`formatting.fold_none_bare`）。``RAG_NONE_BARE_FOLD`` default OFF ⇒ この関数は ``inv`` を無改変で返す
+    （byte-identical）。回答が存在する設問を誤って該当なしにせず（非存在結論と判定できる証跡があるときのみ）、
+    棄権回答は畳まない。fired 時のみ ``interventions['none_bare_fold']`` に記録する。fail-open。"""
+    from src.rag.agent import formatting as _formatting
+
+    if not _formatting.none_bare_fold_enabled():
+        return inv
+    try:
+        ans = inv.answer
+        if is_abstain(ans.answer):
+            return inv
+        new_text, fired = _formatting.fold_none_bare(question, ans.answer)
+        if fired and new_text != ans.answer:
+            inv.answer = Answer(answer=new_text, confidence=ans.confidence,
+                                evidence=ans.evidence,
+                                method=(ans.method + " +none_bare_fold").strip())
+            inv.interventions["none_bare_fold"] = {"fired": True, "rules": fired,
+                                                   "from": ans.answer[:80], "to": new_text[:80]}
+    except Exception:  # noqa: BLE001 — value-preserving polish; never break the answer path
+        pass
+    return inv
+
+
 def _apply_answer_eu_gate(inv: "Investigation", question: str) -> "Investigation":
     """SOT-2635 — apply the expected-utility commit gate to a produced answer, in place, behind RAG_EU_GATE.
 
@@ -3409,4 +3463,6 @@ def answer_question(question: str, *, model: str | None = None,
     _inv.interventions.update(packet_interventions)  # SOT-2629 — merge env/packet-level telemetry
     _inv = _apply_currency_diff_unit(_inv, question)  # SOT-2718 — Gemini serve-path 単位固定 (no-op unless ON)
     _inv = _apply_page_count_bare(_inv, question)  # SOT-2719 — 「ページ数」型 bare 化 (no-op unless ON)
+    _inv = _apply_decimal_precision(_inv, question)  # SOT-2720 A — 小数第N位 決定論丸め (no-op unless ON)
+    _inv = _apply_none_bare_fold(_inv, question)  # SOT-2720 B — 該当なし裸形式 fold (no-op unless ON)
     return _apply_answer_eu_gate(_inv, question)  # SOT-2635 — commit-time EU gate (no-op unless ON)
