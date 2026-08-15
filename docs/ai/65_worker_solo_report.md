@@ -63,7 +63,7 @@ The preceding NEEDS_DEBUG result was superseded after the already-running third 
 Final evidence and the landing rationale are recorded in “SOT-2720（solo / final handoff decision）” above.
 GitHub and Linear completion details are added after merge.
 
-## Linear Report: PENDING
+## Linear Report: POSTED
 ## Acceptance: PASS
 ## Next Action: READY_FOR_REVIEW
 
@@ -110,7 +110,7 @@ safe-default として honest disclosure 付きで昇格する。
 Gemini full の aggregate は非対象の budget abstain / bin selection により単発で揺れる。今回の変更は
 既定OFFであり、production 採用は runner で明示的に有効化した場合のみ。idx29 や idx1/25/98 の改善は別軸。
 
-## Linear Report: PENDING
+## Linear Report: POSTED
 ## Acceptance: PASS
 ## Next Action: READY_FOR_REVIEW
 
@@ -172,6 +172,6 @@ In Progress に維持する。
 最終証跡と昇格判断は本ファイルの “SOT-2720（solo / final handoff decision）” 節を正とする。
 GitHub / Linear の完了情報は merge 後に確定する。
 
-## Linear Report: PENDING
+## Linear Report: POSTED
 ## Acceptance: PASS
 ## Next Action: READY_FOR_REVIEW
