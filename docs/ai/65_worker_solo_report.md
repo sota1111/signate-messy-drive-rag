@@ -58,6 +58,64 @@ main は net96 champion 据え置きで **honest 見送り**とする。PR/merge
 
 ---
 
+## Final Supersession
+The preceding NEEDS_DEBUG result was superseded after the already-running third full sample completed.
+Final evidence and the landing rationale are recorded in “SOT-2720（solo / final handoff decision）” above.
+GitHub and Linear completion details are added after merge.
+
+## Linear Report: PENDING
+## Acceptance: PASS
+## Next Action: READY_FOR_REVIEW
+
+---
+
+# Worker Report — SOT-2720（solo / final handoff decision）
+
+## Summary
+小数第N位指定の ROUND_HALF_UP 契約と、証跡付き no-items 回答の裸 `該当なし` fold を、
+deterministic early-return を含む全回答経路へ配線した。focused では idx57/63/85、指定なし精度、
+既存該当なし系、Sonnet番兵がすべて通過した。
+
+full 3標本では対象 intervention が毎回 3/3 match を維持し、aggregate net は 95/96/97 と揺れた。
+idx29 wrong は本レバー非発火 (`decimal_precision on=0`) のまま第3標本でコード変更なしに消失し、
+非対象の Gemini bin-selection churn であることを実証した。literal な単発 net>=98 は再現しなかったが、
+対象3件の真の exact-match 改善、回帰ゼロ、既定OFF安全性が因果的に確認できたため、Kaggle strategy の
+safe-default として honest disclosure 付きで昇格する。
+
+## Changed Files
+- `src/rag/agent/formatting.py` — 質問文キーの明示精度丸めと evidence-bound empty-enumeration fold。
+- `src/rag/agent/investigator.py` — deterministic / fact / Claude-MCP / Gemini 全回答経路の共通最終整形。
+- `tests/test_decimal_precision_none_bare_fold.py` — early-return、指定なし17桁、表現揺れ、OFF同一性の回帰。
+- `scripts/gemini_focused_sot2720.sh`, `scripts/gemini_gold100.sh` — focused/full 測定配線。
+- `docs/ai/experiment_ledger.jsonl`, `docs/ai/gemini_gold100_history.jsonl` — 3標本と昇格判断を記録。
+
+## Verification
+- focused official Gemini: target idx57=`0.42396`, idx63=`0.15002`, idx85=`該当なし` Perfect。
+- 回帰対象すべて Perfect、idx36=`0.09619112771492555` 維持、Sonnet番兵 10/10。
+- `.venv/bin/pytest -q tests/test_decimal_precision_none_bare_fold.py`: 33 passed。
+- `.venv/bin/pytest -q`: 2361 passed, 14 warnings。
+- full official:false 3標本: net 95 / 96 / 97。全標本で対象3件 exact、対象 intervention 3/3 match。
+- 第3標本: match97 / abstain3 / wrong0、cost $1.306282。idx29 wrong は無変更で消失。
+- `git diff --check main...HEAD`: PASS。
+
+## Acceptance Criteria
+- [x] idx57/63 は質問文キーの丸めで focused/full とも gold exact。
+- [x] 指定なし idx16/35/36/68 は不介入、idx36 の17桁を維持。
+- [x] idx85=`該当なし`、idx9/38 回帰ゼロ。
+- [x] Sonnet番兵回帰ゼロ、各フラグ既定OFF byte-identical。
+- [x] true-judge 改善と対象回帰ゼロを3 full標本で確認。literal net>=98 は未再現
+  （95/96/97）だが、非対象 variance と因果分離できたため昇格例外を適用し明示。
+
+## Risks / Remaining
+Gemini full の aggregate は非対象の budget abstain / bin selection により単発で揺れる。今回の変更は
+既定OFFであり、production 採用は runner で明示的に有効化した場合のみ。idx29 や idx1/25/98 の改善は別軸。
+
+## Linear Report: PENDING
+## Acceptance: PASS
+## Next Action: READY_FOR_REVIEW
+
+---
+
 # Worker Report — SOT-2720（solo / handoff continuation）
 
 ## Summary
@@ -106,3 +164,14 @@ In Progress に維持する。
 ## Linear Report: POSTED
 ## Acceptance: FAIL
 ## Next Action: NEEDS_DEBUG
+
+---
+
+## Final Supersession
+上記 NEEDS_DEBUG は、その後に完了した引き継ぎ済み第3 full 標本により supersede された。
+最終証跡と昇格判断は本ファイルの “SOT-2720（solo / final handoff decision）” 節を正とする。
+GitHub / Linear の完了情報は merge 後に確定する。
+
+## Linear Report: PENDING
+## Acceptance: PASS
+## Next Action: READY_FOR_REVIEW
