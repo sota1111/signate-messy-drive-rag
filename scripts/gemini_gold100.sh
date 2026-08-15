@@ -193,6 +193,14 @@ export RAG_DECIMAL_PRECISION=1
 #     claude_mcp の RAG_NONE_BARE（プロンプト契約・Sonnet 限定）の Gemini serve-path 等価。
 export RAG_NONE_BARE_FOLD=1
 
+# --- SOT-2721 lever (Gemini gold100 net97→98+ 候補; idx29 を gold 文字列一致・回帰ゼロ) ---
+# TP ヒストグラムの「N番目にカウント数が多いビンの範囲」を実データから決定論再集計（Excel 自動ヒストグラム＝
+# Scott 幅3桁 truncate、chart_numcache._scott_histogram、幅0.2 は直書きせずデータ導出）し、カウント降順 K 番目の
+# ビン範囲を『lo ~ hi』へ direct-commit（idx29「わかりません」→「6.088138 ~ 6.288138」）。ゲートは ヒストグラム×
+# ビン×範囲×「N番目」×カウント×多い/少ない を全要求＝gold100 全走査で idx29 のみ発火（idx10 最多カウント型は
+# 非発火）。純 Gemini serve 経路の serve-boundary hook（LLM 出力非依存の direct-commit）。
+export RAG_HIST_BIN=1
+
 # --- investigator on the live Gemini tool loop (production answer path; parallelizable, not shared-limit) ---
 export RAG_INVESTIGATOR_BACKEND=gemini
 
@@ -207,7 +215,7 @@ export RAG_INVESTIGATOR_BACKEND=gemini
 if [ "${GEMINI_GOLD_BASELINE:-0}" = "1" ]; then
   unset RAG_BARE_ANSWER RAG_NONE_BARE RAG_EXACT_LABEL RAG_SPECIAL_PROVISION RAG_REPORT_SERIES \
         RAG_FORMAT_STRIP_PAREN RAG_FORMAT_VALUE_NORM RAG_DECIMAL_UNIT_STRIP RAG_BIN_RANGE_FORMAT \
-        RAG_DECIMAL_PRECISION RAG_NONE_BARE_FOLD
+        RAG_DECIMAL_PRECISION RAG_NONE_BARE_FOLD RAG_HIST_BIN
   MODE=baseline
 else
   MODE=postport

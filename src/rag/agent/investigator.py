@@ -3046,6 +3046,34 @@ def _apply_page_count_bare(inv: "Investigation", question: str) -> "Investigatio
     return inv
 
 
+def _apply_histogram_bin(inv: "Investigation", question: str) -> "Investigation":
+    """SOT-2721 — 「<列>のヒストグラムで N 番目にカウント数が多いビンの範囲」を決定論再集計で直接確定する
+    Gemini serve-boundary hook (in place)。
+
+    純 Gemini 経路（``RAG_INVESTIGATOR_BACKEND`` != claude-mcp）は commit_gate / claude_mcp のような serve 整形・
+    再集計フックを通らないため、idx29 型のヒストグラム・ビン範囲問はここで 1 点だけ決定論確定する。ビン境界は
+    実データから Excel 自動ヒストグラム（Scott 幅3桁 truncate、:func:`formatting._histogram_series`）で機械計算し、
+    LLM の framing churn（区間記法/棄権）に一切依存せず K 番目のビン範囲を『lo ~ hi』へ commit する。
+    ``RAG_HIST_BIN`` default OFF ⇒ この関数は ``inv`` を無改変で返す（byte-identical）。確定不能なら無改変で、
+    fired 時のみ ``interventions['histogram_bin']`` に記録する。fail-open。"""
+    from src.rag.agent import formatting as _formatting
+
+    if not _formatting.histogram_bin_enabled():
+        return inv
+    try:
+        ans = inv.answer
+        direct = _formatting.resolve_histogram_bin_direct(question)
+        if direct is not None and direct != ans.answer:
+            inv.answer = Answer(answer=direct, confidence=1.0, evidence=ans.evidence,
+                                method=(ans.method + " +histogram_bin_commit").strip())
+            inv.interventions["histogram_bin"] = {"fired": True, "rules": ["histogram_bin_commit"],
+                                                  "from": ans.answer[:80], "to": direct[:80],
+                                                  "deterministic": True}
+    except Exception:  # noqa: BLE001 — value-preserving commit; never break the answer path
+        pass
+    return inv
+
+
 def _apply_decimal_precision(inv: "Investigation", question: str) -> "Investigation":
     """SOT-2720 レバーA — 小数第N位指定問の回答を N 桁へ決定論丸めする Gemini serve-boundary hook (in place)。
 
@@ -3475,5 +3503,6 @@ def answer_question(question: str, *, model: str | None = None,
     _inv.interventions.update(packet_interventions)  # SOT-2629 — merge env/packet-level telemetry
     _inv = _apply_currency_diff_unit(_inv, question)  # SOT-2718 — Gemini serve-path 単位固定 (no-op unless ON)
     _inv = _apply_page_count_bare(_inv, question)  # SOT-2719 — 「ページ数」型 bare 化 (no-op unless ON)
+    _inv = _apply_histogram_bin(_inv, question)  # SOT-2721 — ヒストグラム ビン範囲 direct-commit (no-op unless ON)
     _inv = _apply_sot2720_formatting(_inv, question)  # SOT-2720 A/B — every serve route (no-op unless ON)
     return _apply_answer_eu_gate(_inv, question)  # SOT-2635 — commit-time EU gate (no-op unless ON)
