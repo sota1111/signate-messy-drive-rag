@@ -3046,6 +3046,72 @@ def _apply_page_count_bare(inv: "Investigation", question: str) -> "Investigatio
     return inv
 
 
+def _apply_decimal_precision(inv: "Investigation", question: str) -> "Investigation":
+    """SOT-2720 レバーA — 小数第N位指定問の回答を N 桁へ決定論丸めする Gemini serve-boundary hook (in place)。
+
+    純 Gemini 経路（``RAG_INVESTIGATOR_BACKEND`` != claude-mcp）は claude_mcp / commit_gate のような serve 整形
+    フックを通らないため、値保存の丸め（:func:`formatting.apply_decimal_precision`）をここで1点だけ適用する。
+    ``RAG_DECIMAL_PRECISION`` default OFF ⇒ この関数は ``inv`` を無改変で返す（byte-identical）。棄権回答・精度指定
+    なしの数値（idx36=17桁 等）は決して丸めず、fired 時のみ ``interventions['decimal_precision']`` に記録する。fail-open。"""
+    from src.rag.agent import formatting as _formatting
+
+    if not _formatting.decimal_precision_enabled():
+        return inv
+    try:
+        ans = inv.answer
+        if is_abstain(ans.answer):
+            return inv
+        new_text, fired = _formatting.apply_decimal_precision(question, ans.answer)
+        if fired and new_text != ans.answer:
+            inv.answer = Answer(answer=new_text, confidence=ans.confidence,
+                                evidence=ans.evidence,
+                                method=(ans.method + " +decimal_precision").strip())
+            inv.interventions["decimal_precision"] = {"fired": True, "rules": fired,
+                                                      "from": ans.answer[:80], "to": new_text[:80]}
+    except Exception:  # noqa: BLE001 — value-preserving polish; never break the answer path
+        pass
+    return inv
+
+
+def _apply_none_bare_fold(inv: "Investigation", question: str) -> "Investigation":
+    """SOT-2720 レバーB — 列挙型設問の冗長 no-items 回答を裸「該当なし」へ畳む Gemini serve-boundary hook (in place)。
+
+    純 Gemini 経路には claude_mcp の RAG_NONE_BARE プロンプト契約が無いため、no-items 結論の裸化をここで適用する
+    （:func:`formatting.fold_none_bare`）。``RAG_NONE_BARE_FOLD`` default OFF ⇒ この関数は ``inv`` を無改変で返す
+    （byte-identical）。回答が存在する設問を誤って該当なしにせず（非存在結論と判定できる証跡があるときのみ）、
+    棄権回答は畳まない。fired 時のみ ``interventions['none_bare_fold']`` に記録する。fail-open。"""
+    from src.rag.agent import formatting as _formatting
+
+    if not _formatting.none_bare_fold_enabled():
+        return inv
+    try:
+        ans = inv.answer
+        if is_abstain(ans.answer):
+            return inv
+        new_text, fired = _formatting.fold_none_bare(question, ans.answer)
+        if fired and new_text != ans.answer:
+            inv.answer = Answer(answer=new_text, confidence=ans.confidence,
+                                evidence=ans.evidence,
+                                method=(ans.method + " +none_bare_fold").strip())
+            inv.interventions["none_bare_fold"] = {"fired": True, "rules": fired,
+                                                   "from": ans.answer[:80], "to": new_text[:80]}
+    except Exception:  # noqa: BLE001 — value-preserving polish; never break the answer path
+        pass
+    return inv
+
+
+def _apply_sot2720_formatting(inv: "Investigation", question: str) -> "Investigation":
+    """Apply the SOT-2720 serve-boundary contracts to every answer route.
+
+    ``answer_question`` has several deterministic early returns before the Gemini loop.  Keeping the
+    two contracts in this small wrapper prevents those routes from bypassing the same final formatting
+    boundary used by model-produced answers.  Both underlying flags default OFF, so the wrapper is
+    byte-identical when the feature is disabled.
+    """
+    inv = _apply_decimal_precision(inv, question)
+    return _apply_none_bare_fold(inv, question)
+
+
 def _apply_answer_eu_gate(inv: "Investigation", question: str) -> "Investigation":
     """SOT-2635 — apply the expected-utility commit gate to a produced answer, in place, behind RAG_EU_GATE.
 
@@ -3193,7 +3259,7 @@ def answer_question(question: str, *, model: str | None = None,
             from src.rag.agent import formatting as _formatting
             formatted = _formatting.format_contract(det_result, question, contract_type=contract)
             if formatted is not None:
-                return _apply_answer_eu_gate(Investigation(
+                return _apply_answer_eu_gate(_apply_sot2720_formatting(Investigation(
                     question=question,
                     answer=_answer_from_det_contract(formatted),
                     iterations=1,
@@ -3203,7 +3269,7 @@ def answer_question(question: str, *, model: str | None = None,
                     elapsed_s=max(0.0, time.monotonic() - det_started),
                     stop_reason="answered",
                     contract=contract,
-                ), question)
+                ), question), question)
         # SOT-2647 (事前計算事実層 5/5) — precomputed-store direct-answer lane. Sits AFTER the Stage0 router
         # (so Wave A1〜B2 keep precedence and there is no contract-registry collision) and BEFORE the LLM
         # loop: when RAG_FACT_LAYER is on AND the contract type binds unambiguously to a unique store value
@@ -3218,7 +3284,7 @@ def answer_question(question: str, *, model: str | None = None,
             if fact_result is not None:
                 formatted = _formatting.format_contract(fact_result, question, contract_type=contract)
                 if formatted is not None:
-                    return _apply_answer_eu_gate(Investigation(
+                    return _apply_answer_eu_gate(_apply_sot2720_formatting(Investigation(
                         question=question,
                         answer=_answer_from_det_contract(formatted),
                         iterations=1,
@@ -3228,7 +3294,7 @@ def answer_question(question: str, *, model: str | None = None,
                         elapsed_s=max(0.0, time.monotonic() - fact_started),
                         stop_reason="answered",
                         contract=contract,
-                    ), question)
+                    ), question), question)
         # SOT-2584 — Evidence Packet pre-inject (typed route → registry-resolved docs → slots → budget).
         # Built only behind RAG_EVIDENCE_PACKET; reuses the just-computed contract so the question is not
         # re-classified. Fail-open: any build error leaves ``preamble`` None so the answer path is
@@ -3348,7 +3414,7 @@ def answer_question(question: str, *, model: str | None = None,
             deterministic = _deterministic_regulation_answer(question, profile_obj)
             deterministic_tools = ["canonical_route", "find_files", "read_office"]
         if deterministic is not None:
-            return _apply_answer_eu_gate(Investigation(
+            return _apply_answer_eu_gate(_apply_sot2720_formatting(Investigation(
                 question=question,
                 answer=deterministic,
                 iterations=len(deterministic_tools),
@@ -3358,7 +3424,7 @@ def answer_question(question: str, *, model: str | None = None,
                 elapsed_s=max(0.0, time.monotonic() - started),
                 stop_reason="answered",
                 contract=contract,
-            ), question)
+            ), question), question)
         # Record whether the caller kept the defaults *before* any adaptation, so every adaptation below
         # only lifts a default budget and never shrinks an explicit caller budget, and so they compose
         # (the ratio +4 still applies on top of the multi-stage lift).
@@ -3398,7 +3464,7 @@ def answer_question(question: str, *, model: str | None = None,
             question, tools=tools, system=system, contract=contract, preamble=preamble,
             max_turns=max_turns, timeout_s=timeout_s, model=model)
         _inv.interventions.update(packet_interventions)  # SOT-2629 — merge env/packet-level telemetry
-        return _apply_answer_eu_gate(_inv, question)  # SOT-2635 — commit-time EU gate (no-op unless ON)
+        return _apply_answer_eu_gate(_apply_sot2720_formatting(_inv, question), question)  # SOT-2635
     model_obj = gemini_model_factory(question, tools, model=model, system=system)
     _inv = investigate(model_obj, question, tools, max_turns=max_turns, timeout_s=timeout_s,
                        ledger=ledger, calc_ledger=calc_ledger, research=research,
@@ -3409,4 +3475,5 @@ def answer_question(question: str, *, model: str | None = None,
     _inv.interventions.update(packet_interventions)  # SOT-2629 — merge env/packet-level telemetry
     _inv = _apply_currency_diff_unit(_inv, question)  # SOT-2718 — Gemini serve-path 単位固定 (no-op unless ON)
     _inv = _apply_page_count_bare(_inv, question)  # SOT-2719 — 「ページ数」型 bare 化 (no-op unless ON)
+    _inv = _apply_sot2720_formatting(_inv, question)  # SOT-2720 A/B — every serve route (no-op unless ON)
     return _apply_answer_eu_gate(_inv, question)  # SOT-2635 — commit-time EU gate (no-op unless ON)
